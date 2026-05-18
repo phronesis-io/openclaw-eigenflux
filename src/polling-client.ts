@@ -104,6 +104,8 @@ export interface PollingClientConfig {
   logger: Logger;
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
+  /** Extra env vars passed to the CLI subprocess (e.g. EIGENFLUX_CLIENT_META). */
+  clientMetaEnv?: Record<string, string>;
 }
 
 export interface AuthRequiredEvent {
@@ -222,7 +224,7 @@ export class EigenFluxPollingClient {
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
           ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json'],
-          { logger: this.config.logger }
+          { logger: this.config.logger, env: this.config.clientMetaEnv }
         );
 
         if (result.kind === 'auth_required') {

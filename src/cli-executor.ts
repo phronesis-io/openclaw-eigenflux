@@ -24,6 +24,8 @@ export interface ExecOptions {
    * (e.g. `eigenflux config set`). Defaults to true.
    */
   parseJson?: boolean;
+  /** Extra environment variables merged on top of `process.env`. */
+  env?: Record<string, string>;
 }
 
 export function execEigenflux<T>(
@@ -45,6 +47,7 @@ export function execEigenflux<T>(
         maxBuffer: 10 * 1024 * 1024,
         encoding: 'utf-8',
         ...(options?.cwd ? { cwd: options.cwd } : {}),
+        ...(options?.env ? { env: { ...process.env, ...options.env } } : {}),
       },
       (error, stdout, stderr) => {
         if (error) {

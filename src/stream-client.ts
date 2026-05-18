@@ -37,6 +37,8 @@ export interface StreamClientConfig {
   onPmEvent: (event: PmStreamEvent) => Promise<void>;
   onAuthRequired: () => Promise<void>;
   onStreamError?: (error: Error) => void;
+  /** Extra env vars passed to the stream subprocess (e.g. EIGENFLUX_CLIENT_META). */
+  clientMetaEnv?: Record<string, string>;
 }
 
 export class EigenFluxStreamClient {
@@ -133,6 +135,9 @@ export class EigenFluxStreamClient {
 
     const child = spawn(this.config.eigenfluxBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(this.config.clientMetaEnv
+        ? { env: { ...process.env, ...this.config.clientMetaEnv } }
+        : {}),
     });
     this.child = child;
 

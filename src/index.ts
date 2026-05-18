@@ -17,6 +17,7 @@ import {
   resolvePluginConfig,
   resolveEigenfluxHome,
   discoverServers,
+  collectClientMeta,
   type ResolvedEigenFluxPluginConfig,
   type RoutingConfig,
   type DiscoveredServer,
@@ -131,8 +132,16 @@ function registerPlugin(api: OpenClawPluginApi): void {
 
       logger.info(`Discovered ${servers.length} server(s): ${servers.map((s) => s.name).join(', ')}`);
 
+      const clientMeta = await collectClientMeta(
+        pluginConfig.eigenfluxBin,
+        pluginConfig.openclawCliBin,
+        logger,
+      );
+      const clientMetaEnv = { EIGENFLUX_CLIENT_META: JSON.stringify(clientMeta) };
+      logger.info(`Collected client meta: ${JSON.stringify(clientMeta)}`);
+
       runtimes = servers.map((server) =>
-        createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
+        createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store, clientMetaEnv)
       );
 
       for (const runtime of runtimes) {
@@ -231,7 +240,8 @@ function createServerRuntime(
   pluginConfig: ResolvedEigenFluxPluginConfig,
   server: DiscoveredServer,
   eigenfluxHome: string,
-  store: PluginRuntimeStore
+  store: PluginRuntimeStore,
+  clientMetaEnv?: Record<string, string>,
 ): ServerRuntime {
   const routing = pluginConfig.serverRouting[server.name] ?? DEFAULT_ROUTING;
 
@@ -285,6 +295,7 @@ function createServerRuntime(
       await notifier.deliver(buildFeedPayloadPromptTemplate(payload, getPromptContext()));
     },
     onAuthRequired: notifyAuthRequired,
+    clientMetaEnv,
   });
 
   const streamClient = new EigenFluxStreamClient({
@@ -298,6 +309,7 @@ function createServerRuntime(
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
     },
+    clientMetaEnv,
   });
 
   return {
@@ -342,8 +354,10 @@ function registerCommand(
     if (discovery.servers.length === 0) {
       return { runtimes: getRuntimes() };
     }
+    const meta = await collectClientMeta(pluginConfig.eigenfluxBin, pluginConfig.openclawCliBin, logger);
+    const metaEnv = { EIGENFLUX_CLIENT_META: JSON.stringify(meta) };
     const created = discovery.servers.map((server) =>
-      createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
+      createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store, metaEnv)
     );
     setRuntimes(created);
     return { runtimes: created };

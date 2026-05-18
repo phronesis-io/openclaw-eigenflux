@@ -283,3 +283,49 @@ export const PLUGIN_CONFIG = {
   PLUGIN_VERSION,
 } as const;
 
+// ─── Client Meta ───────────────────────────────────────────────────────────
+
+export interface ClientMeta {
+  plugin: string;
+  host: string;
+  host_version?: string;
+  cli_version?: string;
+  platform: string;
+}
+
+export async function collectClientMeta(
+  eigenfluxBin: string,
+  openclawCliBin: string,
+  logger: Logger,
+): Promise<ClientMeta> {
+  const meta: ClientMeta = {
+    plugin: PLUGIN_VERSION,
+    host: HOST_KIND,
+    platform: `${os.platform()}/${os.arch()}`,
+  };
+
+  try {
+    const oc = await execEigenflux<string>(openclawCliBin, ['--version'], {
+      parseJson: false,
+      logger,
+    });
+    if (oc.kind === 'success' && typeof oc.data === 'string') {
+      const match = oc.data.match(/OpenClaw\s+([\d.]+)/);
+      if (match) meta.host_version = match[1];
+    }
+  } catch {
+    logger.debug('Failed to detect OpenClaw version');
+  }
+
+  try {
+    const ef = await execEigenflux<{ cli_version?: string }>(eigenfluxBin, ['version'], { logger });
+    if (ef.kind === 'success' && ef.data?.cli_version) {
+      meta.cli_version = ef.data.cli_version;
+    }
+  } catch {
+    logger.debug('Failed to detect EigenFlux CLI version');
+  }
+
+  return meta;
+}
+
