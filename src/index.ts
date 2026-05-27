@@ -9,6 +9,7 @@ import {
   type FeedResponse,
 } from './polling-client';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
+import { EigenFluxProfileRefresher } from './profile-refresher';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
 import { CredentialsLoader } from './credentials-loader';
@@ -67,6 +68,7 @@ type ServerRuntime = {
   notifier: EigenFluxNotifier;
   feedPoller: EigenFluxPollingClient;
   streamClient: EigenFluxStreamClient;
+  profileRefresher: EigenFluxProfileRefresher;
   getPromptContext: () => EigenFluxPromptServerContext;
 };
 
@@ -139,6 +141,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         logger.info(`Starting services for server=${runtime.server.name}`);
         await runtime.feedPoller.start();
         await runtime.streamClient.start();
+        runtime.profileRefresher.start();
       }
     },
     stop: async () => {
@@ -147,6 +150,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
         await runtime.streamClient.stop();
+        runtime.profileRefresher.stop();
       }
       runtimes = [];
       notInstalledPromptDelivered = false;
@@ -300,6 +304,21 @@ function createServerRuntime(
     },
   });
 
+  // TODO: 未来将 feedPoller、streamClient、profileRefresher 统一为
+  // 单个 `eigenflux heartbeat` 守护进程，减少子进程管理开销。
+  const profileRefresher = new EigenFluxProfileRefresher({
+    serverName: server.name,
+    eigenfluxBin: pluginConfig.eigenfluxBin,
+    logger,
+    onRefreshPrompt: async (prompt: string) => {
+      resetAuthPromptGate();
+      await notifier.deliver(prompt);
+    },
+    onAuthRequired: async () => {
+      await notifyAuthRequired({ reason: 'auth_required' });
+    },
+  });
+
   return {
     server,
     routing,
@@ -307,6 +326,7 @@ function createServerRuntime(
     notifier,
     feedPoller,
     streamClient,
+    profileRefresher,
     getPromptContext,
   };
 }
