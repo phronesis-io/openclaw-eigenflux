@@ -29,6 +29,12 @@ export interface ProfileRefresherConfig {
   onAuthRequired: () => Promise<void>;
 }
 
+interface JsonApiSuccess<T> {
+  code: number;
+  msg: string;
+  data: T;
+}
+
 interface ProfileData {
   profile: { agent_name?: string; bio?: string };
   influence: {
@@ -103,24 +109,27 @@ export class EigenFluxProfileRefresher {
 
     // 1. Fetch current profile + recent items in parallel
     const [profileResult, itemsResult] = await Promise.all([
-      execEigenflux<ProfileData>(
+      execEigenflux<JsonApiSuccess<ProfileData>>(
         this.config.eigenfluxBin,
         ['profile', 'show', '-s', this.config.serverName, '-f', 'json'],
         { logger: this.config.logger },
       ),
-      execEigenflux<ItemsData>(
+      execEigenflux<JsonApiSuccess<ItemsData>>(
         this.config.eigenfluxBin,
         ['profile', 'items', '-s', this.config.serverName, '-f', 'json', '--limit', String(ITEMS_LIMIT)],
         { logger: this.config.logger },
       ),
     ]);
 
+    // Defensive: if stopped during CLI execution, abort
+    if (!this.running) return;
+
     // 2. Check results
     if (profileResult.kind === 'auth_required' || itemsResult.kind === 'auth_required') {
       await this.config.onAuthRequired();
       return;
     }
-    if (profileResult.kind === 'not_installed') {
+    if (profileResult.kind === 'not_installed' || itemsResult.kind === 'not_installed') {
       this.config.logger.error(`eigenflux CLI not found (bin=${this.config.eigenfluxBin})`);
       return;
     }
@@ -133,15 +142,23 @@ export class EigenFluxProfileRefresher {
       return;
     }
 
-    const items = itemsResult.data?.items ?? [];
+    // 3. Unwrap JsonApiSuccess envelope
+    const profileData = profileResult.data?.data;
+    if (!profileData) {
+      this.config.logger.error('Profile fetch returned empty data');
+      return;
+    }
+
+    const items = itemsResult.data?.data?.items ?? [];
     if (items.length === 0) {
       this.config.logger.info('Profile refresh skipped: no recent items');
       return;
     }
 
-    // 3. Assemble prompt and deliver
-    const prompt = buildRefreshPrompt(profileResult.data, items);
+    // 4. Assemble prompt and deliver
+    const prompt = buildRefreshPrompt(profileData, items);
     try {
+      if (!this.running) return;
       await this.config.onRefreshPrompt(prompt);
       this.config.logger.info(`Profile refresh prompt delivered for server=${this.config.serverName}`);
     } catch (err) {

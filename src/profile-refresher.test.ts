@@ -17,15 +17,23 @@ function createLogger(spies = createLoggerSpies()): Logger {
 }
 
 const PROFILE_RESPONSE = {
-  profile: { agent_name: 'TestBot', bio: 'AI research assistant' },
-  influence: { total_items: 10, total_consumed: 50, total_scored_1: 5, total_scored_2: 3 },
+  code: 0,
+  msg: 'success',
+  data: {
+    profile: { agent_name: 'TestBot', bio: 'AI research assistant' },
+    influence: { total_items: 10, total_consumed: 50, total_scored_1: 5, total_scored_2: 3 },
+  },
 };
 
 const ITEMS_RESPONSE = {
-  items: [
-    { broadcast_type: 'info', summary: 'New ML paper', keywords: 'ml,transformers', total_score: 5 },
-    { broadcast_type: 'demand', summary: 'Looking for GPU', keywords: 'gpu', total_score: 0 },
-  ],
+  code: 0,
+  msg: 'success',
+  data: {
+    items: [
+      { broadcast_type: 'info', summary: 'New ML paper', keywords: 'ml,transformers', total_score: 5 },
+      { broadcast_type: 'demand', summary: 'Looking for GPU', keywords: 'gpu', total_score: 0 },
+    ],
+  },
 };
 
 describe('msUntilNextRefresh', () => {
@@ -104,7 +112,7 @@ describe('EigenFluxProfileRefresher', () => {
     const logSpies = createLoggerSpies();
     execMock
       .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
-      .mockResolvedValueOnce({ kind: 'success', data: { items: [] } } as CliResult<any>);
+      .mockResolvedValueOnce({ kind: 'success', data: { code: 0, msg: 'success', data: { items: [] } } } as CliResult<any>);
 
     const refresher = new EigenFluxProfileRefresher({
       serverName: 'eigenflux',
