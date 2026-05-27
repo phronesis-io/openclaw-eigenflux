@@ -68,6 +68,7 @@ type ServerRuntime = {
   feedPoller: EigenFluxPollingClient;
   streamClient: EigenFluxStreamClient;
   getPromptContext: () => EigenFluxPromptServerContext;
+  waitForPendingDelivery: () => Promise<void>;
 };
 
 type ParsedCommandArgs = {
@@ -146,6 +147,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       for (const runtime of runtimes) {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
+        await runtime.waitForPendingDelivery();
         await runtime.streamClient.stop();
       }
       runtimes = [];
@@ -274,6 +276,14 @@ function createServerRuntime(
     );
   };
 
+  // Guard: notifier.deliver() may take longer than the poll interval,
+  // so we skip overlapping deliveries to avoid duplicate agent tasks.
+  let feedDeliveryInFlight = false;
+  let feedDeliveryStartedAt = 0;
+  let feedDeliverySkipCount = 0;
+  let activeFeedDelivery: Promise<boolean> | null = null;
+  const FEED_DELIVERY_TIMEOUT_MS = 300_000;
+
   const feedPoller = new EigenFluxPollingClient({
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
@@ -281,8 +291,48 @@ function createServerRuntime(
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
     onFeedPolled: async (payload: FeedResponse) => {
+      // Always reset auth gate on successful poll, even if delivery is skipped
       resetAuthPromptGate();
-      await notifier.deliver(buildFeedPayloadPromptTemplate(payload, getPromptContext()));
+
+      const items = payload.data?.items ?? [];
+      const notifications = payload.data?.notifications ?? [];
+
+      // Check for stale delivery flag (delivery promise hung)
+      if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
+        const elapsed = Date.now() - feedDeliveryStartedAt;
+        if (elapsed > FEED_DELIVERY_TIMEOUT_MS) {
+          logger.error(
+            `Feed delivery flag stuck for ${Math.round(elapsed / 1000)}s on server=${server.name}, force-resetting`
+          );
+          feedDeliveryInFlight = false;
+          activeFeedDelivery = null;
+        }
+      }
+
+      if (feedDeliveryInFlight) {
+        feedDeliverySkipCount += 1;
+        const elapsed = Date.now() - feedDeliveryStartedAt;
+        logger.warn(
+          `Skipping feed delivery for server=${server.name}: previous delivery still in progress ` +
+          `(elapsed=${Math.round(elapsed / 1000)}s, skipped_items=${items.length}, ` +
+          `skipped_notifications=${notifications.length}, total_skips=${feedDeliverySkipCount})`
+        );
+        return;
+      }
+
+      feedDeliveryInFlight = true;
+      const startedAt = Date.now();
+      feedDeliveryStartedAt = startedAt;
+      activeFeedDelivery = notifier.deliver(
+        buildFeedPayloadPromptTemplate(payload, getPromptContext())
+      ).finally(() => {
+        const duration = Date.now() - startedAt;
+        logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
+        feedDeliveryInFlight = false;
+        activeFeedDelivery = null;
+      });
+
+      await activeFeedDelivery;
     },
     onAuthRequired: notifyAuthRequired,
   });
@@ -308,6 +358,15 @@ function createServerRuntime(
     feedPoller,
     streamClient,
     getPromptContext,
+    async waitForPendingDelivery(): Promise<void> {
+      if (activeFeedDelivery) {
+        try {
+          await activeFeedDelivery;
+        } catch {
+          // Swallow — we're stopping
+        }
+      }
+    },
   };
 }
 

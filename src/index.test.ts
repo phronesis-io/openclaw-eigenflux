@@ -828,4 +828,148 @@ describe('register unit', () => {
     expect(services).toHaveLength(0);
     expect(commands).toHaveLength(0);
   });
+
+  test('skips feed delivery when previous delivery is still in progress', async () => {
+    const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
+    fs.mkdirSync(serverDir, { recursive: true });
+
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+
+    // Make subagent.run return a pending promise that we control
+    let resolveFirstDelivery!: (value: any) => void;
+    const firstDeliveryPromise = new Promise((resolve) => {
+      resolveFirstDelivery = resolve;
+    });
+    const subagentRun = jest.fn().mockReturnValue(firstDeliveryPromise);
+    const testLogger = createLogger();
+
+    pollingClientStartMock.mockImplementation(async () => {
+      // Simulate first feed poll triggering delivery
+      if (capturedPollOnFeedPolled) {
+        // Don't await — let it hang as pending delivery
+        capturedPollOnFeedPolled({
+          code: 0,
+          msg: 'success',
+          data: {
+            items: [{ item_id: '100', broadcast_type: 'info', updated_at: 1760000000000 }],
+            has_more: false,
+            notifications: [],
+          },
+        });
+      }
+    });
+
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: {
+        subagent: { run: subagentRun },
+      },
+      logger: testLogger,
+      registerService: (service: any) => services.push(service),
+      registerCommand: jest.fn(),
+    } as any);
+
+    await services[0].start();
+
+    // First delivery should have been triggered
+    expect(subagentRun).toHaveBeenCalledTimes(1);
+
+    // Now trigger a second onFeedPolled while the first is still pending
+    expect(capturedPollOnFeedPolled).toBeTruthy();
+    await capturedPollOnFeedPolled!({
+      code: 0,
+      msg: 'success',
+      data: {
+        items: [{ item_id: '200', broadcast_type: 'info', updated_at: 1760000000500 }],
+        has_more: false,
+        notifications: [{ notification_id: 'n1', type: 'friend_request', content: 'hi', created_at: 1760000000600 }],
+      },
+    });
+
+    // Second delivery should have been skipped
+    expect(subagentRun).toHaveBeenCalledTimes(1);
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Skipping feed delivery')
+    );
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('skipped_items=1')
+    );
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('skipped_notifications=1')
+    );
+
+    // Resolve first delivery so stop() can complete
+    resolveFirstDelivery({ runId: 'run-bp' });
+    await services[0].stop();
+  });
+
+  test('logs skip count and item details when delivery is skipped', async () => {
+    const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
+    fs.mkdirSync(serverDir, { recursive: true });
+
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+
+    let resolveDelivery!: (value: any) => void;
+    const subagentRun = jest.fn().mockReturnValue(
+      new Promise((resolve) => { resolveDelivery = resolve; })
+    );
+    const testLogger = createLogger();
+
+    pollingClientStartMock.mockImplementation(async () => {
+      if (capturedPollOnFeedPolled) {
+        capturedPollOnFeedPolled({
+          code: 0, msg: 'success',
+          data: { items: [{ item_id: '100', broadcast_type: 'info', updated_at: 1 }], has_more: false, notifications: [] },
+        });
+      }
+    });
+
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: testLogger,
+      registerService: (service: any) => services.push(service),
+      registerCommand: jest.fn(),
+    } as any);
+
+    await services[0].start();
+
+    // Skip twice to verify cumulative count
+    await capturedPollOnFeedPolled!({
+      code: 0, msg: 'success',
+      data: { items: [{ item_id: '200', broadcast_type: 'info', updated_at: 2 }], has_more: false, notifications: [] },
+    });
+    await capturedPollOnFeedPolled!({
+      code: 0, msg: 'success',
+      data: { items: [{ item_id: '300', broadcast_type: 'info', updated_at: 3 }, { item_id: '301', broadcast_type: 'alert', updated_at: 4 }], has_more: false, notifications: [] },
+    });
+
+    // Check cumulative skip count
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('total_skips=1')
+    );
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('total_skips=2')
+    );
+    expect(testLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('skipped_items=2')
+    );
+
+    resolveDelivery({ runId: 'run-skip-count' });
+    await services[0].stop();
+  });
 });
