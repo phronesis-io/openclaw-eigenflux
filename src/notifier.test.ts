@@ -546,4 +546,173 @@ describe('EigenFluxNotifier', () => {
     await notifier.deliver('hello');
     expect(writeStoredNotificationRouteMock).not.toHaveBeenCalled();
   });
+
+  test('uses one-shot session derived from targetSessionKey prefix', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-oneshot' });
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await expect(
+      notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+        targetSessionKey: 'eigenflux:feed:eigenflux',
+      })
+    ).resolves.toBe(true);
+
+    // sessionKey should start with the prefix but have a random suffix
+    const callArgs = run.mock.calls[0]?.[0];
+    expect(callArgs.sessionKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(callArgs.message).toBe('[EIGENFLUX_FEED_PAYLOAD] test');
+    expect(callArgs.deliver).toBe(true);
+  });
+
+  test('deletes one-shot session after successful delivery', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-cleanup' });
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    expect(deleteSession).toHaveBeenCalledTimes(1);
+    const deletedKey = deleteSession.mock.calls[0]?.[0]?.sessionKey;
+    expect(deletedKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(deleteSession.mock.calls[0]?.[0]?.deleteTranscript).toBe(true);
+  });
+
+  test('deletes one-shot session even when delivery fails', async () => {
+    // No subagent available — delivery fails
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    const result = await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    expect(result).toBe(false);
+    // Session should still be cleaned up
+    expect(deleteSession).toHaveBeenCalledTimes(1);
+  });
+
+  test('does NOT remember route when targetSessionKey is used', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-no-remember' });
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    expect(writeStoredNotificationRouteMock).not.toHaveBeenCalled();
+  });
+
+  test('skips heartbeat fallbacks when targetSessionKey is provided', async () => {
+    const runtimeCommand = jest.fn().mockResolvedValue({ code: 1, stderr: 'fail' });
+    const enqueueSystemEvent = jest.fn().mockReturnValue(true);
+    const requestHeartbeatNow = jest.fn();
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { deleteSession },
+          system: {
+            runCommandWithTimeout: runtimeCommand,
+            enqueueSystemEvent,
+            requestHeartbeatNow,
+          },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(requestHeartbeatNow).not.toHaveBeenCalled();
+  });
+
+  test('gracefully degrades when deleteSession is not available on runtime', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-no-delete' });
+    // subagent has run but NO deleteSession
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    const result = await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    // Delivery should succeed even without deleteSession
+    expect(result).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  test('deliver returns original result when deleteSession throws', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-delete-throws' });
+    const deleteSession = jest.fn().mockRejectedValue(new Error('delete RPC failed'));
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    // Delivery should still return true — deleteSession failure is swallowed
+    const result = await notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux',
+    });
+
+    expect(result).toBe(true);
+    expect(deleteSession).toHaveBeenCalledTimes(1);
+  });
 });

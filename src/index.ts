@@ -70,6 +70,7 @@ type ServerRuntime = {
   streamClient: EigenFluxStreamClient;
   profileRefresher: EigenFluxProfileRefresher;
   getPromptContext: () => EigenFluxPromptServerContext;
+  waitForPendingDelivery: () => Promise<void>;
 };
 
 type ParsedCommandArgs = {
@@ -149,6 +150,8 @@ function registerPlugin(api: OpenClawPluginApi): void {
       for (const runtime of runtimes) {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
+        await runtime.waitForPendingDelivery();
+        await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
         runtime.profileRefresher.stop();
       }
@@ -229,6 +232,11 @@ async function deliverNotInstalledPrompt(
   );
 }
 
+/** Dedicated session key for feed delivery, isolated from the main DM session. */
+function buildFeedSessionKey(serverName: string): string {
+  return `eigenflux:feed:${serverName}`;
+}
+
 function createServerRuntime(
   api: OpenClawPluginApi,
   logger: Logger,
@@ -278,6 +286,14 @@ function createServerRuntime(
     );
   };
 
+  // Guard: notifier.deliver() may take longer than the poll interval,
+  // so we skip overlapping deliveries to avoid duplicate agent tasks.
+  let feedDeliveryInFlight = false;
+  let feedDeliveryStartedAt = 0;
+  let feedDeliverySkipCount = 0;
+  let activeFeedDelivery: Promise<boolean> | null = null;
+  const FEED_DELIVERY_TIMEOUT_MS = 300_000;
+
   const feedPoller = new EigenFluxPollingClient({
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
@@ -285,8 +301,53 @@ function createServerRuntime(
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
     onFeedPolled: async (payload: FeedResponse) => {
+      // Always reset auth gate on successful poll, even if delivery is skipped
       resetAuthPromptGate();
-      await notifier.deliver(buildFeedPayloadPromptTemplate(payload, getPromptContext()));
+
+      const items = payload.data?.items ?? [];
+      const notifications = payload.data?.notifications ?? [];
+
+      // Check for stale delivery flag (delivery promise hung)
+      if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
+        const elapsed = Date.now() - feedDeliveryStartedAt;
+        if (elapsed > FEED_DELIVERY_TIMEOUT_MS) {
+          logger.error(
+            `Feed delivery flag stuck for ${Math.round(elapsed / 1000)}s on server=${server.name}, force-resetting`
+          );
+          feedDeliveryInFlight = false;
+          activeFeedDelivery = null;
+        }
+      }
+
+      if (feedDeliveryInFlight) {
+        feedDeliverySkipCount += 1;
+        const elapsed = Date.now() - feedDeliveryStartedAt;
+        logger.warn(
+          `Skipping feed delivery for server=${server.name}: previous delivery still in progress ` +
+          `(elapsed=${Math.round(elapsed / 1000)}s, skipped_items=${items.length}, ` +
+          `skipped_notifications=${notifications.length}, total_skips=${feedDeliverySkipCount})`
+        );
+        return;
+      }
+
+      feedDeliveryInFlight = true;
+      const startedAt = Date.now();
+      feedDeliveryStartedAt = startedAt;
+      activeFeedDelivery = notifier.deliver(
+        buildFeedPayloadPromptTemplate(payload, getPromptContext()),
+        { targetSessionKey: buildFeedSessionKey(server.name) }
+      ).finally(() => {
+        const duration = Date.now() - startedAt;
+        logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
+        // Only clear flags if this delivery is still the current one.
+        // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
+        if (feedDeliveryStartedAt === startedAt) {
+          feedDeliveryInFlight = false;
+          activeFeedDelivery = null;
+        }
+      });
+
+      await activeFeedDelivery;
     },
     onAuthRequired: notifyAuthRequired,
   });
@@ -328,6 +389,15 @@ function createServerRuntime(
     streamClient,
     profileRefresher,
     getPromptContext,
+    async waitForPendingDelivery(): Promise<void> {
+      if (activeFeedDelivery) {
+        try {
+          await activeFeedDelivery;
+        } catch {
+          // Swallow — we're stopping
+        }
+      }
+    },
   };
 }
 

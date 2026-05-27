@@ -159,7 +159,7 @@ describe('register integration', () => {
     await waitFor(() => subagentRun.mock.calls.length === 1);
 
     expect(subagentRun).toHaveBeenCalledWith({
-      sessionKey: 'main',
+      sessionKey: expect.stringMatching(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/),
       message: expect.stringContaining('[EIGENFLUX_FEED_PAYLOAD]'),
       deliver: true,
       idempotencyKey: expect.any(String),
@@ -217,6 +217,37 @@ describe('register integration', () => {
     expect(message).toContain('"item_id": "601"');
     expect(message).toContain('"item_id": "602"');
     expect(message).toContain('"group_id": "group-dup-1"');
+
+    await services[0].stop();
+  });
+
+  test('delivers feed to dedicated session, not main DM session', async () => {
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-feed-session' });
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: {
+        subagent: { run: subagentRun },
+      },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => {
+        services.push(service);
+      },
+    } as any);
+
+    expect(services).toHaveLength(1);
+    await services[0].start();
+    await waitFor(() => subagentRun.mock.calls.length === 1);
+
+    // Feed should be delivered to eigenflux:feed:eigenflux, not main
+    const feedCall = subagentRun.mock.calls[0]?.[0];
+    expect(feedCall.sessionKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(feedCall.message).toContain('[EIGENFLUX_FEED_PAYLOAD]');
 
     await services[0].stop();
   });
