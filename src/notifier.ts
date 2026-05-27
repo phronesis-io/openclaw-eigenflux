@@ -27,6 +27,10 @@ type EigenFluxRuntimeApi = {
       runId: string;
       timeoutMs?: number;
     }) => Promise<{ status: 'ok' | 'error' | 'timeout'; error?: string }>;
+    deleteSession?: (params: {
+      sessionKey: string;
+      deleteTranscript?: boolean;
+    }) => Promise<void>;
   };
   system?: {
     enqueueSystemEvent?: (
@@ -71,6 +75,17 @@ export type EigenFluxNotifierConfig = {
   routeOverrides?: NotificationRouteOverrides;
 };
 
+export type DeliverOptions = {
+  /**
+   * When set, deliver to a one-shot session derived from this prefix
+   * (a random suffix is appended to prevent context accumulation).
+   * The session is automatically deleted after delivery completes.
+   * Skips route persistence and stale-route re-resolve fallback.
+   * Typical use: `eigenflux:feed:<serverName>` for isolated feed processing.
+   */
+  targetSessionKey?: string;
+};
+
 type CommandRunner = (
   argv: string[],
   options: { timeoutMs: number }
@@ -94,6 +109,7 @@ export class EigenFluxNotifier {
   private readonly api: OpenClawPluginApi;
   private readonly logger: Logger;
   private readonly config: EigenFluxNotifierConfig;
+  private readonly pendingCleanups: Promise<void>[] = [];
 
   constructor(api: OpenClawPluginApi, logger: Logger, config: EigenFluxNotifierConfig) {
     this.api = api;
@@ -105,7 +121,44 @@ export class EigenFluxNotifier {
     return (this.api.runtime ?? {}) as EigenFluxRuntimeApi;
   }
 
-  async deliver(message: string): Promise<boolean> {
+  async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
+    const targetKey = options?.targetSessionKey;
+
+    // When a target session prefix is provided, generate a one-shot session key
+    // (random suffix ensures no context accumulation across heartbeat cycles),
+    // skip full route resolution, and clean up the session after delivery.
+    if (targetKey) {
+      // Sweep any pending cleanups from previous deliveries before starting a new one.
+      // This prevents orphan sessions from accumulating if deleteSession was slow.
+      await this.drainPendingCleanups();
+
+      const sessionKey = `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const route: ResolvedNotificationRoute = {
+        sessionKey,
+        agentId: this.config.agentId,
+      };
+      this.logger.info(
+        `Delivery route resolved: source=targeted-oneshot, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
+      );
+
+      // Targeted delivery uses only subagent and command-agent transports.
+      // Heartbeat fallbacks are excluded because they re-resolve to the main
+      // DM session, which would break session isolation.
+      const result = await this.attemptDelivery(message, route, { skipHeartbeat: true });
+      if (result.result.ok) {
+        this.logDispatch(result.result);
+      } else {
+        this.logger.error(`Failed to deliver notification to targeted session: ${result.errors.join(' | ')}`);
+      }
+
+      // Fire-and-forget: queue cleanup so it doesn't block the next delivery.
+      // Pending cleanups are drained at the start of the next delivery and on stop().
+      this.enqueueCleanup(sessionKey);
+
+      return result.result.ok;
+    }
+
+    // Standard delivery: resolve route, attempt delivery, remember on success.
     const initial = await this.resolveRoute();
     this.logger.info(
       `Delivery route resolved: source=${initial.source}, ${formatRouteForLog(initial.route)}, message_preview=${previewMessage(message)}`
@@ -153,7 +206,8 @@ export class EigenFluxNotifier {
 
   private async attemptDelivery(
     message: string,
-    route: ResolvedNotificationRoute
+    route: ResolvedNotificationRoute,
+    options: { skipHeartbeat?: boolean } = {}
   ): Promise<{
     result: NotifyAttemptResult;
     finalRoute: ResolvedNotificationRoute;
@@ -162,9 +216,14 @@ export class EigenFluxNotifier {
     const attempts: Array<() => Promise<NotifyAttemptResult>> = [
       () => this.tryNotifyViaRuntimeSubagent(message, route),
       () => this.tryNotifyViaRuntimeCommandAgent(message, route),
-      () => this.tryNotifyViaRuntimeHeartbeat(message, route),
-      () => this.tryNotifyViaRuntimeCommandHeartbeat(message),
     ];
+
+    if (!options.skipHeartbeat) {
+      attempts.push(
+        () => this.tryNotifyViaRuntimeHeartbeat(message, route),
+        () => this.tryNotifyViaRuntimeCommandHeartbeat(message),
+      );
+    }
 
     const errors: string[] = [];
     for (const attempt of attempts) {
@@ -456,6 +515,41 @@ export class EigenFluxNotifier {
       route,
       this.logger
     );
+  }
+
+  /**
+   * Best-effort cleanup of a one-shot session. Failures are logged but do not
+   * propagate — the session may already have been cleaned up by the runtime.
+   */
+  private async tryDeleteSession(sessionKey: string): Promise<void> {
+    const deleteSession = this.runtime.subagent?.deleteSession;
+    if (typeof deleteSession !== 'function') {
+      this.logger.debug(`deleteSession unavailable; skipping cleanup for session_key=${sessionKey}`);
+      return;
+    }
+    try {
+      await deleteSession({ sessionKey, deleteTranscript: true });
+      this.logger.info(`One-shot session cleaned up: session_key=${sessionKey}`);
+    } catch (error) {
+      this.logger.warn(`Failed to clean up one-shot session session_key=${sessionKey}: ${formatError(error)}`);
+    }
+  }
+
+  /** Queue a session cleanup as fire-and-forget (non-blocking). */
+  private enqueueCleanup(sessionKey: string): void {
+    const cleanup = this.tryDeleteSession(sessionKey);
+    this.pendingCleanups.push(cleanup);
+    cleanup.finally(() => {
+      const idx = this.pendingCleanups.indexOf(cleanup);
+      if (idx >= 0) this.pendingCleanups.splice(idx, 1);
+    });
+  }
+
+  /** Await all pending session cleanups. Called before new delivery and on stop(). */
+  async drainPendingCleanups(): Promise<void> {
+    if (this.pendingCleanups.length === 0) return;
+    this.logger.debug(`Draining ${this.pendingCleanups.length} pending session cleanup(s)`);
+    await Promise.allSettled([...this.pendingCleanups]);
   }
 
   private logDispatch(result: Extract<NotifyAttemptResult, { ok: true }>): void {

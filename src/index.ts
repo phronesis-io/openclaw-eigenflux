@@ -148,6 +148,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
         await runtime.waitForPendingDelivery();
+        await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
       }
       runtimes = [];
@@ -225,6 +226,11 @@ async function deliverNotInstalledPrompt(
   await notifier.deliver(
     buildNotInstalledPromptTemplate({ bin, installCommand: INSTALL_COMMAND })
   );
+}
+
+/** Dedicated session key for feed delivery, isolated from the main DM session. */
+function buildFeedSessionKey(serverName: string): string {
+  return `eigenflux:feed:${serverName}`;
 }
 
 function createServerRuntime(
@@ -324,7 +330,8 @@ function createServerRuntime(
       const startedAt = Date.now();
       feedDeliveryStartedAt = startedAt;
       activeFeedDelivery = notifier.deliver(
-        buildFeedPayloadPromptTemplate(payload, getPromptContext())
+        buildFeedPayloadPromptTemplate(payload, getPromptContext()),
+        { targetSessionKey: buildFeedSessionKey(server.name) }
       ).finally(() => {
         const duration = Date.now() - startedAt;
         logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
