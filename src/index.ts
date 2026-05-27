@@ -335,8 +335,12 @@ function createServerRuntime(
       ).finally(() => {
         const duration = Date.now() - startedAt;
         logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
-        feedDeliveryInFlight = false;
-        activeFeedDelivery = null;
+        // Only clear flags if this delivery is still the current one.
+        // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
+        if (feedDeliveryStartedAt === startedAt) {
+          feedDeliveryInFlight = false;
+          activeFeedDelivery = null;
+        }
       });
 
       await activeFeedDelivery;
