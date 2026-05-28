@@ -103,6 +103,8 @@ function registerPlugin(api: OpenClawPluginApi): void {
 
   const pluginConfig = resolvePluginConfig(api.pluginConfig, logger);
   const eigenfluxHome = resolveEigenfluxHome();
+  // Set once at startup so all CLI child processes inherit it automatically.
+  process.env.EIGENFLUX_HOME = eigenfluxHome;
   const store = createInMemoryPluginStore();
 
   let runtimes: ServerRuntime[] = [];
