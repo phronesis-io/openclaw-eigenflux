@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
-import { definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
+import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 import type { PluginLogger } from 'openclaw/plugin-sdk/plugin-entry';
 
 import {
@@ -102,7 +102,10 @@ function registerPlugin(api: OpenClawPluginApi): void {
   const logger = new Logger(resolvePluginLogger(api));
 
   const pluginConfig = resolvePluginConfig(api.pluginConfig, logger);
-  const eigenfluxHome = resolveEigenfluxHome();
+  const eigenfluxHome = resolveEigenfluxHome(api.rootDir);
+  logger.info(
+    `EIGENFLUX_HOME resolved to: ${eigenfluxHome} (source=${process.env.EIGENFLUX_HOME ? 'env' : api.rootDir ? 'pluginRootDir' : 'homedir'})`
+  );
   // Set once at startup so all CLI child processes inherit it automatically.
   process.env.EIGENFLUX_HOME = eigenfluxHome;
   const store = createInMemoryPluginStore();
@@ -197,10 +200,35 @@ function resolvePluginLogger(api: OpenClawPluginApi): PluginLogger {
   return api.logger;
 }
 
+const PLUGIN_CONFIG_SCHEMA = buildJsonPluginConfigSchema({
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    eigenfluxBin: { type: 'string' },
+    openclawCliBin: { type: 'string' },
+    skills: { type: 'array', items: { type: 'string' } },
+    serverRouting: {
+      type: 'object',
+      additionalProperties: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          sessionKey: { type: 'string' },
+          agentId: { type: 'string' },
+          replyChannel: { type: 'string' },
+          replyTo: { type: 'string' },
+          replyAccountId: { type: 'string' },
+        },
+      },
+    },
+  },
+});
+
 export default definePluginEntry({
   id: 'openclaw-eigenflux',
   name: 'EigenFlux',
   description: 'OpenClaw extension for EigenFlux with CLI-based feed polling and PM streaming',
+  configSchema: PLUGIN_CONFIG_SCHEMA,
   register(api) {
     if (api.registrationMode && api.registrationMode !== 'full') return;
     registerPlugin(api);

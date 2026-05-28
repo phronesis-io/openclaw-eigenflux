@@ -6,6 +6,7 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { Logger } from './logger';
 
@@ -40,6 +41,41 @@ export class CredentialsLoader {
     this.logger = logger;
     this.credentialsDir = path.join(eigenfluxHome, 'servers', serverName);
     this.credentialsPath = path.join(this.credentialsDir, 'credentials.json');
+    this.migrateFromLegacyPath(eigenfluxHome, serverName);
+  }
+
+  /**
+   * One-time migration: if credentials exist at the legacy ~/.eigenflux path
+   * but not at the current path, copy them over so users don't need to re-auth
+   * after the storage location changes (e.g. sandbox environments).
+   */
+  private migrateFromLegacyPath(eigenfluxHome: string, serverName: string): void {
+    if (fs.existsSync(this.credentialsPath)) {
+      return; // current path already has credentials, nothing to migrate
+    }
+
+    const legacyHome = path.join(os.homedir(), '.eigenflux');
+    if (eigenfluxHome === legacyHome) {
+      return; // same path, no migration needed
+    }
+
+    const legacyCredentialsPath = path.join(legacyHome, 'servers', serverName, 'credentials.json');
+    if (!fs.existsSync(legacyCredentialsPath)) {
+      return;
+    }
+
+    try {
+      const content = fs.readFileSync(legacyCredentialsPath, 'utf-8');
+      fs.mkdirSync(this.credentialsDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(this.credentialsPath, content, { encoding: 'utf-8', mode: 0o600 });
+      this.logger.info(
+        `Migrated credentials from legacy path ${legacyCredentialsPath} to ${this.credentialsPath}`
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to migrate credentials from ${legacyCredentialsPath}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   loadAccessToken(): string | null {
@@ -94,8 +130,11 @@ export class CredentialsLoader {
   }
 
   saveAccessToken(token: string, email?: string, expiresAt?: number): void {
-    if (!fs.existsSync(this.credentialsDir)) {
-      fs.mkdirSync(this.credentialsDir, { recursive: true });
+    try {
+      fs.mkdirSync(this.credentialsDir, { recursive: true, mode: 0o700 });
+    } catch (mkdirError) {
+      this.logger.error(`Failed to create credentials directory: ${this.credentialsDir}`, mkdirError);
+      return;
     }
 
     const credentials: EigenFluxCredentials = {
@@ -105,7 +144,10 @@ export class CredentialsLoader {
     };
 
     try {
-      fs.writeFileSync(this.credentialsPath, JSON.stringify(credentials, null, 2), 'utf-8');
+      fs.writeFileSync(this.credentialsPath, JSON.stringify(credentials, null, 2), {
+        encoding: 'utf-8',
+        mode: 0o600,
+      });
       this.logger.info(`Saved access token to ${this.credentialsPath}`);
     } catch (error) {
       this.logger.error('Failed to save credentials file', error);

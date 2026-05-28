@@ -122,6 +122,20 @@ describe('resolveEigenfluxHome', () => {
     const home = resolveEigenfluxHome();
     expect(home).toBe('/custom/path/.eigenflux');
   });
+
+  test('uses baseDir when EIGENFLUX_HOME is not set', () => {
+    delete process.env.EIGENFLUX_HOME;
+
+    const home = resolveEigenfluxHome('/opt/openclaw/plugins/eigenflux');
+    expect(home).toBe('/opt/openclaw/plugins/eigenflux/.eigenflux');
+  });
+
+  test('EIGENFLUX_HOME takes precedence over baseDir', () => {
+    process.env.EIGENFLUX_HOME = '/explicit/override';
+
+    const home = resolveEigenfluxHome('/opt/openclaw/plugins/eigenflux');
+    expect(home).toBe('/explicit/override/.eigenflux');
+  });
 });
 
 describe('discoverServers', () => {

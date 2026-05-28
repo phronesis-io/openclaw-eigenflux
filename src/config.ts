@@ -195,7 +195,7 @@ export async function discoverServers(
 
 // ─── EigenFlux Home ─────────────────────────────────────────────────────────
 
-export function resolveEigenfluxHome(): string {
+export function resolveEigenfluxHome(baseDir?: string): string {
   const envHome = process.env.EIGENFLUX_HOME;
   if (envHome) {
     const expanded = expandHomeDir(envHome);
@@ -203,6 +203,9 @@ export function resolveEigenfluxHome(): string {
       return path.join(expanded, '.eigenflux');
     }
     return expanded;
+  }
+  if (baseDir) {
+    return path.join(baseDir, '.eigenflux');
   }
   return path.join(os.homedir(), '.eigenflux');
 }
