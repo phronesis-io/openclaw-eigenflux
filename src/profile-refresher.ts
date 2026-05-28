@@ -137,6 +137,12 @@ export class EigenFluxProfileRefresher {
       return;
     }
 
+    const profileData = profileResult.data;
+    if (!profileData) {
+      this.config.logger.error('Profile fetch returned empty data');
+      return;
+    }
+
     const items = itemsResult.data?.items ?? [];
     if (items.length === 0) {
       this.config.logger.info('Profile refresh skipped: no recent items');
@@ -144,7 +150,7 @@ export class EigenFluxProfileRefresher {
     }
 
     // 3. Assemble prompt and deliver
-    const prompt = buildRefreshPrompt(profileResult.data, items);
+    const prompt = buildRefreshPrompt(profileData, items);
     try {
       if (!this.running) return;
       await this.config.onRefreshPrompt(prompt);
