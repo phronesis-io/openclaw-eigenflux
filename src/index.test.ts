@@ -878,6 +878,8 @@ describe('register unit', () => {
     } as any);
 
     await services[0].start();
+    // Allow notifier's async resolveRoute() to settle before asserting
+    await new Promise((r) => setImmediate(r));
 
     // First delivery should have been triggered
     expect(subagentRun).toHaveBeenCalledTimes(1);

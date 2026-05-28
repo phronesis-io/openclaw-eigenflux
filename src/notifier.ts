@@ -132,10 +132,19 @@ export class EigenFluxNotifier {
       // This prevents orphan sessions from accumulating if deleteSession was slow.
       await this.drainPendingCleanups();
 
+      // Resolve the delivery target (channel/to/accountId) from the standard route,
+      // then override the sessionKey with a one-shot key to avoid context accumulation.
+      // Without this, the one-shot session has no delivery context and OpenClaw can't
+      // route the agent's reply to the correct channel (e.g. Feishu "requires target").
+      const baseRoute = await this.resolveRoute();
+
       const sessionKey = `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
       const route: ResolvedNotificationRoute = {
         sessionKey,
-        agentId: this.config.agentId,
+        agentId: baseRoute.route.agentId,
+        ...(baseRoute.route.replyChannel && { replyChannel: baseRoute.route.replyChannel }),
+        ...(baseRoute.route.replyTo && { replyTo: baseRoute.route.replyTo }),
+        ...(baseRoute.route.replyAccountId && { replyAccountId: baseRoute.route.replyAccountId }),
       };
       this.logger.info(
         `Delivery route resolved: source=targeted-oneshot, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
