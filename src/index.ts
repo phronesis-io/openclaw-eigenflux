@@ -108,6 +108,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
   );
   // Set once at startup so all CLI child processes inherit it automatically.
   process.env.EIGENFLUX_HOME = eigenfluxHome;
+  process.env.EIGENFLUX_HOST = `openclaw/${PLUGIN_CONFIG.PLUGIN_VERSION}`;
   const store = createInMemoryPluginStore();
 
   let runtimes: ServerRuntime[] = [];
@@ -138,6 +139,13 @@ function registerPlugin(api: OpenClawPluginApi): void {
       }
 
       logger.info(`Discovered ${servers.length} server(s): ${servers.map((s) => s.name).join(', ')}`);
+
+      // Derive EIGENFLUX_CHANNEL from the first server's routing config.
+      if (!process.env.EIGENFLUX_CHANNEL) {
+        const firstRouting = pluginConfig.serverRouting[servers[0].name];
+        const channel = firstRouting?.replyChannel;
+        process.env.EIGENFLUX_CHANNEL = channel || 'openclaw';
+      }
 
       runtimes = servers.map((server) =>
         createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
