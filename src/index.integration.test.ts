@@ -17,6 +17,7 @@ jest.mock('os', () => {
 // cannot be loaded by Jest's CJS transform pipeline.
 jest.mock('openclaw/plugin-sdk/plugin-entry', () => ({
   definePluginEntry: (opts: any) => opts,
+  buildJsonPluginConfigSchema: (schema: any) => schema,
 }));
 
 // Mock discoverServers and resolveEigenfluxHome

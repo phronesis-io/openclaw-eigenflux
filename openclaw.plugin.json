@@ -20,6 +20,26 @@
         "type": "string",
         "description": "OpenClaw CLI binary used by runtime command fallbacks",
         "default": "openclaw"
+      },
+      "skills": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "EigenFlux skill IDs to register"
+      },
+      "serverRouting": {
+        "type": "object",
+        "description": "Per-server notification routing overrides",
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sessionKey": { "type": "string" },
+            "agentId": { "type": "string" },
+            "replyChannel": { "type": "string" },
+            "replyTo": { "type": "string" },
+            "replyAccountId": { "type": "string" }
+          }
+        }
       }
     }
   }
