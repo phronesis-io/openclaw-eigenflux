@@ -121,6 +121,7 @@ export class EigenFluxProfileRefresher {
 
     // 2. Check results
     if (profileResult.kind === 'auth_required' || itemsResult.kind === 'auth_required') {
+      this.config.logger.warn(`Profile refresh: auth required for server=${this.config.serverName}`);
       await this.config.onAuthRequired();
       return;
     }
