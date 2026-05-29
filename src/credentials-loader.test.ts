@@ -45,7 +45,7 @@ describe('CredentialsLoader', () => {
     expect(loader.loadAccessToken()).toBeNull();
   });
 
-  test('returns expired auth state when credentials file token is stale', () => {
+  test('returns available even when local expires_at is in the past (trusts server-side sliding expiration)', () => {
     const serverDir = path.join(eigenfluxHome, 'servers', serverName);
     fs.writeFileSync(
       path.join(serverDir, 'credentials.json'),
@@ -59,10 +59,11 @@ describe('CredentialsLoader', () => {
     const loader = new CredentialsLoader(createLogger(), eigenfluxHome, serverName);
     expect(loader.loadAuthState()).toEqual(
       expect.objectContaining({
-        status: 'expired',
+        status: 'available',
+        accessToken: 'at_expired_token',
       })
     );
-    expect(loader.loadAccessToken()).toBeNull();
+    expect(loader.loadAccessToken()).toBe('at_expired_token');
   });
 
   test('saveAccessToken creates the server directory and writes credentials.json', () => {

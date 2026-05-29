@@ -101,19 +101,12 @@ export class CredentialsLoader {
         const credentials: EigenFluxCredentials = JSON.parse(content);
 
         if (credentials.access_token) {
-          if (credentials.expires_at) {
-            const now = Date.now();
-            if (now >= credentials.expires_at) {
-              this.logger.warn('Access token has expired');
-              return {
-                status: 'expired',
-                credentialsPath: this.credentialsPath,
-                expiresAt: credentials.expires_at,
-                email: credentials.email,
-              };
-            }
-          }
-
+          // Trust server-side sliding expiration: the server extends the session
+          // on every successful API call (ValidateSession → UpdateSessionActivity),
+          // so the local expires_at written at login time becomes stale quickly.
+          // If the token is actually expired server-side, the CLI will return
+          // exit code 4 (auth_required) on the next API call, which triggers
+          // the onAuthRequired flow. No need to reject locally based on expires_at.
           this.logger.info(`Loaded access token from ${this.credentialsPath}`);
           return {
             status: 'available',
@@ -135,6 +128,7 @@ export class CredentialsLoader {
   }
 
   saveAccessToken(token: string, email?: string, expiresAt?: number): void {
+    this.logger.info(`Saving access token: path=${this.credentialsPath}, email=${email ?? 'n/a'}`);
     try {
       fs.mkdirSync(this.credentialsDir, { recursive: true, mode: 0o700 });
     } catch (mkdirError) {
