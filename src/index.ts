@@ -1,3 +1,5 @@
+import * as os from 'os';
+
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
 import type { PluginLogger } from 'openclaw/plugin-sdk/plugin-entry';
@@ -104,7 +106,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
   const pluginConfig = resolvePluginConfig(api.pluginConfig, logger);
   const eigenfluxHome = resolveEigenfluxHome(api.rootDir);
   logger.info(
-    `EIGENFLUX_HOME resolved to: ${eigenfluxHome} (source=${process.env.EIGENFLUX_HOME ? 'env' : api.rootDir ? 'pluginRootDir' : 'homedir'})`
+    `EigenFlux home resolved: path=${eigenfluxHome}, source=${process.env.EIGENFLUX_HOME ? 'EIGENFLUX_HOME env' : api.rootDir ? 'api.rootDir' : 'os.homedir()'}, rootDir=${api.rootDir ?? 'undefined'}, homedir=${os.homedir()}`
   );
   // Set once at startup so all CLI child processes inherit it automatically.
   process.env.EIGENFLUX_HOME = eigenfluxHome;

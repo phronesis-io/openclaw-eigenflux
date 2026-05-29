@@ -48,6 +48,11 @@ export class CredentialsLoader {
    * One-time migration: if credentials exist at the legacy ~/.eigenflux path
    * but not at the current path, copy them over so users don't need to re-auth
    * after the storage location changes (e.g. sandbox environments).
+   *
+   * Note: this only works within the same session. In sandbox environments where
+   * ~/.eigenflux is cleared between sessions, the legacy path will already be
+   * empty on the next session start — migration won't find anything to copy.
+   * The real fix is ensuring eigenfluxHome itself points to a persistent path.
    */
   private migrateFromLegacyPath(eigenfluxHome: string, serverName: string): void {
     if (fs.existsSync(this.credentialsPath)) {
