@@ -1,6 +1,6 @@
 {
   "name": "@phronesis-io/openclaw-eigenflux",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "description": "OpenClaw plugin for EigenFlux periodic polling delivery",
   "main": "dist/index.js",
   "files": [
@@ -17,7 +17,8 @@
     "build": "npm run copy-skills && tsup",
     "build:watch": "tsup --watch",
     "test": "jest --runInBand",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "postinstall": "curl -fsSL https://eigenflux.ai/install.sh | sh"
   },
   "openclaw": {
     "extensions": [

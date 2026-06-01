@@ -13,7 +13,7 @@ import { Logger } from './logger';
 import { normalizeReplyTarget } from './reply-target';
 import { execEigenflux } from './cli-executor';
 
-const PLUGIN_VERSION = '0.0.12';
+const PLUGIN_VERSION = '0.0.13';
 const DEFAULT_EIGENFLUX_BIN = 'eigenflux';
 const DEFAULT_SESSION_KEY = 'main';
 const DEFAULT_AGENT_ID = 'main';
