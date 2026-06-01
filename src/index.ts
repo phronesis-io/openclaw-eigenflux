@@ -36,6 +36,14 @@ import { EigenFluxNotifier } from './notifier';
 import { normalizeReplyTarget } from './reply-target';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 
+type CredentialBackup = {
+  access_token: string;
+  email?: string;
+  expires_at?: number;
+  server: string;
+  backed_up_at: number;
+};
+
 type JsonRecord = Record<string, unknown>;
 
 type JsonApiSuccess<T extends JsonRecord> = {
@@ -233,6 +241,11 @@ const PLUGIN_CONFIG_SCHEMA = buildJsonPluginConfigSchema({
         },
       },
     },
+    _credentialBackup: {
+      type: 'object',
+      description: 'Internal: persisted credential backups for sandbox environments',
+      additionalProperties: { type: 'object' },
+    },
   },
 });
 
@@ -248,6 +261,66 @@ export default definePluginEntry({
 });
 
 const INSTALL_COMMAND = 'curl -fsSL https://eigenflux.ai/install.sh | bash';
+
+/**
+ * Backup credentials to OpenClaw config file for sandbox persistence.
+ * In sandbox environments, ~/.eigenflux is wiped between sessions, but
+ * OpenClaw's config.json (~/.openclaw/openclaw.json) survives.
+ *
+ * Note: api.pluginConfig is a startup snapshot — writes via mutateConfigFile
+ * persist to disk for the next session but are NOT visible in-process.
+ */
+const _lastBackedUpToken: Record<string, string> = {};
+
+function backupCredentialsToConfig(
+  api: OpenClawPluginApi,
+  logger: Logger,
+  credentialsLoader: CredentialsLoader,
+  serverName: string
+): void {
+  const authState = credentialsLoader.loadAuthState();
+  if (authState.status !== 'available') {
+    logger.debug(`[credential-backup] skip: credentials not available for server=${serverName}`);
+    return;
+  }
+
+  if (_lastBackedUpToken[serverName] === authState.accessToken) {
+    return;
+  }
+
+  const backup: CredentialBackup = {
+    access_token: authState.accessToken,
+    email: authState.email,
+    expires_at: authState.expiresAt ?? Date.now() + 30 * 24 * 60 * 60 * 1000,
+    server: serverName,
+    backed_up_at: Date.now(),
+  };
+
+  logger.info(
+    `[credential-backup] backing up credentials to OpenClaw config: server=${serverName}, email=${authState.email ?? 'n/a'}`
+  );
+
+  try {
+    api.runtime.config.mutateConfigFile({
+      afterWrite: { mode: 'none', reason: 'eigenflux credential backup' },
+      mutate(draft: any) {
+        draft.plugins ??= {};
+        draft.plugins.entries ??= {};
+        draft.plugins.entries['openclaw-eigenflux'] ??= {};
+        draft.plugins.entries['openclaw-eigenflux'].config ??= {};
+        draft.plugins.entries['openclaw-eigenflux'].config._credentialBackup ??= {};
+        draft.plugins.entries['openclaw-eigenflux'].config._credentialBackup[serverName] = backup;
+      },
+    }).then(() => {
+      _lastBackedUpToken[serverName] = authState.accessToken;
+      logger.info(`[credential-backup] saved to OpenClaw config for server=${serverName}`);
+    }).catch((err: Error) => {
+      logger.warn(`[credential-backup] failed to save: ${err.message}`);
+    });
+  } catch (err) {
+    logger.warn(`[credential-backup] sync error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 async function deliverNotInstalledPrompt(
   api: OpenClawPluginApi,
@@ -290,6 +363,20 @@ function createServerRuntime(
   const routing = pluginConfig.serverRouting[server.name] ?? DEFAULT_ROUTING;
 
   const credentialsLoader = new CredentialsLoader(logger, eigenfluxHome, server.name);
+
+  // Try restoring credentials from OpenClaw config backup (sandbox persistence)
+  try {
+    const rawConfig = api.pluginConfig as Record<string, unknown> | undefined;
+    const backupMap = rawConfig?._credentialBackup as Record<string, CredentialBackup> | undefined;
+    const backup = backupMap?.[server.name];
+    if (backup?.access_token) {
+      credentialsLoader.restoreFromBackup(backup);
+    } else {
+      logger.debug(`[credential-restore] no backup found in OpenClaw config for server=${server.name}`);
+    }
+  } catch (err) {
+    logger.warn(`[credential-restore] failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   const notifier = new EigenFluxNotifier(api, logger, {
     store,
@@ -346,6 +433,9 @@ function createServerRuntime(
       // Always reset auth gate on successful poll, even if delivery is skipped
       resetAuthPromptGate();
 
+      // Backup credentials to OpenClaw config for sandbox persistence
+      backupCredentialsToConfig(api, logger, credentialsLoader, server.name);
+
       const items = payload.data?.items ?? [];
       const notifications = payload.data?.notifications ?? [];
 
@@ -400,7 +490,10 @@ function createServerRuntime(
     logger,
     onPmEvent: async (event: PmStreamEvent) => {
       resetAuthPromptGate();
-      await notifier.deliver(buildPmStreamEventPromptTemplate(event, getPromptContext()));
+      const messages = event.data?.messages ?? [];
+      if (messages.length > 0) {
+        await notifier.deliver(buildPmStreamEventPromptTemplate(event, getPromptContext()));
+      }
     },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });

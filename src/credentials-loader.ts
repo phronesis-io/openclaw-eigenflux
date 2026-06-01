@@ -127,6 +127,29 @@ export class CredentialsLoader {
     };
   }
 
+  /**
+   * Restore credentials from a backup object (e.g. OpenClaw config).
+   * Only writes if no local credentials.json exists yet.
+   * Returns true if credentials were restored.
+   */
+  restoreFromBackup(backup: { access_token: string; email?: string; expires_at?: number }): boolean {
+    if (fs.existsSync(this.credentialsPath)) {
+      this.logger.debug(`[credential-restore] skip: credentials.json already exists at ${this.credentialsPath}`);
+      return false;
+    }
+
+    if (!backup?.access_token) {
+      this.logger.debug(`[credential-restore] skip: backup has no access_token`);
+      return false;
+    }
+
+    this.saveAccessToken(backup.access_token, backup.email, backup.expires_at);
+    this.logger.info(
+      `[credential-restore] restored from backup: email=${backup.email ?? 'n/a'}, path=${this.credentialsPath}`
+    );
+    return true;
+  }
+
   saveAccessToken(token: string, email?: string, expiresAt?: number): void {
     this.logger.info(`Saving access token: path=${this.credentialsPath}, email=${email ?? 'n/a'}`);
     try {
