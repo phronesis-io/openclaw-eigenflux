@@ -228,6 +228,79 @@ describe('EigenFluxPollingClient', () => {
     expect(onFeedPolled).not.toHaveBeenCalled();
   });
 
+  test('invokes onPollSuccess on every successful poll, even with empty feed', async () => {
+    const onPollSuccess = jest.fn().mockResolvedValue(undefined);
+
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: { items: [], has_more: false, notifications: [] },
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60),
+      logger: createLogger(),
+      onFeedPolled: jest.fn().mockResolvedValue(undefined),
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+      onPollSuccess,
+    });
+
+    const result = await client.pollOnce();
+
+    expect(result.kind).toBe('success');
+    expect(onPollSuccess).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not invoke onPollSuccess when CLI returns auth_required', async () => {
+    const onPollSuccess = jest.fn().mockResolvedValue(undefined);
+
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'auth_required',
+      stderr: 'token expired',
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60),
+      logger: createLogger(),
+      onFeedPolled: jest.fn().mockResolvedValue(undefined),
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+      onPollSuccess,
+    });
+
+    await client.pollOnce();
+    expect(onPollSuccess).not.toHaveBeenCalled();
+  });
+
+  test('onPollSuccess rejection does not fail the poll', async () => {
+    const loggerSpies = createLoggerSpies();
+    const onPollSuccess = jest.fn().mockRejectedValue(new Error('report boom'));
+
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: { items: [], has_more: false, notifications: [] },
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60),
+      logger: createLogger(loggerSpies),
+      onFeedPolled: jest.fn().mockResolvedValue(undefined),
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+      onPollSuccess,
+    });
+
+    const result = await client.pollOnce();
+
+    expect(result.kind).toBe('success');
+    expect(loggerSpies.warn).toHaveBeenCalledWith(
+      expect.stringContaining('onPollSuccess hook failed')
+    );
+  });
+
   test('re-resolves pollInterval after every poll and reschedules with the new value', async () => {
     jest.useFakeTimers();
     try {

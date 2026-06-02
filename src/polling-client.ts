@@ -104,6 +104,14 @@ export interface PollingClientConfig {
   logger: Logger;
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
+  /**
+   * Optional hook invoked once per successful poll (heartbeat), regardless of
+   * whether the feed contained any items/notifications. Used for side-channel
+   * housekeeping such as reporting agent settings to the backend. Must be
+   * best-effort: it is awaited but its rejection is caught and logged so it can
+   * never interrupt polling.
+   */
+  onPollSuccess?: (payload: FeedResponse) => Promise<void>;
 }
 
 export interface AuthRequiredEvent {
@@ -259,6 +267,18 @@ export class EigenFluxPollingClient {
 
         if (notifyFeed && (items.length > 0 || notifications.length > 0)) {
           await this.config.onFeedPolled(feedResponse);
+        }
+
+        // Fire the per-heartbeat hook on every successful poll, independent of
+        // feed content. Best-effort: never let it break the poll loop.
+        if (this.config.onPollSuccess) {
+          try {
+            await this.config.onPollSuccess(feedResponse);
+          } catch (hookError) {
+            this.config.logger.warn(
+              `onPollSuccess hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
+            );
+          }
         }
 
         return { kind: 'success', payload: feedResponse };

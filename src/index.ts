@@ -12,6 +12,7 @@ import {
 } from './polling-client';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
+import { EigenFluxSettingsReporter } from './settings-reporter';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
 import { CredentialsLoader } from './credentials-loader';
@@ -79,6 +80,7 @@ type ServerRuntime = {
   feedPoller: EigenFluxPollingClient;
   streamClient: EigenFluxStreamClient;
   profileRefresher: EigenFluxProfileRefresher;
+  settingsReporter: EigenFluxSettingsReporter;
   getPromptContext: () => EigenFluxPromptServerContext;
   waitForPendingDelivery: () => Promise<void>;
 };
@@ -415,6 +417,16 @@ function createServerRuntime(
     );
   };
 
+  // Pushes the agent's runtime mode to the backend once per heartbeat via the
+  // eigenflux CLI (`settings push`). The CLI handles change-detection, dedup,
+  // and reading feed_delivery_preference from its own config. Best-effort:
+  // never interrupts polling.
+  const settingsReporter = new EigenFluxSettingsReporter({
+    serverName: server.name,
+    eigenfluxBin: pluginConfig.eigenfluxBin,
+    logger,
+  });
+
   // Guard: notifier.deliver() may take longer than the poll interval,
   // so we skip overlapping deliveries to avoid duplicate agent tasks.
   let feedDeliveryInFlight = false;
@@ -481,6 +493,11 @@ function createServerRuntime(
 
       await activeFeedDelivery;
     },
+    onPollSuccess: async () => {
+      // Push local settings to the backend once per heartbeat (throttled
+      // internally). Errors are swallowed inside report().
+      await settingsReporter.report();
+    },
     onAuthRequired: notifyAuthRequired,
   });
 
@@ -523,6 +540,7 @@ function createServerRuntime(
     feedPoller,
     streamClient,
     profileRefresher,
+    settingsReporter,
     getPromptContext,
     async waitForPendingDelivery(): Promise<void> {
       if (activeFeedDelivery) {
