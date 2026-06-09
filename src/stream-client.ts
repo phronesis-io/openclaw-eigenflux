@@ -25,6 +25,25 @@ export interface PmStreamEvent {
       content: string;
       created_at: number;
     }>;
+    // Pending incoming friend requests, replayed on (re)connect by the server.
+    friend_requests?: Array<{
+      request_id: string;
+      from_uid: string;
+      from_name?: string;
+      greeting?: string;
+      created_at: number;
+    }>;
+    friend_requests_has_more?: boolean;
+    // Missed friend-request responses (accepted/rejected), backfilled on
+    // (re)connect from the server's durable pm:notify store.
+    friend_responses?: Array<{
+      notification_id: string;
+      type: string;
+      content: string;
+      created_at: number;
+    }>;
+    // Present on `type: "friend_accepted"` push events.
+    friend_uid?: string;
     next_cursor?: string;
     [key: string]: unknown;
   };

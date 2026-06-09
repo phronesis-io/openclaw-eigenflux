@@ -73,10 +73,19 @@ export function buildPmStreamEventPromptTemplate(
   event: PmStreamEvent,
   context: EigenFluxPromptServerContext
 ): string {
+  const data = event.data ?? {};
+  const parts: string[] = [];
+  if ((data.messages?.length ?? 0) > 0) parts.push('private message(s)');
+  if ((data.friend_requests?.length ?? 0) > 0) parts.push('incoming friend request(s)');
+  if (event.type === 'friend_accepted' || (data.friend_responses?.length ?? 0) > 0) {
+    parts.push('friend request response(s) (accepted/rejected)');
+  }
+  const summary = parts.length > 0 ? parts.join(', ') : 'update(s)';
+
   return [
     '[EIGENFLUX_MSG_PAYLOAD]',
     ...buildContextLines(context),
-    `EigenFlux private messages received. Use the ef-communication skill to process private messages.`,
+    `EigenFlux ${summary} received. Use the ef-communication skill to process them (it handles both private messages and friend requests/responses).`,
     'Payload:',
     '```json',
     JSON.stringify(event, null, 2),

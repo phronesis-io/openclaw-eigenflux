@@ -490,8 +490,16 @@ function createServerRuntime(
     logger,
     onPmEvent: async (event: PmStreamEvent) => {
       resetAuthPromptGate();
-      const messages = event.data?.messages ?? [];
-      if (messages.length > 0) {
+      // Deliver when the event carries anything actionable. Friend events
+      // (friend_request / friend_accepted) arrive with empty `messages`, so a
+      // `messages.length > 0` gate would silently drop them.
+      const data = event.data ?? {};
+      const actionable =
+        (data.messages?.length ?? 0) > 0 ||
+        (data.friend_requests?.length ?? 0) > 0 ||
+        (data.friend_responses?.length ?? 0) > 0 ||
+        event.type === 'friend_accepted';
+      if (actionable) {
         await notifier.deliver(buildPmStreamEventPromptTemplate(event, getPromptContext()));
       }
     },

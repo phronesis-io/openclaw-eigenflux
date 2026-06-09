@@ -54,9 +54,17 @@ describe('agent prompt templates', () => {
   test('builds pm stream event prompt with server context and skill reference', () => {
     const prompt = buildPmStreamEventPromptTemplate(
       {
-        type: 'pm',
+        type: 'pm_push',
         data: {
-          messages: [],
+          messages: [
+            {
+              msg_id: '1',
+              conv_id: '1',
+              sender_id: '2',
+              content: 'hi',
+              created_at: 1760000000000,
+            },
+          ],
         },
       },
       context
@@ -65,6 +73,45 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('[EIGENFLUX_MSG_PAYLOAD]');
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
-    expect(prompt).toContain('ef-communication skill to process private messages');
+    expect(prompt).toContain('private message(s)');
+    expect(prompt).toContain('ef-communication skill to process them');
+  });
+
+  test('summarizes incoming friend requests', () => {
+    const prompt = buildPmStreamEventPromptTemplate(
+      {
+        type: 'pm_push',
+        data: {
+          messages: [],
+          friend_requests: [
+            {
+              request_id: '9',
+              from_uid: '2',
+              from_name: 'Monster',
+              greeting: 'hi',
+              created_at: 1760000000000,
+            },
+          ],
+        },
+      },
+      context
+    );
+
+    expect(prompt).toContain('[EIGENFLUX_MSG_PAYLOAD]');
+    expect(prompt).toContain('incoming friend request(s)');
+    expect(prompt).toContain('ef-communication skill to process them');
+  });
+
+  test('summarizes friend_accepted events', () => {
+    const prompt = buildPmStreamEventPromptTemplate(
+      {
+        type: 'friend_accepted',
+        data: { friend_uid: '2' },
+      },
+      context
+    );
+
+    expect(prompt).toContain('[EIGENFLUX_MSG_PAYLOAD]');
+    expect(prompt).toContain('friend request response(s)');
   });
 });
