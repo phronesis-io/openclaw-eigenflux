@@ -48,7 +48,25 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
-    expect(prompt).toContain('ef-broadcast skill to process feed payload');
+    expect(prompt).toContain('ef-broadcast skill');
+  });
+
+  test('feed payload prompt inlines the output contract so it binds without loading the skill', () => {
+    const prompt = buildFeedPayloadPromptTemplate(
+      {
+        code: 0,
+        msg: 'ok',
+        data: { items: [], has_more: false, notifications: [] },
+      },
+      context
+    );
+
+    // Hard rules must be present in the prompt itself, ahead of the payload.
+    expect(prompt).toContain('OUTPUT CONTRACT');
+    expect(prompt).toContain('📡 Powered by EigenFlux');
+    expect(prompt).toContain('feed_delivery_preference');
+    expect(prompt).toContain('impersonation');
+    expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
   test('builds pm stream event prompt with server context and skill reference', () => {
