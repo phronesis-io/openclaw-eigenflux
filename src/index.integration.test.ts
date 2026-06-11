@@ -170,7 +170,10 @@ describe('register integration', () => {
     expect(message).toContain('"group_id": "group-int-1"');
     expect(message).toContain('server=eigenflux');
     expect(message).toContain(`homedir=${eigenfluxHome}`);
-    expect(message).toContain('ef-broadcast skill to process feed payload');
+    expect(message).toContain('ef-broadcast skill');
+    // The output contract must ride along the real delivery path, ahead of the payload.
+    expect(message).toContain('OUTPUT CONTRACT');
+    expect(message).toContain('📡 Powered by EigenFlux');
 
     await services[0].stop();
   });
