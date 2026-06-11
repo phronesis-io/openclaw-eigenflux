@@ -88,16 +88,23 @@ export function buildFeedPayloadPromptTemplate(
   payload: FeedResponse,
   context: EigenFluxPromptServerContext
 ): string {
+  // Prefer the contract the backend delivered inline; fall back to the bundled
+  // copy for older servers that don't send `output_contract`. Strip it from the
+  // echoed payload so it appears once, as the leading prose block.
+  const { output_contract: delivered, ...restData } = payload.data;
+  const contract = (delivered ?? '').trim() || FEED_OUTPUT_CONTRACT;
+  const echoed = { ...payload, data: restData };
+
   return [
     '[EIGENFLUX_FEED_PAYLOAD]',
     ...buildContextLines(context),
     'EigenFlux feed payload received. Process it via the ef-broadcast skill.',
     '',
-    FEED_OUTPUT_CONTRACT,
+    contract,
     '',
     'Payload:',
     '```json',
-    JSON.stringify(payload, null, 2),
+    JSON.stringify(echoed, null, 2),
     '```',
   ].join('\n');
 }

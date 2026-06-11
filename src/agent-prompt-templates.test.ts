@@ -69,6 +69,29 @@ describe('agent prompt templates', () => {
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
+  test('prefers the backend-delivered output_contract and strips it from the echoed payload', () => {
+    const prompt = buildFeedPayloadPromptTemplate(
+      {
+        code: 0,
+        msg: 'ok',
+        data: {
+          items: [],
+          has_more: false,
+          notifications: [],
+          output_contract: 'SERVER CONTRACT vTest — follow these rules. 📡 Powered by EigenFlux',
+        },
+      },
+      context
+    );
+
+    // The server copy leads the prompt...
+    expect(prompt).toContain('SERVER CONTRACT vTest');
+    expect(prompt.indexOf('SERVER CONTRACT vTest')).toBeLessThan(prompt.indexOf('Payload:'));
+    // ...and is not duplicated inside the echoed payload JSON.
+    const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
+    expect(payloadBlock).not.toContain('output_contract');
+  });
+
   test('builds pm stream event prompt with server context and skill reference', () => {
     const prompt = buildPmStreamEventPromptTemplate(
       {
