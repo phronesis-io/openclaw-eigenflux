@@ -286,6 +286,41 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
   });
 
+  test('triggerNow runs a refresh immediately when running', async () => {
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'success', data: ITEMS_RESPONSE } as CliResult<any>);
+
+    const refresher = new EigenFluxProfileRefresher({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      logger: createLogger(),
+      onRefreshPrompt,
+      onAuthRequired: jest.fn(),
+    });
+
+    refresher.start();
+    await refresher.triggerNow();
+
+    expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
+    expect(onRefreshPrompt.mock.calls[0][0]).toContain('TestBot');
+
+    refresher.stop();
+  });
+
+  test('triggerNow rejects when not running', async () => {
+    const refresher = new EigenFluxProfileRefresher({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      logger: createLogger(),
+      onRefreshPrompt: jest.fn(),
+      onAuthRequired: jest.fn(),
+    });
+
+    await expect(refresher.triggerNow()).rejects.toThrow('not running');
+  });
+
   test('isRunning returns false after stop', () => {
     const refresher = new EigenFluxProfileRefresher({
       serverName: 'eigenflux',

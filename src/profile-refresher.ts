@@ -101,6 +101,21 @@ export class EigenFluxProfileRefresher {
     this.config.logger.info(`Stopped profile refresher for server=${this.config.serverName}`);
   }
 
+  /**
+   * Run a refresh immediately, out of band from the daily timer. Intended for
+   * manual verification (`/eigenflux refresh`) so the full silent loop can be
+   * exercised on demand instead of waiting for the 1–5 AM window. Requires the
+   * refresher to be started; rejects otherwise. The next scheduled refresh is
+   * left untouched.
+   */
+  async triggerNow(): Promise<void> {
+    if (!this.running) {
+      throw new Error('profile refresher is not running');
+    }
+    this.config.logger.info(`Manual profile refresh triggered for server=${this.config.serverName}`);
+    await this.refresh();
+  }
+
   private scheduleNext(): void {
     if (!this.running) return;
     const delay = msUntilNextRefresh(new Date());
