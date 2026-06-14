@@ -84,6 +84,17 @@ export type DeliverOptions = {
    * Typical use: `eigenflux:feed:<serverName>` for isolated feed processing.
    */
   targetSessionKey?: string;
+  /**
+   * When true, deliver *silently*: run the host agent loop (so it can read its
+   * own memory/session and execute CLI tools like `eigenflux profile update`)
+   * but suppress the user-facing channel reply. Used by the daily profile
+   * refresh so bio updates stay imperceptible to the user.
+   *
+   * Silent delivery only uses the subagent / command-agent transports with
+   * delivery turned off; the heartbeat fallbacks are skipped because they
+   * surface in the user's main session.
+   */
+  silent?: boolean;
 };
 
 type CommandRunner = (
@@ -123,6 +134,7 @@ export class EigenFluxNotifier {
 
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
     const targetKey = options?.targetSessionKey;
+    const silent = options?.silent === true;
 
     // When a target session prefix is provided, generate a one-shot session key
     // (random suffix ensures no context accumulation across heartbeat cycles),
@@ -153,7 +165,7 @@ export class EigenFluxNotifier {
       // Targeted delivery uses only subagent and command-agent transports.
       // Heartbeat fallbacks are excluded because they re-resolve to the main
       // DM session, which would break session isolation.
-      const result = await this.attemptDelivery(message, route, { skipHeartbeat: true });
+      const result = await this.attemptDelivery(message, route, { skipHeartbeat: true, silent });
       if (result.result.ok) {
         this.logDispatch(result.result);
       } else {
@@ -173,7 +185,7 @@ export class EigenFluxNotifier {
       `Delivery route resolved: source=${initial.source}, ${formatRouteForLog(initial.route)}, message_preview=${previewMessage(message)}`
     );
 
-    const firstAttempt = await this.attemptDelivery(message, initial.route);
+    const firstAttempt = await this.attemptDelivery(message, initial.route, { silent });
     if (firstAttempt.result.ok) {
       await this.rememberRouteIfChanged(firstAttempt.finalRoute, initial.source);
       this.logDispatch(firstAttempt.result);
@@ -195,7 +207,7 @@ export class EigenFluxNotifier {
         this.logger.info(
           `Retrying delivery with fresh route: source=${fallback.source}, ${formatRouteForLog(fallback.route)}`
         );
-        const retry = await this.attemptDelivery(message, fallback.route);
+        const retry = await this.attemptDelivery(message, fallback.route, { silent });
         if (retry.result.ok) {
           await this.rememberRouteIfChanged(retry.finalRoute, fallback.source);
           this.logDispatch(retry.result);
@@ -216,18 +228,21 @@ export class EigenFluxNotifier {
   private async attemptDelivery(
     message: string,
     route: ResolvedNotificationRoute,
-    options: { skipHeartbeat?: boolean } = {}
+    options: { skipHeartbeat?: boolean; silent?: boolean } = {}
   ): Promise<{
     result: NotifyAttemptResult;
     finalRoute: ResolvedNotificationRoute;
     errors: string[];
   }> {
+    const silent = options.silent === true;
     const attempts: Array<() => Promise<NotifyAttemptResult>> = [
-      () => this.tryNotifyViaRuntimeSubagent(message, route),
-      () => this.tryNotifyViaRuntimeCommandAgent(message, route),
+      () => this.tryNotifyViaRuntimeSubagent(message, route, silent),
+      () => this.tryNotifyViaRuntimeCommandAgent(message, route, silent),
     ];
 
-    if (!options.skipHeartbeat) {
+    // Heartbeat fallbacks surface in the user's main session, so they can never
+    // be silent. Skip them entirely for silent delivery.
+    if (!options.skipHeartbeat && !silent) {
       attempts.push(
         () => this.tryNotifyViaRuntimeHeartbeat(message, route),
         () => this.tryNotifyViaRuntimeCommandHeartbeat(message),
@@ -261,7 +276,8 @@ export class EigenFluxNotifier {
 
   private async tryNotifyViaRuntimeSubagent(
     message: string,
-    route: ResolvedNotificationRoute
+    route: ResolvedNotificationRoute,
+    silent = false
   ): Promise<NotifyAttemptResult> {
     const runtimeSubagent = this.runtime.subagent;
 
@@ -274,13 +290,16 @@ export class EigenFluxNotifier {
     }
 
     try {
+      // deliver:false still runs the full agent loop (LLM + tool calls), so the
+      // agent can update its bio via the CLI — it just suppresses the channel reply.
+      const deliver = !silent;
       this.logger.info(
-        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=true`
+        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}`
       );
       const { runId } = await runtimeSubagent.run({
         sessionKey: route.sessionKey,
         message,
-        deliver: true,
+        deliver,
         idempotencyKey: randomUUID(),
       });
 
@@ -320,11 +339,12 @@ export class EigenFluxNotifier {
 
   private async tryNotifyViaRuntimeCommandAgent(
     message: string,
-    route: ResolvedNotificationRoute
+    route: ResolvedNotificationRoute,
+    silent = false
   ): Promise<NotifyAttemptResult> {
     return this.runRuntimeCommand(
       'runtime.command.agent',
-      this.buildAgentCliArgs(message, route),
+      this.buildAgentCliArgs(message, route, silent),
       route
     );
   }
@@ -429,7 +449,11 @@ export class EigenFluxNotifier {
     }
   }
 
-  private buildAgentCliArgs(message: string, route: ResolvedNotificationRoute): string[] {
+  private buildAgentCliArgs(
+    message: string,
+    route: ResolvedNotificationRoute,
+    silent = false
+  ): string[] {
     const args = [
       this.config.openclawCliBin,
       'agent',
@@ -437,8 +461,13 @@ export class EigenFluxNotifier {
       message,
       '--agent',
       route.agentId,
-      '--deliver',
     ];
+
+    // --deliver runs the channel reply; omit it for silent delivery so the
+    // agent loop still runs (and can call the CLI) without messaging the user.
+    if (!silent) {
+      args.push('--deliver');
+    }
 
     if (route.replyChannel) {
       args.push('--reply-channel', route.replyChannel);

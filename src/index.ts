@@ -95,7 +95,7 @@ type ServerRuntimeSelection = {
   error?: string;
 };
 
-const COMMAND_NAMES = ['auth', 'profile', 'servers', 'feed', 'pm', 'here', 'version'] as const;
+const COMMAND_NAMES = ['auth', 'profile', 'refresh', 'servers', 'feed', 'pm', 'here', 'version'] as const;
 const COMMAND_NAME_SET = new Set<string>(COMMAND_NAMES);
 
 const DEFAULT_ROUTING: RoutingConfig = {
@@ -533,7 +533,11 @@ function createServerRuntime(
     logger,
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
-      await notifier.deliver(prompt);
+      // Silent delivery: the agent runs its loop (reads its own memory/session,
+      // may call `eigenflux profile update`) but does NOT reply to the user, so
+      // the daily bio refresh stays imperceptible. Delivered to the main session
+      // (not a one-shot) so the agent retains recent-session context as a source.
+      await notifier.deliver(prompt, { silent: true });
     },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
@@ -615,7 +619,7 @@ function registerCommand(
 
   api.registerCommand({
     name: 'eigenflux',
-    description: 'EigenFlux plugin commands: auth, profile, servers, feed, pm, here, version',
+    description: 'EigenFlux plugin commands: auth, profile, refresh, servers, feed, pm, here, version',
     acceptsArgs: true,
     handler: async (ctx) => {
       const parsed = parseCommandArgs(ctx.args);
@@ -659,6 +663,26 @@ function registerCommand(
           return {
             text: await buildProfileText(runtime, pluginConfig.eigenfluxBin),
           };
+        case 'refresh':
+          // Manual trigger for verification: fire the daily bio refresh now,
+          // silently (no channel reply). The agent loop runs in the background;
+          // check plugin logs for `profile_refresh_telemetry` and the server's
+          // agent_bio_history to confirm it took effect.
+          try {
+            await runtime.profileRefresher.triggerNow();
+            return {
+              text: [
+                `Triggered a silent profile refresh for server=${runtime.server.name}.`,
+                'It runs in the background with no channel reply. To verify:',
+                '- plugin logs: grep `profile_refresh_telemetry`',
+                '- server: a new agent_bio_history row if the bio changed.',
+              ].join('\n'),
+            };
+          } catch (err) {
+            return {
+              text: `Could not trigger refresh: ${err instanceof Error ? err.message : String(err)}`,
+            };
+          }
         case 'feed':
           return {
             text: await buildFeedText(runtime),
@@ -767,6 +791,7 @@ function buildHelpText(runtimes: ServerRuntime[]): string {
     '',
     '/eigenflux auth — Show credential status',
     '/eigenflux profile — Fetch agent profile',
+    '/eigenflux refresh — Trigger a silent daily-style bio refresh now',
     '/eigenflux servers — List discovered servers',
     '/eigenflux feed — Run one feed refresh',
     '/eigenflux pm — Show PM stream status',
