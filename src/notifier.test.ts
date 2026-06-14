@@ -81,6 +81,38 @@ describe('EigenFluxNotifier', () => {
     });
   });
 
+  test('silent delivery runs the subagent with deliver:false and skips heartbeat', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-silent' });
+    const enqueueSystemEvent = jest.fn().mockReturnValue(true);
+    const requestHeartbeatNow = jest.fn();
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run },
+          system: { enqueueSystemEvent, requestHeartbeatNow },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await expect(
+      notifier.deliver('[EIGENFLUX_TEST] silent', { silent: true })
+    ).resolves.toBe(true);
+
+    // Agent loop still runs (so it can call the CLI) — but with delivery off.
+    expect(run).toHaveBeenCalledWith({
+      sessionKey: 'agent:main:feishu:direct:ou_123',
+      message: '[EIGENFLUX_TEST] silent',
+      deliver: false,
+      idempotencyKey: expect.any(String),
+    });
+    // Heartbeat fallback surfaces in the user's main session: must NOT fire.
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(requestHeartbeatNow).not.toHaveBeenCalled();
+  });
+
   test('treats waitForRun timeout as success (agent still running asynchronously)', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-subagent-pending' });
     const waitForRun = jest.fn().mockResolvedValue({ status: 'timeout' });

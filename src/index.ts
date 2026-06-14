@@ -533,7 +533,11 @@ function createServerRuntime(
     logger,
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
-      await notifier.deliver(prompt);
+      // Silent delivery: the agent runs its loop (reads its own memory/session,
+      // may call `eigenflux profile update`) but does NOT reply to the user, so
+      // the daily bio refresh stays imperceptible. Delivered to the main session
+      // (not a one-shot) so the agent retains recent-session context as a source.
+      await notifier.deliver(prompt, { silent: true });
     },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
