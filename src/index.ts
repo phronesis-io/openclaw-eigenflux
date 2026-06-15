@@ -12,7 +12,7 @@ import {
 } from './polling-client';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
-import { collectOpenClawContext, EMPTY_CONTEXT } from './openclaw-context';
+import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
 import { EigenFluxSettingsReporter } from './settings-reporter';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
@@ -443,11 +443,14 @@ function createServerRuntime(
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
     // Read the agent's own memory + recent session from the OpenClaw state dir
-    // (api.rootDir) and inject them into the prompt as concrete material. The
-    // silent subagent does NOT get memory-core's automatic injection, so the
-    // plugin supplies it directly. Best-effort; falls back to empty on any error.
-    collectContext: () =>
-      api.rootDir ? collectOpenClawContext(api.rootDir, logger) : EMPTY_CONTEXT,
+    // and inject them into the prompt as concrete material. The silent subagent
+    // does NOT get memory-core's automatic injection, so the plugin supplies it
+    // directly. Note: the state dir is resolved via the SDK, NOT api.rootDir
+    // (which is the plugin's install directory). Best-effort; empty on error.
+    collectContext: () => {
+      const stateDir = resolveOpenClawStateDir(logger);
+      return stateDir ? collectOpenClawContext(stateDir, logger) : EMPTY_CONTEXT;
+    },
     // Local test isolation: set EIGENFLUX_REFRESH_NO_BROADCAST=1 to build the bio
     // from memory + session only, so you can verify those sources actually drive it.
     includeBroadcasts: process.env.EIGENFLUX_REFRESH_NO_BROADCAST !== '1',
@@ -593,9 +596,9 @@ function registerCommand(
           // since plugin logs are not easily visible: this confirms whether
           // memory/session are actually being read (and from which rootDir) and
           // whether the broadcast-off test flag is in effect.
-          const probeRootDir = api.rootDir;
-          const probe = probeRootDir
-            ? collectOpenClawContext(probeRootDir, logger)
+          const probeStateDir = resolveOpenClawStateDir(logger);
+          const probe = probeStateDir
+            ? collectOpenClawContext(probeStateDir, logger)
             : EMPTY_CONTEXT;
           const noBroadcast = process.env.EIGENFLUX_REFRESH_NO_BROADCAST === '1';
           void runtime.profileRefresher.triggerNow().catch((err) => {
@@ -606,7 +609,7 @@ function registerCommand(
           return {
             text: [
               `Triggered a silent profile refresh for server=${runtime.server.name} (running in background).`,
-              `context probe: memory=${probe.memorySnippets.length} snippet(s), session=${probe.sessionSnippets.length} snippet(s), broadcasts=${noBroadcast ? 'off' : 'on'}, rootDir=${probeRootDir ?? 'undefined'}`,
+              `context probe: memory=${probe.memorySnippets.length} snippet(s), session=${probe.sessionSnippets.length} snippet(s), broadcasts=${noBroadcast ? 'off' : 'on'}, stateDir=${probeStateDir ?? 'undefined'}`,
               'No channel reply. Verify via a new agent_bio_history row if the bio changed.',
             ].join('\n'),
           };

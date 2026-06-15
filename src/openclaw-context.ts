@@ -12,8 +12,9 @@
  * error) yields an empty list and is logged at debug, never thrown.
  */
 
-import { readdirSync, statSync, readFileSync } from 'node:fs';
+import { readdirSync, statSync, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { Logger } from './logger';
 
 /**
@@ -25,13 +26,39 @@ import { Logger } from './logger';
 const MEMORY_DIR_REL = ['workspace', 'memory'];
 
 export interface RefreshContext {
-  /** Snippets pulled from the agent's durable memory (memory-core sqlite). */
+  /** Snippets pulled from the agent's durable memory (memory markdown). */
   memorySnippets: string[];
   /** Recent user-driven topics pulled from the latest session transcript. */
   sessionSnippets: string[];
 }
 
 export const EMPTY_CONTEXT: RefreshContext = { memorySnippets: [], sessionSnippets: [] };
+
+/**
+ * Resolve the OpenClaw state directory (e.g. ~/.openclaw), where memory/ and
+ * agents/ live. NOTE: this is NOT `api.rootDir` — that is the plugin's own
+ * install directory. The canonical source is the SDK's resolveStateDir(); we
+ * fall back to the gateway's cwd and then ~/.openclaw so a missing/renamed SDK
+ * export degrades gracefully instead of reading from the wrong place.
+ */
+export function resolveOpenClawStateDir(logger: Logger): string | undefined {
+  try {
+    // Deep SDK subpath — load defensively so an SDK change can't break plugin load.
+    const mod = require('openclaw/plugin-sdk/memory-core-host-runtime-core') as {
+      resolveStateDir?: () => string;
+    };
+    const dir = mod.resolveStateDir?.();
+    if (dir && typeof dir === 'string') return dir;
+  } catch (err) {
+    logger.debug(`resolveOpenClawStateDir: SDK resolveStateDir unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  // Fallbacks: the gateway runs with cwd = state dir; then the default location.
+  const cwd = process.cwd();
+  if (cwd && existsSync(join(cwd, 'agents'))) return cwd;
+  const home = join(homedir(), '.openclaw');
+  if (existsSync(join(home, 'agents'))) return home;
+  return undefined;
+}
 
 const MAX_MEMORY_CHARS = 4000;
 const MAX_MEMORY_FILES = 20;
