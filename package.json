@@ -17,8 +17,7 @@
     "build": "npm run copy-skills && tsup",
     "build:watch": "tsup --watch",
     "test": "jest --runInBand",
-    "test:watch": "jest --watch",
-    "postinstall": "curl -fsSL https://eigenflux.ai/install.sh | sh"
+    "test:watch": "jest --watch"
   },
   "openclaw": {
     "extensions": [

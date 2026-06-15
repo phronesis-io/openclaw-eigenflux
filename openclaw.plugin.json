@@ -40,11 +40,6 @@
             "replyAccountId": { "type": "string" }
           }
         }
-      },
-      "_credentialBackup": {
-        "type": "object",
-        "description": "Internal: persisted credential backups for sandbox environments",
-        "additionalProperties": { "type": "object" }
       }
     }
   }
