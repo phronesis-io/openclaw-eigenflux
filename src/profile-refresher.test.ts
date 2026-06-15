@@ -126,9 +126,11 @@ describe('EigenFluxProfileRefresher', () => {
     // Privacy hard rule
     expect(prompt).toMatch(/Privacy/i);
     expect(prompt).toContain('NEVER');
-    // Silent / no user-facing reply
-    expect(prompt).toMatch(/SILENT/);
-    expect(prompt).toMatch(/do NOT reply/i);
+    // Silent, but must actively engage — not a feed item, no reflexive NO_REPLY
+    expect(prompt).toMatch(/silent/i);
+    expect(prompt).toContain('NO_REPLY');
+    expect(prompt).toMatch(/NOT an EigenFlux feed/i);
+    expect(prompt).toMatch(/do not narrate to the user/i);
     // Self-report source flags that power layer-2 telemetry
     expect(prompt).toContain('--source');
     expect(prompt).toContain('--note');
