@@ -673,26 +673,26 @@ function registerCommand(
           return {
             text: await buildProfileText(runtime, pluginConfig.eigenfluxBin),
           };
-        case 'refresh':
+        case 'refresh': {
           // Manual trigger for verification: fire the daily bio refresh now,
-          // silently (no channel reply). The agent loop runs in the background;
-          // check plugin logs for `profile_refresh_telemetry` and the server's
-          // agent_bio_history to confirm it took effect.
-          try {
-            await runtime.profileRefresher.triggerNow();
-            return {
-              text: [
-                `Triggered a silent profile refresh for server=${runtime.server.name}.`,
-                'It runs in the background with no channel reply. To verify:',
-                '- plugin logs: grep `profile_refresh_telemetry`',
-                '- server: a new agent_bio_history row if the bio changed.',
-              ].join('\n'),
-            };
-          } catch (err) {
-            return {
-              text: `Could not trigger refresh: ${err instanceof Error ? err.message : String(err)}`,
-            };
-          }
+          // silently (no channel reply). Fire-and-forget — we do NOT await the
+          // refresh, so the command always responds immediately even if the
+          // background refresh is slow or stalls (it runs the full agent loop
+          // + CLI fetches). Errors are logged, never surfaced as a hang.
+          void runtime.profileRefresher.triggerNow().catch((err) => {
+            logger.error(
+              `Manual profile refresh failed for server=${runtime.server.name}: ${err instanceof Error ? err.message : String(err)}`
+            );
+          });
+          return {
+            text: [
+              `Triggered a silent profile refresh for server=${runtime.server.name} (running in background).`,
+              'No channel reply. To verify:',
+              '- plugin logs: grep `profile_refresh_telemetry`',
+              '- server: a new agent_bio_history row if the bio changed.',
+            ].join('\n'),
+          };
+        }
         case 'feed':
           return {
             text: await buildFeedText(runtime),
