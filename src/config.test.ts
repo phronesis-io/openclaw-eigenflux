@@ -10,6 +10,8 @@ import {
   resolvePluginConfig,
   resolveEigenfluxHome,
   discoverServers,
+  getInstalledCliVersion,
+  isCliOutdated,
 } from './config';
 
 const packageManifest = require('../package.json') as { version: string };
@@ -183,5 +185,51 @@ describe('PLUGIN_CONFIG metadata', () => {
     expect(PLUGIN_CONFIG.DEFAULT_EIGENFLUX_BIN).toBe('eigenflux');
     expect(PLUGIN_CONFIG.DEFAULT_SESSION_KEY).toBe('main');
     expect(PLUGIN_CONFIG.DEFAULT_AGENT_ID).toBe('main');
+  });
+
+  test('declares an expected CLI version', () => {
+    expect(PLUGIN_CONFIG.EXPECTED_CLI_VERSION).toMatch(/^\d+\.\d+\.\d+$/u);
+  });
+});
+
+describe('isCliOutdated', () => {
+  test('true when installed is older than target', () => {
+    expect(isCliOutdated('0.0.12', '0.0.13')).toBe(true);
+    expect(isCliOutdated('0.1.0', '1.0.0')).toBe(true);
+    expect(isCliOutdated('1.2.3', '1.3.0')).toBe(true);
+  });
+
+  test('false when installed is equal or newer', () => {
+    expect(isCliOutdated('0.0.13', '0.0.13')).toBe(false);
+    expect(isCliOutdated('0.0.14', '0.0.13')).toBe(false);
+    expect(isCliOutdated('1.0.0', '0.9.9')).toBe(false);
+  });
+
+  test('false (no nag) on null or unparseable input', () => {
+    expect(isCliOutdated(null, '0.0.13')).toBe(false);
+    expect(isCliOutdated('garbage', '0.0.13')).toBe(false);
+    expect(isCliOutdated('', '0.0.13')).toBe(false);
+  });
+
+  test('tolerates suffixes on the patch segment', () => {
+    expect(isCliOutdated('0.0.12-rc1', '0.0.13')).toBe(true);
+    expect(isCliOutdated('0.0.13+abc', '0.0.13')).toBe(false);
+  });
+});
+
+describe('getInstalledCliVersion', () => {
+  beforeEach(() => execEigenfluxMock.mockReset());
+
+  test('returns cli_version from `eigenflux version` JSON', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'success', data: { cli_version: '0.0.12' } });
+    await expect(getInstalledCliVersion('eigenflux')).resolves.toBe('0.0.12');
+    expect(execEigenfluxMock).toHaveBeenCalledWith('eigenflux', ['version'], expect.anything());
+  });
+
+  test('returns null when CLI is missing or version absent', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'not_installed', bin: 'eigenflux' });
+    await expect(getInstalledCliVersion('eigenflux')).resolves.toBeNull();
+    execEigenfluxMock.mockResolvedValue({ kind: 'success', data: {} });
+    await expect(getInstalledCliVersion('eigenflux')).resolves.toBeNull();
   });
 });

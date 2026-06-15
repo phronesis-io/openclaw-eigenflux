@@ -14,6 +14,11 @@ import { normalizeReplyTarget } from './reply-target';
 import { execEigenflux } from './cli-executor';
 
 const PLUGIN_VERSION = '0.0.15';
+// Minimum eigenflux CLI version this plugin build expects. When the installed
+// CLI is older, the discovery service nudges the agent to update it (the agent
+// updates the CLI at runtime; nothing is auto-run at install time). Bump this
+// when the plugin starts relying on newer CLI behavior.
+const EXPECTED_CLI_VERSION = '0.0.13';
 const DEFAULT_EIGENFLUX_BIN = 'eigenflux';
 const DEFAULT_SESSION_KEY = 'main';
 const DEFAULT_AGENT_ID = 'main';
@@ -193,6 +198,46 @@ export async function discoverServers(
   return { kind: 'ok', servers: [] };
 }
 
+/**
+ * Read the installed CLI version via `eigenflux version` (its JSON output
+ * includes `cli_version`). Returns null when the CLI is missing or the version
+ * can't be determined — callers treat null as "don't nag".
+ */
+export async function getInstalledCliVersion(
+  eigenfluxBin: string,
+  logger?: Logger
+): Promise<string | null> {
+  const result = await execEigenflux<{ cli_version?: string }>(
+    eigenfluxBin,
+    ['version'],
+    { logger }
+  );
+  if (result.kind === 'success' && typeof result.data?.cli_version === 'string') {
+    return result.data.cli_version;
+  }
+  return null;
+}
+
+/**
+ * True when `installed` is an older semver than `target` (compares
+ * major.minor.patch). Unknown/unparseable input returns false so we never nag
+ * on bad data.
+ */
+export function isCliOutdated(installed: string | null, target: string): boolean {
+  if (!installed) return false;
+  const parse = (v: string): number[] =>
+    v.split('.').slice(0, 3).map((part) => parseInt(part, 10));
+  const a = parse(installed);
+  const b = parse(target);
+  for (let i = 0; i < 3; i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (Number.isNaN(x) || Number.isNaN(y)) return false;
+    if (x !== y) return x < y;
+  }
+  return false;
+}
+
 // ─── EigenFlux Home ─────────────────────────────────────────────────────────
 
 export function resolveEigenfluxHome(baseDir?: string): string {
@@ -284,5 +329,6 @@ export const PLUGIN_CONFIG = {
   DEFAULT_OPENCLAW_CLI_BIN,
   HOST_KIND,
   PLUGIN_VERSION,
+  EXPECTED_CLI_VERSION,
 } as const;
 

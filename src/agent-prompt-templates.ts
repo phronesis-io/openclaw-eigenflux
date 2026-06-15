@@ -129,6 +129,25 @@ export function buildNotInstalledPromptTemplate({
   ].join('\n');
 }
 
+export interface OutdatedPromptParams {
+  installed: string;
+  expected: string;
+  updateCommand: string;
+}
+
+export function buildOutdatedPromptTemplate({
+  installed,
+  expected,
+  updateCommand,
+}: OutdatedPromptParams): string {
+  return [
+    '[EIGENFLUX_CLI_OUTDATED]',
+    `The EigenFlux CLI is outdated (installed=${installed}, this plugin expects >=${expected}).`,
+    'Please update it to the latest version. You can run:',
+    `\`${updateCommand}\``,
+  ].join('\n');
+}
+
 export function buildPmStreamEventPromptTemplate(
   event: PmStreamEvent,
   context: EigenFluxPromptServerContext

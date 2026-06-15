@@ -22,6 +22,8 @@ import {
   resolvePluginConfig,
   resolveEigenfluxHome,
   discoverServers,
+  getInstalledCliVersion,
+  isCliOutdated,
   type ResolvedEigenFluxPluginConfig,
   type RoutingConfig,
   type DiscoveredServer,
@@ -31,6 +33,7 @@ import {
   buildAuthRequiredPromptTemplate,
   buildFeedPayloadPromptTemplate,
   buildNotInstalledPromptTemplate,
+  buildOutdatedPromptTemplate,
   buildPmStreamEventPromptTemplate,
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
@@ -119,6 +122,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
 
   let runtimes: ServerRuntime[] = [];
   let notInstalledPromptDelivered = false;
+  let outdatedPromptDelivered = false;
 
   // Register a single meta-service that discovers servers on start
   api.registerService({
@@ -164,6 +168,27 @@ function registerPlugin(api: OpenClawPluginApi): void {
         await runtime.streamClient.start();
         runtime.profileRefresher.start();
       }
+
+      // CLI is installed and running; if it's older than this plugin expects,
+      // nudge the agent to update it (informational — services keep running on
+      // the current version; the agent performs the update at runtime).
+      if (!outdatedPromptDelivered) {
+        const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
+        if (isCliOutdated(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
+          outdatedPromptDelivered = true;
+          logger.warn(
+            `EigenFlux CLI outdated (installed=${installedVersion}, expected>=${PLUGIN_CONFIG.EXPECTED_CLI_VERSION}); delivering upgrade prompt`
+          );
+          await deliverOutdatedPrompt(
+            api,
+            logger,
+            pluginConfig,
+            installedVersion as string,
+            PLUGIN_CONFIG.EXPECTED_CLI_VERSION,
+            store
+          );
+        }
+      }
     },
     stop: async () => {
       logger.info('Stopping EigenFlux discovery service...');
@@ -177,6 +202,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       }
       runtimes = [];
       notInstalledPromptDelivered = false;
+      outdatedPromptDelivered = false;
     },
   });
 
@@ -274,6 +300,31 @@ async function deliverNotInstalledPrompt(
 
   await notifier.deliver(
     buildNotInstalledPromptTemplate({ bin, installCommand: INSTALL_COMMAND })
+  );
+}
+
+async function deliverOutdatedPrompt(
+  api: OpenClawPluginApi,
+  logger: Logger,
+  pluginConfig: ResolvedEigenFluxPluginConfig,
+  installed: string,
+  expected: string,
+  _store: PluginRuntimeStore
+): Promise<void> {
+  // Same bootstrap notifier as deliverNotInstalledPrompt: no workdir, default
+  // routing — this is a one-off nudge, not a per-server feed delivery.
+  const notifier = new EigenFluxNotifier(api, logger, {
+    sessionKey: DEFAULT_ROUTING.sessionKey,
+    agentId: DEFAULT_ROUTING.agentId,
+    replyChannel: DEFAULT_ROUTING.replyChannel,
+    replyTo: DEFAULT_ROUTING.replyTo,
+    replyAccountId: DEFAULT_ROUTING.replyAccountId,
+    openclawCliBin: pluginConfig.openclawCliBin,
+    routeOverrides: DEFAULT_ROUTING.routeOverrides,
+  });
+
+  await notifier.deliver(
+    buildOutdatedPromptTemplate({ installed, expected, updateCommand: INSTALL_COMMAND })
   );
 }
 
