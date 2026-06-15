@@ -330,7 +330,8 @@ function buildRefreshPrompt(
     lines.push(
       '',
       '## From your memory (durable facts about this user — weight these FIRST)',
-      ...context.memorySnippets.map((s) => `- ${s.replace(/\n+/g, ' ').trim()}`)
+      // Memory snippets are markdown files; keep their structure verbatim.
+      ...context.memorySnippets.flatMap((s) => [s.trim(), ''])
     );
   }
   if (context.sessionSnippets.length > 0) {
