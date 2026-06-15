@@ -12,6 +12,7 @@ import {
 } from './polling-client';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
+import { collectOpenClawContext, EMPTY_CONTEXT } from './openclaw-context';
 import { EigenFluxSettingsReporter } from './settings-reporter';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
@@ -531,6 +532,15 @@ function createServerRuntime(
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
+    // Read the agent's own memory + recent session from the OpenClaw state dir
+    // (api.rootDir) and inject them into the prompt as concrete material. The
+    // silent subagent does NOT get memory-core's automatic injection, so the
+    // plugin supplies it directly. Best-effort; falls back to empty on any error.
+    collectContext: () =>
+      api.rootDir ? collectOpenClawContext(api.rootDir, logger) : EMPTY_CONTEXT,
+    // Local test isolation: set EIGENFLUX_REFRESH_NO_BROADCAST=1 to build the bio
+    // from memory + session only, so you can verify those sources actually drive it.
+    includeBroadcasts: process.env.EIGENFLUX_REFRESH_NO_BROADCAST !== '1',
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
       // Silent delivery: the agent runs its loop (reads its own memory/session,

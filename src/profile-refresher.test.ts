@@ -100,7 +100,7 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
   });
 
-  test('prompt instructs use of memory/session, privacy guard, silent mode, and source flags', async () => {
+  test('injects memory/session context, privacy guard, silent mode, and source flags', async () => {
     const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
     execMock
       .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
@@ -112,17 +112,22 @@ describe('EigenFluxProfileRefresher', () => {
       logger: createLogger(),
       onRefreshPrompt,
       onAuthRequired: jest.fn(),
+      collectContext: () => ({
+        memorySnippets: ['Kyrie builds Project Halcyon, a Rust edge-inference runtime'],
+        sessionSnippets: ['Working on operator fusion memory peaks in Halcyon'],
+      }),
     });
 
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     const prompt = onRefreshPrompt.mock.calls[0][0] as string;
-    // New memory + session sources
-    expect(prompt).toContain('Your memory');
-    expect(prompt).toContain('Recent sessions');
+    // Concrete memory + session content is injected verbatim, not just referenced
+    expect(prompt).toMatch(/From your memory/i);
+    expect(prompt).toContain('Project Halcyon');
+    expect(prompt).toMatch(/Recent session context/i);
+    expect(prompt).toContain('operator fusion');
     // Privacy hard rule
     expect(prompt).toMatch(/Privacy/i);
     expect(prompt).toContain('NEVER');
@@ -134,6 +139,67 @@ describe('EigenFluxProfileRefresher', () => {
     // Self-report source flags that power layer-2 telemetry
     expect(prompt).toContain('--source');
     expect(prompt).toContain('--note');
+
+    refresher.stop();
+  });
+
+  test('includeBroadcasts:false builds from memory/session only, omitting broadcasts', async () => {
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'success', data: ITEMS_RESPONSE } as CliResult<any>);
+
+    const refresher = new EigenFluxProfileRefresher({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      logger: createLogger(),
+      onRefreshPrompt,
+      onAuthRequired: jest.fn(),
+      includeBroadcasts: false,
+      collectContext: () => ({
+        memorySnippets: ['Kyrie maintains TideKeeper, an open-source tide predictor'],
+        sessionSnippets: [],
+      }),
+    });
+
+    refresher.start();
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    const prompt = onRefreshPrompt.mock.calls[0][0] as string;
+    expect(prompt).toContain('TideKeeper');
+    expect(prompt).toMatch(/intentionally omitted this run/i);
+    // The broadcast summaries must NOT be present
+    expect(prompt).not.toContain('New ML paper');
+
+    refresher.stop();
+  });
+
+  test('includeBroadcasts:false with no context skips with skipped_no_context', async () => {
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    const logSpies = createLoggerSpies();
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'success', data: ITEMS_RESPONSE } as CliResult<any>);
+
+    const refresher = new EigenFluxProfileRefresher({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      logger: createLogger(logSpies),
+      onRefreshPrompt,
+      onAuthRequired: jest.fn(),
+      includeBroadcasts: false,
+      collectContext: () => ({ memorySnippets: [], sessionSnippets: [] }),
+    });
+
+    refresher.start();
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    expect(onRefreshPrompt).not.toHaveBeenCalled();
+    const line = logSpies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes('profile_refresh_telemetry'));
+    expect(line).toBeDefined();
+    expect(JSON.parse(line!.slice(line!.indexOf('{')))).toMatchObject({ outcome: 'skipped_no_context' });
 
     refresher.stop();
   });
@@ -192,8 +258,7 @@ describe('EigenFluxProfileRefresher', () => {
 
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     const marker = 'profile_refresh_telemetry ';
     const telemetryLine = logSpies.info.mock.calls
@@ -224,8 +289,7 @@ describe('EigenFluxProfileRefresher', () => {
 
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     expect(onRefreshPrompt).not.toHaveBeenCalled();
     expect(logSpies.info).toHaveBeenCalledWith(
@@ -249,8 +313,7 @@ describe('EigenFluxProfileRefresher', () => {
 
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     expect(onAuthRequired).toHaveBeenCalled();
     refresher.stop();
@@ -271,8 +334,7 @@ describe('EigenFluxProfileRefresher', () => {
 
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
     expect(execMock).toHaveBeenCalledWith(
       '/usr/bin/eigenflux',

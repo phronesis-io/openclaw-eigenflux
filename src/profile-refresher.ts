@@ -16,6 +16,7 @@
 
 import { execEigenflux, type CliResult } from './cli-executor';
 import { Logger } from './logger';
+import { EMPTY_CONTEXT, type RefreshContext } from './openclaw-context';
 
 const REFRESH_WINDOW_START = 1; // 1:00 AM
 const REFRESH_WINDOW_END = 5;   // 5:00 AM (exclusive)
@@ -32,6 +33,18 @@ export interface ProfileRefresherConfig {
    */
   onRefreshPrompt: (prompt: string) => Promise<void>;
   onAuthRequired: () => Promise<void>;
+  /**
+   * Pull the agent's own memory + recent session context to inject into the
+   * prompt as concrete material. Optional; defaults to no extra context.
+   * Best-effort — implementations should never throw.
+   */
+  collectContext?: () => RefreshContext | Promise<RefreshContext>;
+  /**
+   * When false, the refresh prompt omits recent broadcasts and relies solely on
+   * memory + session. Used for local testing (EIGENFLUX_REFRESH_NO_BROADCAST=1)
+   * to isolate whether memory/session actually drive the bio. Defaults to true.
+   */
+  includeBroadcasts?: boolean;
 }
 
 /**
@@ -187,14 +200,40 @@ export class EigenFluxProfileRefresher {
     }
 
     const items = itemsResult.data?.items ?? [];
-    if (items.length === 0) {
+    const includeBroadcasts = this.config.includeBroadcasts !== false;
+
+    // 3. Collect the agent's own memory + recent session context (best-effort).
+    let context: RefreshContext = EMPTY_CONTEXT;
+    if (this.config.collectContext) {
+      try {
+        context = (await this.config.collectContext()) ?? EMPTY_CONTEXT;
+      } catch (err) {
+        this.config.logger.warn(
+          `Context collection failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+    const hasContext = context.memorySnippets.length > 0 || context.sessionSnippets.length > 0;
+
+    // Decide whether there is anything to refresh from. With broadcasts on, a
+    // dry feed alone is enough reason to skip (preserves old behavior). With
+    // broadcasts off (test mode), we need memory/session or there is no signal.
+    if (includeBroadcasts && items.length === 0 && !hasContext) {
       this.config.logger.info('Profile refresh skipped: no recent items');
       this.emitTelemetry({ outcome: 'skipped_no_items', broadcast_items: 0, prompt_bytes: 0, delivered: false });
       return;
     }
+    if (!includeBroadcasts && !hasContext) {
+      this.config.logger.info('Profile refresh skipped: broadcasts disabled and no memory/session context');
+      this.emitTelemetry({ outcome: 'skipped_no_context', broadcast_items: 0, prompt_bytes: 0, delivered: false });
+      return;
+    }
+    this.config.logger.info(
+      `Profile refresh context: memory_snippets=${context.memorySnippets.length}, session_snippets=${context.sessionSnippets.length}, broadcasts=${includeBroadcasts ? items.length : 'off'}`
+    );
 
-    // 3. Assemble prompt and deliver
-    const prompt = buildRefreshPrompt(profileData, items);
+    // 4. Assemble prompt and deliver
+    const prompt = buildRefreshPrompt(profileData, includeBroadcasts ? items : [], context, includeBroadcasts);
     try {
       if (!opts.manual && !this.running) return;
       await this.config.onRefreshPrompt(prompt);
@@ -253,7 +292,12 @@ export function msUntilNextRefresh(now: Date): number {
   return target.getTime() - now.getTime();
 }
 
-function buildRefreshPrompt(profile: ProfileData, items: ItemsData['items']): string {
+function buildRefreshPrompt(
+  profile: ProfileData,
+  items: ItemsData['items'],
+  context: RefreshContext,
+  includeBroadcasts: boolean
+): string {
   const name = profile.profile?.agent_name ?? '(unknown)';
   const bio = profile.profile?.bio || '(empty)';
   const totalItems = profile.influence?.total_items ?? 0;
@@ -277,25 +321,45 @@ function buildRefreshPrompt(profile: ProfileData, items: ItemsData['items']): st
     `- Name: ${name}`,
     `- Bio: ${bio}`,
     `- Influence: ${totalItems} items published, ${totalConsumed} consumed, ${totalScored} scored`,
-    '',
-    '## Recent Broadcasts',
   ];
 
-  for (const item of items) {
-    const summary = item.summary || '(no summary)';
-    let line = `- [${item.broadcast_type ?? 'unknown'}] ${summary}`;
-    if (item.keywords) line += ` (keywords: ${item.keywords})`;
-    if (item.total_score && item.total_score > 0) line += ` (score: ${item.total_score})`;
-    lines.push(line);
+  // Memory + recent session context, injected as concrete material so the model
+  // actually has it (it does not reliably "go look" on its own). These are the
+  // highest-signal inputs for who the user *is*, vs. broadcasts (what's trending).
+  if (context.memorySnippets.length > 0) {
+    lines.push(
+      '',
+      '## From your memory (durable facts about this user — weight these FIRST)',
+      ...context.memorySnippets.map((s) => `- ${s.replace(/\n+/g, ' ').trim()}`)
+    );
+  }
+  if (context.sessionSnippets.length > 0) {
+    lines.push(
+      '',
+      '## Recent session context (what the user is actually working on — weight these)',
+      ...context.sessionSnippets.map((s) => `- ${s}`)
+    );
+  }
+
+  if (includeBroadcasts && items.length > 0) {
+    lines.push('', '## Recent Broadcasts (what is trending on the network)');
+    for (const item of items) {
+      const summary = item.summary || '(no summary)';
+      let line = `- [${item.broadcast_type ?? 'unknown'}] ${summary}`;
+      if (item.keywords) line += ` (keywords: ${item.keywords})`;
+      if (item.total_score && item.total_score > 0) line += ` (score: ${item.total_score})`;
+      lines.push(line);
+    }
+  } else if (!includeBroadcasts) {
+    lines.push(
+      '',
+      '## Recent Broadcasts',
+      '(intentionally omitted this run — build the bio ONLY from memory + recent',
+      'session context above, not from network trends.)'
+    );
   }
 
   lines.push(
-    '',
-    '## Additional Sources (beyond broadcasts)',
-    'Also draw on what you already know about this user from:',
-    '- **Your memory** — durable facts about their role, expertise, focus, and goals.',
-    '- **Recent sessions** — topics and work from your latest conversations with them.',
-    'Memory and recent sessions are higher-signal than broadcasts; weight them first.',
     '',
     '## Privacy (hard rule)',
     'Memory and sessions may contain private or sensitive details. Use them ONLY to',
@@ -304,9 +368,9 @@ function buildRefreshPrompt(profile: ProfileData, items: ItemsData['items']): st
     '',
     '## Instructions',
     '1. Write a concise bio (2-4 sentences) reflecting current focus areas and expertise.',
-    '2. Blend signals: memory + recent sessions first, then recent broadcasts.',
-    '   Within broadcasts, favor your highest-scoring items (see score above) and the',
-    '   total_scored counts — they reflect what the network actually values from you.',
+    '2. Weight the sources: memory + recent session FIRST (who the user is and what',
+    '   they are doing now), then broadcasts (what the network values). The bio should',
+    '   read as the user\'s own identity, not a digest of trending security news.',
     '3. Preserve still-relevant info from the current bio.',
     '4. Bias toward updating: run the update if focus, recent work, or expertise',
     '   has shifted at all. Only skip when the current bio already reflects your',
