@@ -451,9 +451,6 @@ function createServerRuntime(
       const stateDir = resolveOpenClawStateDir(logger);
       return stateDir ? collectOpenClawContext(stateDir, logger) : EMPTY_CONTEXT;
     },
-    // Local test isolation: set EIGENFLUX_REFRESH_NO_BROADCAST=1 to build the bio
-    // from memory + session only, so you can verify those sources actually drive it.
-    includeBroadcasts: process.env.EIGENFLUX_REFRESH_NO_BROADCAST !== '1',
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
       // Silent delivery: the agent runs its loop (reads its own memory/session,
@@ -594,13 +591,11 @@ function registerCommand(
           //
           // We also probe the context synchronously and surface it in the reply,
           // since plugin logs are not easily visible: this confirms whether
-          // memory/session are actually being read (and from which rootDir) and
-          // whether the broadcast-off test flag is in effect.
+          // memory/session are actually being read (and from which state dir).
           const probeStateDir = resolveOpenClawStateDir(logger);
           const probe = probeStateDir
             ? collectOpenClawContext(probeStateDir, logger)
             : EMPTY_CONTEXT;
-          const noBroadcast = process.env.EIGENFLUX_REFRESH_NO_BROADCAST === '1';
           void runtime.profileRefresher.triggerNow().catch((err) => {
             logger.error(
               `Manual profile refresh failed for server=${runtime.server.name}: ${err instanceof Error ? err.message : String(err)}`
@@ -609,7 +604,7 @@ function registerCommand(
           return {
             text: [
               `Triggered a silent profile refresh for server=${runtime.server.name} (running in background).`,
-              `context probe: memory=${probe.memorySnippets.length} snippet(s), session=${probe.sessionSnippets.length} snippet(s), broadcasts=${noBroadcast ? 'off' : 'on'}, stateDir=${probeStateDir ?? 'undefined'}`,
+              `context probe: memory=${probe.memorySnippets.length} snippet(s), session=${probe.sessionSnippets.length} snippet(s), stateDir=${probeStateDir ?? 'undefined'}`,
               'No channel reply. Verify via a new agent_bio_history row if the bio changed.',
             ].join('\n'),
           };
