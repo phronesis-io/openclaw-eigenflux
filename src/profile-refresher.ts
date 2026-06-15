@@ -32,9 +32,10 @@ export interface ProfileRefresherConfig {
   onRefreshPrompt: (prompt: string) => Promise<void>;
   onAuthRequired: () => Promise<void>;
   /**
-   * Pull the agent's own memory + recent session context to inject into the
-   * prompt as concrete material. This is the sole driver of the bio. Optional;
-   * defaults to no context (which makes every refresh a no-op skip).
+   * Resolve the host-specific inputs for the CLI refresh-prompt core: the memory
+   * directories (the CLI reads the markdown) and recent session snippets (the
+   * host extracts these from its own transcript format). This is the sole driver
+   * of the bio. Optional; defaults to no context (every refresh is a no-op skip).
    * Best-effort — implementations should never throw.
    */
   collectContext?: () => RefreshContext | Promise<RefreshContext>;
@@ -51,16 +52,12 @@ export interface ProfileRefresherConfig {
  */
 interface RefreshTelemetry {
   server: string;
-  /** delivered | skipped_no_context | auth_required | fetch_failed | delivery_failed */
+  /** delivered | skipped_no_context | auth_required | not_installed | error | delivery_failed */
   outcome: string;
-  memory_snippets: number;
+  memory_dirs: number;
   session_snippets: number;
   prompt_bytes: number;
   delivered: boolean;
-}
-
-interface ProfileData {
-  profile: { agent_name?: string; bio?: string };
 }
 
 export class EigenFluxProfileRefresher {
@@ -129,45 +126,7 @@ export class EigenFluxProfileRefresher {
   private async refresh(opts: { manual?: boolean } = {}): Promise<void> {
     this.config.logger.info(`Running profile refresh for server=${this.config.serverName}`);
 
-    // 1. Fetch the current profile (for the existing bio/name to refine).
-    // CLI `-f json` outputs the unwrapped data directly (no {code,msg,data} envelope)
-    const profileResult = await execEigenflux<ProfileData>(
-      this.config.eigenfluxBin,
-      ['profile', 'show', '-s', this.config.serverName, '-f', 'json'],
-      { logger: this.config.logger },
-    );
-
-    // Defensive: if stopped during CLI execution, abort — unless this is a
-    // manual one-shot trigger, which runs independently of the daily timer.
-    if (!opts.manual && !this.running) return;
-
-    // 2. Check results
-    if (profileResult.kind === 'auth_required') {
-      this.config.logger.warn(`Profile refresh: auth required for server=${this.config.serverName}`);
-      this.emitTelemetry({ outcome: 'auth_required', memory_snippets: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
-      await this.config.onAuthRequired();
-      return;
-    }
-    if (profileResult.kind === 'not_installed') {
-      this.config.logger.error(`eigenflux CLI not found (bin=${this.config.eigenfluxBin})`);
-      this.emitTelemetry({ outcome: 'fetch_failed', memory_snippets: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
-      return;
-    }
-    if (profileResult.kind !== 'success') {
-      this.config.logger.error(`Profile fetch failed: ${profileResult.kind}`);
-      this.emitTelemetry({ outcome: 'fetch_failed', memory_snippets: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
-      return;
-    }
-
-    const profileData = profileResult.data;
-    if (!profileData) {
-      this.config.logger.error('Profile fetch returned empty data');
-      this.emitTelemetry({ outcome: 'fetch_failed', memory_snippets: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
-      return;
-    }
-
-    // 3. Collect the agent's own memory + recent session context (best-effort).
-    // This is the SOLE driver of the bio — no broadcasts.
+    // 1. Resolve host-specific inputs: memory dirs + extracted session snippets.
     let context: RefreshContext = EMPTY_CONTEXT;
     if (this.config.collectContext) {
       try {
@@ -178,28 +137,71 @@ export class EigenFluxProfileRefresher {
         );
       }
     }
-    const hasContext = context.memorySnippets.length > 0 || context.sessionSnippets.length > 0;
+    const memoryDirs = context.memoryDirs ?? [];
+    const sessionSnippets = context.sessionSnippets ?? [];
 
-    // Nothing to refresh from without memory/session — skip.
-    if (!hasContext) {
+    // Nothing to refresh from without memory/session — skip (don't even call out).
+    if (memoryDirs.length === 0 && sessionSnippets.length === 0) {
       this.config.logger.info('Profile refresh skipped: no memory/session context');
-      this.emitTelemetry({ outcome: 'skipped_no_context', memory_snippets: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
+      this.emitTelemetry({ outcome: 'skipped_no_context', memory_dirs: 0, session_snippets: 0, prompt_bytes: 0, delivered: false });
+      return;
+    }
+
+    // Defensive: if stopped before delivery, abort — unless a manual trigger.
+    if (!opts.manual && !this.running) return;
+
+    // 2. Ask the host-agnostic CLI core to assemble the prompt (it fetches the
+    // profile, reads the memory markdown, and builds the wording). stdout is the
+    // prompt, empty when the CLI judged there's nothing to refresh from.
+    const args = [
+      'profile', 'refresh-prompt',
+      '-s', this.config.serverName,
+      ...memoryDirs.flatMap((d) => ['--memory-dir', d]),
+      ...sessionSnippets.flatMap((s) => ['--session-snippet', s]),
+    ];
+    const result = await execEigenflux<string>(this.config.eigenfluxBin, args, {
+      logger: this.config.logger,
+      parseJson: false,
+    });
+
+    if (!opts.manual && !this.running) return;
+
+    if (result.kind === 'auth_required') {
+      this.config.logger.warn(`Profile refresh: auth required for server=${this.config.serverName}`);
+      this.emitTelemetry({ outcome: 'auth_required', memory_dirs: memoryDirs.length, session_snippets: sessionSnippets.length, prompt_bytes: 0, delivered: false });
+      await this.config.onAuthRequired();
+      return;
+    }
+    if (result.kind === 'not_installed') {
+      this.config.logger.error(`eigenflux CLI not found (bin=${this.config.eigenfluxBin})`);
+      this.emitTelemetry({ outcome: 'not_installed', memory_dirs: memoryDirs.length, session_snippets: sessionSnippets.length, prompt_bytes: 0, delivered: false });
+      return;
+    }
+    if (result.kind !== 'success') {
+      this.config.logger.error(`refresh-prompt failed: ${result.error.message}`);
+      this.emitTelemetry({ outcome: 'error', memory_dirs: memoryDirs.length, session_snippets: sessionSnippets.length, prompt_bytes: 0, delivered: false });
+      return;
+    }
+
+    const prompt = (result.data ?? '').trim();
+    if (!prompt) {
+      this.config.logger.info('Profile refresh skipped: CLI produced no prompt');
+      this.emitTelemetry({ outcome: 'skipped_no_context', memory_dirs: memoryDirs.length, session_snippets: sessionSnippets.length, prompt_bytes: 0, delivered: false });
       return;
     }
     this.config.logger.info(
-      `Profile refresh context: memory_snippets=${context.memorySnippets.length}, session_snippets=${context.sessionSnippets.length}`
+      `Profile refresh context: memory_dirs=${memoryDirs.length}, session_snippets=${sessionSnippets.length}`
     );
 
-    // 4. Assemble prompt and deliver
-    const prompt = buildRefreshPrompt(profileData, context);
+    // 3. Deliver the prompt silently.
     try {
       if (!opts.manual && !this.running) return;
       await this.config.onRefreshPrompt(prompt);
       this.config.logger.info(`Profile refresh prompt delivered for server=${this.config.serverName}`);
       this.emitTelemetry({
         outcome: 'delivered',
-        memory_snippets: context.memorySnippets.length,
-        session_snippets: context.sessionSnippets.length,
+        memory_dirs: memoryDirs.length,
+        session_snippets: sessionSnippets.length,
         prompt_bytes: Buffer.byteLength(prompt, 'utf-8'),
         delivered: true,
       });
@@ -209,8 +211,8 @@ export class EigenFluxProfileRefresher {
       );
       this.emitTelemetry({
         outcome: 'delivery_failed',
-        memory_snippets: context.memorySnippets.length,
-        session_snippets: context.sessionSnippets.length,
+        memory_dirs: memoryDirs.length,
+        session_snippets: sessionSnippets.length,
         prompt_bytes: Buffer.byteLength(prompt, 'utf-8'),
         delivered: false,
       });
@@ -250,77 +252,4 @@ export function msUntilNextRefresh(now: Date): number {
   }
 
   return target.getTime() - now.getTime();
-}
-
-function buildRefreshPrompt(profile: ProfileData, context: RefreshContext): string {
-  const name = profile.profile?.agent_name ?? '(unknown)';
-  const bio = profile.profile?.bio || '(empty)';
-
-  const lines: string[] = [
-    'Your EigenFlux profile is due for its daily refresh. This is a background',
-    'maintenance TASK you must actively perform — it is NOT an EigenFlux feed',
-    'item, so do NOT respond with NO_REPLY and do NOT treat it as something to',
-    'skim and dismiss.',
-    '',
-    'What "silent" means here: do not narrate to the user, do not ask for',
-    'confirmation, do not post anything to the channel. It does NOT mean skip the',
-    'work. You must: (1) assess whether the bio is still accurate, then (2) EITHER',
-    'run the update command below, OR, if no update is warranted, finish with a',
-    'single internal line stating why (e.g. "skip: bio already current"). Never',
-    'finish without having actually assessed.',
-    '',
-    '## Current Profile',
-    `- Name: ${name}`,
-    `- Bio: ${bio}`,
-  ];
-
-  // Memory + recent session context, injected as concrete material so the model
-  // actually has it (it does not reliably "go look" on its own). These are the
-  // SOLE drivers of the bio — who the user is and what they are working on.
-  if (context.memorySnippets.length > 0) {
-    lines.push(
-      '',
-      '## From your memory (durable facts about this user — weight these FIRST)',
-      // Memory snippets are markdown files; keep their structure verbatim.
-      ...context.memorySnippets.flatMap((s) => [s.trim(), ''])
-    );
-  }
-  if (context.sessionSnippets.length > 0) {
-    lines.push(
-      '',
-      '## Recent session context (what the user is actually working on — weight these)',
-      ...context.sessionSnippets.map((s) => `- ${s}`)
-    );
-  }
-
-  lines.push(
-    '',
-    '## Privacy (hard rule)',
-    'Memory and sessions may contain private or sensitive details. Use them ONLY to',
-    'shape a public-facing bio. NEVER copy secrets, credentials, private names, or',
-    'verbatim private content into the bio. When in doubt, generalize or omit.',
-    '',
-    '## Instructions',
-    '1. Write a concise bio (2-4 sentences) capturing who the user is and their',
-    '   current focus — built from your memory + recent session above.',
-    '2. The bio should read as the user\'s own identity and current work, not a',
-    '   digest of trending news.',
-    '3. Preserve still-relevant info from the current bio.',
-    '4. Bias toward updating: run the update if focus, recent work, or expertise',
-    '   has shifted at all. Only skip when the current bio already reflects your',
-    '   latest activity — and even then, you must have assessed first, not skipped.',
-    '5. To update, run (note the source flags — they power refresh telemetry):',
-    '   eigenflux profile update --bio "YOUR NEW BIO" \\',
-    '     --source "<comma-separated of: memory,session>" \\',
-    '     --note "<one short line: what changed and why>"',
-    '',
-    '## Nightly runtime report (always do this, even if the bio is unchanged)',
-    `Report the model and agent name you are running as, so the network knows`,
-    `your current runtime. Substitute your real model identifier:`,
-    `   eigenflux settings push --model "<your model id, e.g. claude-opus-4-8>" \\`,
-    `     --mode plugin`,
-    `(The agent name "${name}" is already on record; no need to change it unless wrong.)`,
-  );
-
-  return lines.join('\n');
 }

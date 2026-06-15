@@ -16,16 +16,14 @@ function createLogger(spies = createLoggerSpies()): Logger {
   return new Logger(spies);
 }
 
-// CLI `-f json` outputs unwrapped data directly (no {code,msg,data} envelope)
-const PROFILE_RESPONSE = {
-  profile: { agent_name: 'TestBot', bio: 'AI research assistant' },
-};
-
-// Memory/session context is the sole driver of the bio now (no broadcasts).
+// Host-specific inputs the OpenClaw adapter hands to the CLI core.
 const CTX = {
-  memorySnippets: ['Kyrie builds Project Halcyon, a Rust edge-inference runtime'],
+  memoryDirs: ['/state/workspace/memory'],
   sessionSnippets: ['Working on operator fusion memory peaks in Halcyon'],
 };
+
+// The prompt the CLI core (`profile refresh-prompt`) prints to stdout.
+const CLI_PROMPT = 'ASSEMBLED PROMPT for TestBot\n## From your memory\n...';
 
 describe('msUntilNextRefresh', () => {
   test('targets 1:00-4:59 AM window', () => {
@@ -55,6 +53,24 @@ describe('msUntilNextRefresh', () => {
   });
 });
 
+function makeRefresher(overrides: Record<string, unknown> = {}) {
+  return new EigenFluxProfileRefresher({
+    serverName: 'eigenflux',
+    eigenfluxBin: 'eigenflux',
+    logger: createLogger(),
+    onRefreshPrompt: jest.fn().mockResolvedValue(undefined),
+    onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    collectContext: () => CTX,
+    ...overrides,
+  } as any);
+}
+
+const telemetry = (spies: ReturnType<typeof createLoggerSpies>) => {
+  const marker = 'profile_refresh_telemetry ';
+  const line = spies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes(marker));
+  return line ? JSON.parse(line.slice(line.indexOf(marker) + marker.length)) : undefined;
+};
+
 describe('EigenFluxProfileRefresher', () => {
   beforeEach(() => {
     jest.useFakeTimers();
@@ -66,174 +82,91 @@ describe('EigenFluxProfileRefresher', () => {
     jest.restoreAllMocks();
   });
 
-  test('delivers prompt with profile and injected memory/session context', async () => {
+  test('calls `profile refresh-prompt` with memory-dir + session-snippet and delivers stdout', async () => {
     const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
 
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
+    const refresher = makeRefresher({ eigenfluxBin: '/usr/bin/eigenflux', onRefreshPrompt });
     refresher.start();
-    expect(refresher.isRunning()).toBe(true);
-
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     for (let i = 0; i < 12; i++) await Promise.resolve();
 
+    expect(execMock).toHaveBeenCalledWith(
+      '/usr/bin/eigenflux',
+      [
+        'profile', 'refresh-prompt', '-s', 'eigenflux',
+        '--memory-dir', '/state/workspace/memory',
+        '--session-snippet', 'Working on operator fusion memory peaks in Halcyon',
+      ],
+      expect.objectContaining({ parseJson: false }),
+    );
     expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
-    const prompt = onRefreshPrompt.mock.calls[0][0];
-    expect(prompt).toContain('TestBot');
-    expect(prompt).toContain('AI research assistant');
-    expect(prompt).toContain('Project Halcyon');
-    expect(prompt).toContain('eigenflux profile update --bio');
+    expect(onRefreshPrompt.mock.calls[0][0]).toBe(CLI_PROMPT);
 
     refresher.stop();
   });
 
-  test('injects memory/session context, privacy guard, silent mode, and source flags', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
+  test('emits delivered telemetry with memory_dirs/session counts', async () => {
+    const spies = createLoggerSpies();
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
 
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
+    const refresher = makeRefresher({ logger: createLogger(spies) });
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     for (let i = 0; i < 12; i++) await Promise.resolve();
 
-    const prompt = onRefreshPrompt.mock.calls[0][0] as string;
-    // Concrete memory + session content is injected verbatim, not just referenced
-    expect(prompt).toMatch(/From your memory/i);
-    expect(prompt).toContain('Project Halcyon');
-    expect(prompt).toMatch(/Recent session context/i);
-    expect(prompt).toContain('operator fusion');
-    // No broadcasts in the prompt at all
-    expect(prompt).not.toMatch(/broadcast/i);
-    // Privacy hard rule
-    expect(prompt).toMatch(/Privacy/i);
-    expect(prompt).toContain('NEVER');
-    // Silent, but must actively engage — not a feed item, no reflexive NO_REPLY
-    expect(prompt).toMatch(/silent/i);
-    expect(prompt).toContain('NO_REPLY');
-    expect(prompt).toMatch(/NOT an EigenFlux feed/i);
-    expect(prompt).toMatch(/do not narrate to the user/i);
-    // Self-report source flags that power layer-2 telemetry
-    expect(prompt).toContain('--source');
-    expect(prompt).toContain('--note');
-
-    refresher.stop();
-  });
-
-  test('emits delivered telemetry with memory/session counts', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const logSpies = createLoggerSpies();
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
-
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(logSpies),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    const marker = 'profile_refresh_telemetry ';
-    const telemetryLine = logSpies.info.mock.calls
-      .map((c) => String(c[0]))
-      .find((m) => m.includes(marker));
-    expect(telemetryLine).toBeDefined();
-    const payload = JSON.parse(telemetryLine!.slice(telemetryLine!.indexOf(marker) + marker.length));
-    expect(payload).toMatchObject({
+    expect(telemetry(spies)).toMatchObject({
       server: 'eigenflux',
       outcome: 'delivered',
-      memory_snippets: 1,
+      memory_dirs: 1,
       session_snippets: 1,
       delivered: true,
     });
-    expect(payload.prompt_bytes).toBeGreaterThan(0);
 
     refresher.stop();
   });
 
-  test('skips with skipped_no_context when there is no memory/session', async () => {
+  test('skips with skipped_no_context and does NOT call the CLI when there is no context', async () => {
     const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const logSpies = createLoggerSpies();
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
+    const spies = createLoggerSpies();
 
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(logSpies),
+    const refresher = makeRefresher({
+      logger: createLogger(spies),
       onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => ({ memorySnippets: [], sessionSnippets: [] }),
+      collectContext: () => ({ memoryDirs: [], sessionSnippets: [] }),
     });
+    refresher.start();
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
 
+    expect(execMock).not.toHaveBeenCalled();
+    expect(onRefreshPrompt).not.toHaveBeenCalled();
+    expect(telemetry(spies)).toMatchObject({ outcome: 'skipped_no_context' });
+
+    refresher.stop();
+  });
+
+  test('skips when the CLI prints an empty prompt', async () => {
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    const spies = createLoggerSpies();
+    execMock.mockResolvedValueOnce({ kind: 'success', data: '   ' } as CliResult<any>);
+
+    const refresher = makeRefresher({ logger: createLogger(spies), onRefreshPrompt });
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     for (let i = 0; i < 12; i++) await Promise.resolve();
 
     expect(onRefreshPrompt).not.toHaveBeenCalled();
-    const line = logSpies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes('profile_refresh_telemetry'));
-    expect(line).toBeDefined();
-    expect(JSON.parse(line!.slice(line!.indexOf('{')))).toMatchObject({ outcome: 'skipped_no_context' });
+    expect(telemetry(spies)).toMatchObject({ outcome: 'skipped_no_context' });
 
     refresher.stop();
   });
 
-  test('skips when collectContext is not configured', async () => {
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    const logSpies = createLoggerSpies();
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
-
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(logSpies),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-    });
-
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(onRefreshPrompt).not.toHaveBeenCalled();
-    expect(logSpies.info).toHaveBeenCalledWith(
-      expect.stringContaining('no memory/session context')
-    );
-
-    refresher.stop();
-  });
-
-  test('triggers onAuthRequired when profile fetch returns auth_required', async () => {
+  test('triggers onAuthRequired when the CLI reports auth_required', async () => {
     const onAuthRequired = jest.fn().mockResolvedValue(undefined);
     execMock.mockResolvedValueOnce({ kind: 'auth_required', stderr: '' } as CliResult<any>);
 
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt: jest.fn(),
-      onAuthRequired,
-    });
-
+    const refresher = makeRefresher({ onAuthRequired });
     refresher.start();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     for (let i = 0; i < 12; i++) await Promise.resolve();
@@ -242,91 +175,21 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
   });
 
-  test('calls profile show with correct arguments and no items fetch', async () => {
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
-
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'my-server',
-      eigenfluxBin: '/usr/bin/eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt: jest.fn().mockResolvedValue(undefined),
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
-    refresher.start();
-    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
-    for (let i = 0; i < 12; i++) await Promise.resolve();
-
-    expect(execMock).toHaveBeenCalledWith(
-      '/usr/bin/eigenflux',
-      ['profile', 'show', '-s', 'my-server', '-f', 'json'],
-      expect.any(Object),
-    );
-    // No broadcast items fetch anymore.
-    expect(execMock).not.toHaveBeenCalledWith(
-      '/usr/bin/eigenflux',
-      expect.arrayContaining(['items']),
-      expect.any(Object),
-    );
-
-    refresher.stop();
-  });
-
-  test('triggerNow runs a refresh immediately when running', async () => {
+  test('triggerNow delivers immediately, even when never started', async () => {
     const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
 
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
-    refresher.start();
-    await refresher.triggerNow();
-
-    expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
-    expect(onRefreshPrompt.mock.calls[0][0]).toContain('TestBot');
-
-    refresher.stop();
-  });
-
-  test('triggerNow runs even when the refresher was never started', async () => {
-    // The command path may hold an unstarted refresher instance; a manual
-    // trigger must still deliver, independent of the daily timer state.
-    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
-    execMock.mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>);
-
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt,
-      onAuthRequired: jest.fn(),
-      collectContext: () => CTX,
-    });
-
-    // Note: no start() call — running stays false.
+    const refresher = makeRefresher({ onRefreshPrompt });
+    // No start() — running stays false.
     await refresher.triggerNow();
 
     expect(refresher.isRunning()).toBe(false);
     expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
-    expect(onRefreshPrompt.mock.calls[0][0]).toContain('TestBot');
+    expect(onRefreshPrompt.mock.calls[0][0]).toBe(CLI_PROMPT);
   });
 
   test('isRunning returns false after stop', () => {
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt: jest.fn(),
-      onAuthRequired: jest.fn(),
-    });
-
+    const refresher = makeRefresher();
     expect(refresher.isRunning()).toBe(false);
     refresher.start();
     expect(refresher.isRunning()).toBe(true);
@@ -335,19 +198,11 @@ describe('EigenFluxProfileRefresher', () => {
   });
 
   test('stop clears pending timer', () => {
-    const refresher = new EigenFluxProfileRefresher({
-      serverName: 'eigenflux',
-      eigenfluxBin: 'eigenflux',
-      logger: createLogger(),
-      onRefreshPrompt: jest.fn(),
-      onAuthRequired: jest.fn(),
-    });
-
+    const refresher = makeRefresher();
     refresher.start();
     refresher.stop();
-
-    // Advancing should not trigger any CLI calls
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     expect(execMock).not.toHaveBeenCalled();
   });
 });
+

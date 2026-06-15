@@ -442,11 +442,20 @@ function createServerRuntime(
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
-    // Read the agent's own memory + recent session from the OpenClaw state dir
-    // and inject them into the prompt as concrete material. The silent subagent
-    // does NOT get memory-core's automatic injection, so the plugin supplies it
-    // directly. Note: the state dir is resolved via the SDK, NOT api.rootDir
-    // (which is the plugin's install directory). Best-effort; empty on error.
+    // OpenClaw adapter for the host-agnostic `eigenflux profile refresh-prompt`
+    // core: supply the host-specific inputs (memory dir + extracted session
+    // snippets); the CLI reads the memory markdown and assembles the prompt.
+    // The state dir is resolved via the SDK, NOT api.rootDir (which is the
+    // plugin's install directory). Best-effort; empty on error.
+    //
+    // TODO(multi-host): each host gets its own thin adapter that returns
+    // { memoryDirs, sessionSnippets } and delivers the CLI's prompt silently:
+    //   - Claude Code: memory from CLAUDE.md / ~/.claude memory; session from
+    //     ~/.claude/projects/**/*.jsonl; delivery via the claude/channel
+    //     (note: channel pushes are user-visible — true silence needs more work).
+    //   - Hermes: memory/session locations + silent-delivery mechanism TBD —
+    //     investigate the host before writing the adapter.
+    //   - Codex: memory likely AGENTS.md; session store + delivery TBD.
     collectContext: () => {
       const stateDir = resolveOpenClawStateDir(logger);
       return stateDir ? collectOpenClawContext(stateDir, logger) : EMPTY_CONTEXT;
@@ -604,7 +613,7 @@ function registerCommand(
           return {
             text: [
               `Triggered a silent profile refresh for server=${runtime.server.name} (running in background).`,
-              `context probe: memory=${probe.memorySnippets.length} snippet(s), session=${probe.sessionSnippets.length} snippet(s), stateDir=${probeStateDir ?? 'undefined'}`,
+              `context probe: memory_dirs=${probe.memoryDirs.length}, session=${probe.sessionSnippets.length} snippet(s), stateDir=${probeStateDir ?? 'undefined'}`,
               'No channel reply. Verify via a new agent_bio_history row if the bio changed.',
             ].join('\n'),
           };

@@ -1,15 +1,13 @@
 /**
- * Reads the agent's own memory and recent session context directly from the
- * OpenClaw state directory, so the daily profile refresh can inject them into
- * the prompt as *concrete material* rather than telling the agent to "go look".
+ * OpenClaw adapter for the host-agnostic `eigenflux profile refresh-prompt`
+ * core. The CLI owns prompt assembly + memory reading; this module supplies the
+ * two host-specific inputs:
+ *   - memoryDirs: where OpenClaw keeps memory markdown (CLI reads the files).
+ *   - sessionSnippets: recent user-driven topics extracted from the OpenClaw
+ *     session transcript (host-specific JSONL format).
  *
- * Why this exists: the refresh is delivered to a silent subagent (deliver:false)
- * which does NOT get memory-core's automatic pre-turn memory injection, and in
- * practice the agent dismisses "use your memory" instructions. Pulling the
- * content in here guarantees it reaches the model.
- *
- * Both sources are best-effort: any failure (missing file, locked DB, parse
- * error) yields an empty list and is logged at debug, never thrown.
+ * Session extraction is best-effort: any failure (missing file, parse error)
+ * yields an empty list and is logged at debug, never thrown.
  */
 
 import { readdirSync, statSync, readFileSync, existsSync } from 'node:fs';
@@ -18,21 +16,21 @@ import { homedir } from 'node:os';
 import { Logger } from './logger';
 
 /**
- * Memory markdown lives under the OpenClaw workspace, relative to the state dir
- * (api.rootDir): `<stateDir>/workspace/memory/*.md`. These markdown files are
- * memory-core's source of truth — read them directly so memory works even when
+ * Memory markdown lives under the OpenClaw workspace, relative to the state dir:
+ * `<stateDir>/workspace/memory/*.md` — memory-core's source of truth. We hand
+ * the directory to the CLI (which reads the markdown) so memory works even when
  * the sqlite vector index is unavailable (e.g. no embedding key configured).
  */
 const MEMORY_DIR_REL = ['workspace', 'memory'];
 
 export interface RefreshContext {
-  /** Snippets pulled from the agent's durable memory (memory markdown). */
-  memorySnippets: string[];
-  /** Recent user-driven topics pulled from the latest session transcript. */
+  /** Directories of memory markdown for the CLI to read (`--memory-dir`). */
+  memoryDirs: string[];
+  /** Recent session topics, host-extracted, for the CLI (`--session-snippet`). */
   sessionSnippets: string[];
 }
 
-export const EMPTY_CONTEXT: RefreshContext = { memorySnippets: [], sessionSnippets: [] };
+export const EMPTY_CONTEXT: RefreshContext = { memoryDirs: [], sessionSnippets: [] };
 
 /**
  * Resolve the OpenClaw state directory (e.g. ~/.openclaw), where memory/ and
@@ -60,14 +58,13 @@ export function resolveOpenClawStateDir(logger: Logger): string | undefined {
   return undefined;
 }
 
-const MAX_MEMORY_CHARS = 4000;
-const MAX_MEMORY_FILES = 20;
 const MAX_SESSION_TURNS = 12;
 const MAX_SESSION_SNIPPET_CHARS = 280;
 
 /**
- * Collect memory + recent-session context for an agent from the OpenClaw state
- * directory (`api.rootDir`, e.g. ~/.openclaw).
+ * Resolve the host-specific inputs for the CLI refresh-prompt core: the memory
+ * directory and recent session snippets, from the OpenClaw state directory
+ * (e.g. ~/.openclaw). The CLI reads the memory markdown itself.
  */
 export function collectOpenClawContext(
   stateDir: string,
@@ -75,61 +72,11 @@ export function collectOpenClawContext(
   options?: { agentName?: string }
 ): RefreshContext {
   const agentName = options?.agentName ?? 'main';
+  const memoryDir = join(stateDir, ...MEMORY_DIR_REL);
   return {
-    memorySnippets: readMemorySnippets(stateDir, logger),
+    memoryDirs: existsSync(memoryDir) ? [memoryDir] : [],
     sessionSnippets: readSessionSnippets(stateDir, agentName, logger),
   };
-}
-
-/**
- * Read durable memory from the markdown files under `<stateDir>/workspace/memory`
- * (memory-core's source of truth). Newest files first, total capped at
- * MAX_MEMORY_CHARS. Reading markdown directly avoids the sqlite vector index,
- * so memory works even without an embedding key.
- */
-function readMemorySnippets(stateDir: string, logger: Logger): string[] {
-  const dir = join(stateDir, ...MEMORY_DIR_REL);
-  let entries: string[];
-  try {
-    entries = readdirSync(dir);
-  } catch (err) {
-    logger.debug(`readMemorySnippets: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
-  }
-
-  const files = entries
-    .filter((name) => name.toLowerCase().endsWith('.md'))
-    .map((name) => {
-      const path = join(dir, name);
-      try {
-        return { path, mtime: statSync(path).mtimeMs };
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((f): f is { path: string; mtime: number } => !!f)
-    .sort((a, b) => b.mtime - a.mtime)
-    .slice(0, MAX_MEMORY_FILES);
-
-  const snippets: string[] = [];
-  let total = 0;
-  for (const file of files) {
-    let text: string;
-    try {
-      text = readFileSync(file.path, 'utf-8').trim();
-    } catch {
-      continue;
-    }
-    if (!text) continue;
-    if (total + text.length > MAX_MEMORY_CHARS) {
-      text = text.slice(0, Math.max(0, MAX_MEMORY_CHARS - total)).trim();
-    }
-    if (!text) break;
-    snippets.push(text);
-    total += text.length;
-    if (total >= MAX_MEMORY_CHARS) break;
-  }
-  return snippets;
 }
 
 /**
