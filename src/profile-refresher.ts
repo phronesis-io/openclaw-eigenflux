@@ -104,16 +104,14 @@ export class EigenFluxProfileRefresher {
   /**
    * Run a refresh immediately, out of band from the daily timer. Intended for
    * manual verification (`/eigenflux refresh`) so the full silent loop can be
-   * exercised on demand instead of waiting for the 1–5 AM window. Requires the
-   * refresher to be started; rejects otherwise. The next scheduled refresh is
-   * left untouched.
+   * exercised on demand instead of waiting for the 1–5 AM window. Runs
+   * independently of the timer state — the command path may hold a refresher
+   * instance that was never start()ed, and a manual one-shot should still work.
+   * The next scheduled refresh (if any) is left untouched.
    */
   async triggerNow(): Promise<void> {
-    if (!this.running) {
-      throw new Error('profile refresher is not running');
-    }
     this.config.logger.info(`Manual profile refresh triggered for server=${this.config.serverName}`);
-    await this.refresh();
+    await this.refresh({ manual: true });
   }
 
   private scheduleNext(): void {
@@ -136,7 +134,7 @@ export class EigenFluxProfileRefresher {
     }, delay);
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(opts: { manual?: boolean } = {}): Promise<void> {
     this.config.logger.info(`Running profile refresh for server=${this.config.serverName}`);
 
     // 1. Fetch current profile + recent items in parallel
@@ -154,8 +152,9 @@ export class EigenFluxProfileRefresher {
       ),
     ]);
 
-    // Defensive: if stopped during CLI execution, abort
-    if (!this.running) return;
+    // Defensive: if stopped during CLI execution, abort — unless this is a
+    // manual one-shot trigger, which runs independently of the daily timer.
+    if (!opts.manual && !this.running) return;
 
     // 2. Check results
     if (profileResult.kind === 'auth_required' || itemsResult.kind === 'auth_required') {
@@ -197,7 +196,7 @@ export class EigenFluxProfileRefresher {
     // 3. Assemble prompt and deliver
     const prompt = buildRefreshPrompt(profileData, items);
     try {
-      if (!this.running) return;
+      if (!opts.manual && !this.running) return;
       await this.config.onRefreshPrompt(prompt);
       this.config.logger.info(`Profile refresh prompt delivered for server=${this.config.serverName}`);
       this.emitTelemetry({

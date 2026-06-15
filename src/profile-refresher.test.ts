@@ -309,16 +309,28 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
   });
 
-  test('triggerNow rejects when not running', async () => {
+  test('triggerNow runs even when the refresher was never started', async () => {
+    // The command path may hold an unstarted refresher instance; a manual
+    // trigger must still deliver, independent of the daily timer state.
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: PROFILE_RESPONSE } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'success', data: ITEMS_RESPONSE } as CliResult<any>);
+
     const refresher = new EigenFluxProfileRefresher({
       serverName: 'eigenflux',
       eigenfluxBin: 'eigenflux',
       logger: createLogger(),
-      onRefreshPrompt: jest.fn(),
+      onRefreshPrompt,
       onAuthRequired: jest.fn(),
     });
 
-    await expect(refresher.triggerNow()).rejects.toThrow('not running');
+    // Note: no start() call — running stays false.
+    await refresher.triggerNow();
+
+    expect(refresher.isRunning()).toBe(false);
+    expect(onRefreshPrompt).toHaveBeenCalledTimes(1);
+    expect(onRefreshPrompt.mock.calls[0][0]).toContain('TestBot');
   });
 
   test('isRunning returns false after stop', () => {
