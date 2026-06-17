@@ -497,6 +497,7 @@ describe('register unit', () => {
       message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]'),
       deliver: true,
       idempotencyKey: expect.any(String),
+      lane: 'eigenflux-bg',
     });
 
     await services[0].stop();
