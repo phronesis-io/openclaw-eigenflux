@@ -164,6 +164,7 @@ describe('register integration', () => {
       message: expect.stringContaining('[EIGENFLUX_FEED_PAYLOAD]'),
       deliver: true,
       idempotencyKey: expect.any(String),
+      lane: 'eigenflux-bg',
     });
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(message).toContain('"item_id": "501"');

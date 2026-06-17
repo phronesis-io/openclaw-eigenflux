@@ -22,6 +22,9 @@ type EigenFluxRuntimeApi = {
       message: string;
       deliver?: boolean;
       idempotencyKey?: string;
+      /** Queue lane for this run. Background deliveries use a dedicated lane so a
+       *  slow/stuck run never blocks the user's interactive (per-chat) lane. */
+      lane?: string;
     }) => Promise<{ runId: string }>;
     waitForRun?: (params: {
       runId: string;
@@ -31,6 +34,19 @@ type EigenFluxRuntimeApi = {
       sessionKey: string;
       deleteTranscript?: boolean;
     }) => Promise<void>;
+  };
+  /** Task-run management. Used to truly cancel a run that outlived our wait budget
+   *  ("stop waiting" != "stop the run"). Optional: older hosts may not expose it. */
+  tasks?: {
+    runs?: {
+      bindSession?: (params: { sessionKey: string }) => {
+        list: () => Array<{ id: string; runId?: string }>;
+        cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
+          found: boolean;
+          cancelled: boolean;
+        }>;
+      };
+    };
   };
   system?: {
     enqueueSystemEvent?: (
@@ -59,6 +75,10 @@ const COMMAND_TIMEOUT_MS = 15000;
 // take well over a minute on long feed payloads. 3 minutes gives agents plenty
 // of room to complete while still bounding a genuinely stuck run.
 const SUBAGENT_WAIT_TIMEOUT_MS = 180_000;
+// Background deliveries (feed / PM / profile) run on a dedicated queue lane so a
+// slow or stuck agent run never serializes behind / ahead of the user's own
+// interactive (per-chat) lane. The lane is orthogonal to the session key.
+const BACKGROUND_LANE = 'eigenflux-bg';
 const HEARTBEAT_REASON = 'plugin:eigenflux';
 
 export type EigenFluxNotifierConfig = {
@@ -294,20 +314,18 @@ export class EigenFluxNotifier {
       // agent can update its bio via the CLI — it just suppresses the channel reply.
       const deliver = !silent;
       this.logger.info(
-        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}`
+        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${BACKGROUND_LANE}`
       );
       const { runId } = await runtimeSubagent.run({
         sessionKey: route.sessionKey,
         message,
         deliver,
         idempotencyKey: randomUUID(),
+        lane: BACKGROUND_LANE,
       });
 
       // run() only enqueues; wait long enough for the full agent loop (LLM +
-      // reply + channel send) to complete so we can surface real errors. A
-      // waitForRun timeout here means "still running" — treat it as success
-      // and let the subagent finish asynchronously, since retrying via CLI
-      // would re-run the same agent loop and cause duplicate deliveries.
+      // reply + channel send) to complete so we can surface real errors.
       if (typeof runtimeSubagent.waitForRun === 'function') {
         const waited = await runtimeSubagent.waitForRun({
           runId,
@@ -319,6 +337,13 @@ export class EigenFluxNotifier {
             mode: 'runtime.subagent',
             error: `subagent run error${waited.error ? `: ${waited.error}` : ''}`,
           };
+        }
+        if (waited.status === 'timeout') {
+          // "Stop waiting" is not "stop the run": an un-cancelled run keeps holding
+          // host resources and accumulates as an orphan. Best-effort cancel it, then
+          // still report ok so we do NOT fall through to the CLI agent fallback,
+          // which would re-run the same loop and double-deliver.
+          await this.tryCancelRun(route.sessionKey, runId);
         }
       }
 
@@ -334,6 +359,38 @@ export class EigenFluxNotifier {
         mode: 'runtime.subagent',
         error: formatError(error),
       };
+    }
+  }
+
+  /**
+   * Best-effort cancel of a background run that outlived SUBAGENT_WAIT_TIMEOUT_MS.
+   * Stopping the wait does not stop the run, so without this the orphaned run
+   * lingers on the host and accumulates. Failures are logged, never thrown.
+   */
+  private async tryCancelRun(sessionKey: string, runId: string): Promise<void> {
+    const runs = this.runtime.tasks?.runs;
+    if (!runs || typeof runs.bindSession !== 'function') {
+      this.logger.debug(
+        `tryCancelRun: runtime.tasks.runs unavailable; cannot cancel run_id=${runId}`
+      );
+      return;
+    }
+    try {
+      const bound = runs.bindSession({ sessionKey });
+      const task = bound.list().find((t) => t.runId === runId);
+      if (!task) {
+        this.logger.warn(
+          `tryCancelRun: no task found for run_id=${runId} on session=${sessionKey}; cannot cancel`
+        );
+        return;
+      }
+      const result = await bound.cancel({ taskId: task.id, cfg: this.api.config });
+      this.logger.warn(
+        `Cancelled stuck background run after ${Math.round(SUBAGENT_WAIT_TIMEOUT_MS / 1000)}s: ` +
+        `run_id=${runId}, task_id=${task.id}, found=${result.found}, cancelled=${result.cancelled}`
+      );
+    } catch (error) {
+      this.logger.warn(`tryCancelRun failed for run_id=${runId}: ${formatError(error)}`);
     }
   }
 
