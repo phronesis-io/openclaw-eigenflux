@@ -15,6 +15,15 @@ import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session
 /**
  * Typed subset of the OpenClaw runtime API used by the notifier.
  */
+/** Minimal shape of a session-store entry we read/write when seeding a route. */
+type SessionStoreEntryLike = {
+  deliveryContext?: { channel?: string; to?: string; accountId?: string };
+  lastChannel?: string;
+  lastTo?: string;
+  lastAccountId?: string;
+  [key: string]: unknown;
+};
+
 type EigenFluxRuntimeApi = {
   subagent?: {
     run?: (params: {
@@ -34,6 +43,18 @@ type EigenFluxRuntimeApi = {
       sessionKey: string;
       deleteTranscript?: boolean;
     }) => Promise<void>;
+  };
+  /** Session-store helpers. Used to seed the one-shot feed session's delivery
+   *  context before a deliver:true run, since `subagent.run` cannot carry a
+   *  reply target and a fresh one-shot session has none of its own. */
+  agent?: {
+    session?: {
+      resolveStorePath?: (store: string | undefined, opts?: { agentId?: string }) => string;
+      updateSessionStore?: (
+        storePath: string,
+        mutator: (store: Record<string, SessionStoreEntryLike>) => unknown
+      ) => Promise<unknown>;
+    };
   };
   /** Task-run management. Used to truly cancel a run that outlived our wait budget
    *  ("stop waiting" != "stop the run"). Optional: older hosts may not expose it. */
@@ -166,8 +187,6 @@ export class EigenFluxNotifier {
 
       // Resolve the delivery target (channel/to/accountId) from the standard route,
       // then override the sessionKey with a one-shot key to avoid context accumulation.
-      // Without this, the one-shot session has no delivery context and OpenClaw can't
-      // route the agent's reply to the correct channel (e.g. Feishu "requires target").
       const baseRoute = await this.resolveRoute();
 
       const sessionKey = `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
@@ -181,6 +200,15 @@ export class EigenFluxNotifier {
       this.logger.info(
         `Delivery route resolved: source=targeted-oneshot, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
       );
+
+      // Seed the one-shot session's delivery context BEFORE the run. A deliver:true
+      // subagent resolves its reply target from the session store (it cannot be passed
+      // through subagent.run), and a fresh one-shot session has none — without this the
+      // run fails with Feishu "requires target" (missing target). Skip when silent
+      // (no channel reply) since there is nothing to route. Best-effort.
+      if (!silent) {
+        await this.seedOneShotDeliveryContext(sessionKey, route);
+      }
 
       // Targeted delivery uses only subagent and command-agent transports.
       // Heartbeat fallbacks are excluded because they re-resolve to the main
@@ -243,6 +271,68 @@ export class EigenFluxNotifier {
 
     this.logger.error(`Failed to deliver notification: ${firstAttempt.errors.join(' | ')}`);
     return false;
+  }
+
+  /**
+   * Seed the one-shot feed session's delivery context into the session store
+   * BEFORE running the deliver:true subagent.
+   *
+   * Why this is necessary: `runtime.subagent.run` has no parameter to carry a
+   * reply target, and a deliver:true run resolves its target from the session
+   * store entry's `deliveryContext` (OpenClaw's `extractDeliveryInfo`). A freshly
+   * minted one-shot session key has no entry at all, so the agent's reply fails
+   * with Feishu "Delivering to … requires target" (a *missing*-target error, not
+   * a format error). Writing the resolved route here gives that run a real
+   * destination, while preserving the isolated-session design.
+   *
+   * Store path + agent id mirror the read side: a non-`agent:` key resolves to
+   * the default agent ("main"), which matches `route.agentId`. Best-effort —
+   * failures are logged, never thrown (delivery still attempts and can fall back).
+   */
+  private async seedOneShotDeliveryContext(
+    sessionKey: string,
+    route: ResolvedNotificationRoute
+  ): Promise<void> {
+    if (!route.replyChannel || !route.replyTo) {
+      this.logger.warn(
+        `Cannot seed deliveryContext for one-shot session ${sessionKey}: route has no channel/to`
+      );
+      return;
+    }
+    const session = this.runtime.agent?.session;
+    if (typeof session?.resolveStorePath !== 'function' || typeof session?.updateSessionStore !== 'function') {
+      this.logger.warn(
+        'runtime.agent.session store API unavailable; cannot seed deliveryContext for one-shot session'
+      );
+      return;
+    }
+    const deliveryContext = {
+      channel: route.replyChannel,
+      to: route.replyTo,
+      ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
+    };
+    try {
+      const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
+      const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
+      await session.updateSessionStore(storePath, (store) => {
+        const existing = store[sessionKey] ?? {};
+        store[sessionKey] = {
+          ...existing,
+          deliveryContext,
+          lastChannel: route.replyChannel,
+          lastTo: route.replyTo,
+          ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+        };
+        return undefined;
+      });
+      this.logger.info(
+        `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to seed deliveryContext for one-shot session ${sessionKey}: ${formatError(error)}`
+      );
+    }
   }
 
   private async attemptDelivery(
