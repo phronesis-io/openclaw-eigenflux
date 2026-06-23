@@ -782,4 +782,83 @@ describe('EigenFluxNotifier', () => {
     expect(result).toBe(true);
     expect(deleteSession).toHaveBeenCalledTimes(1);
   });
+
+  describe('seeds deliveryContext for one-shot feed sessions', () => {
+    test('writes the resolved route into the one-shot session store before the run', async () => {
+      const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
+      const updateSessionStore = jest.fn(async (_storePath: string, mutator: (store: any) => unknown) => {
+        const store: Record<string, any> = {};
+        await mutator(store);
+        return store;
+      });
+      const resolveStorePath = jest.fn(() => '/tmp/sessions/main.json');
+
+      // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
+      const callOrder: string[] = [];
+      updateSessionStore.mockImplementationOnce(async (_p: string, mutator: (s: any) => unknown) => {
+        callOrder.push('seed');
+        const store: Record<string, any> = {};
+        await mutator(store);
+        return store;
+      });
+      run.mockImplementationOnce(async (params: any) => {
+        callOrder.push('run');
+        return { runId: 'run-seed' };
+      });
+
+      const notifier = new EigenFluxNotifier(
+        createApi({
+          config: { session: { store: 'sessions' } } as any,
+          runtime: {
+            subagent: { run },
+            agent: { session: { resolveStorePath, updateSessionStore } },
+          } as unknown as OpenClawPluginApi['runtime'],
+        }),
+        createLogger(),
+        { ...createConfig(), replyAccountId: 'default' }
+      );
+
+      await expect(
+        notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] x', { targetSessionKey: 'eigenflux:feed:eigenflux' })
+      ).resolves.toBe(true);
+
+      expect(resolveStorePath).toHaveBeenCalledWith('sessions', { agentId: 'main' });
+      expect(updateSessionStore).toHaveBeenCalledTimes(1);
+
+      // The mutator must write deliveryContext (+ last* mirror) under the one-shot key.
+      const [, mutator] = updateSessionStore.mock.calls[0];
+      const store: Record<string, any> = {};
+      mutator(store);
+      const sessionKey = run.mock.calls[0][0].sessionKey;
+      expect(sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
+      expect(store[sessionKey]).toMatchObject({
+        deliveryContext: { channel: 'feishu', to: 'user:ou_123', accountId: 'default' },
+        lastChannel: 'feishu',
+        lastTo: 'user:ou_123',
+        lastAccountId: 'default',
+      });
+
+      expect(callOrder).toEqual(['seed', 'run']);
+    });
+
+    test('delivery still proceeds when the session-store API is unavailable', async () => {
+      const run = jest.fn().mockResolvedValue({ runId: 'run-no-seed' });
+
+      const notifier = new EigenFluxNotifier(
+        createApi({
+          runtime: {
+            subagent: { run },
+            // no runtime.agent.session
+          } as unknown as OpenClawPluginApi['runtime'],
+        }),
+        createLogger(),
+        createConfig()
+      );
+
+      await expect(
+        notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] y', { targetSessionKey: 'eigenflux:feed:eigenflux' })
+      ).resolves.toBe(true);
+      expect(run).toHaveBeenCalledTimes(1);
+    });
+  });
 });
