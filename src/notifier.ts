@@ -274,6 +274,29 @@ export class EigenFluxNotifier {
   }
 
   /**
+   * Deliver feed into the user's MAIN session via a system event + heartbeat
+   * wake, instead of a throwaway one-shot subagent session (plan §五·附, mode
+   * 2a). This is what lets feed-derived broadcasts read the user's own working
+   * context, keeps the main session's prompt cache warm (vs a cold one-shot
+   * each cycle), and makes feed visible for in-session discussion.
+   *
+   * It deliberately uses ONLY the heartbeat transport — OpenClaw defers a
+   * heartbeat while the main lane is busy (`requests-in-flight`), so this never
+   * jumps ahead of the user's own messages. It does NOT fall back to a
+   * deliver:true subagent (that was the path that contended on the user lane).
+   * Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so the
+   * poll loop needs no backpressure guard.
+   */
+  async deliverToMainSession(message: string): Promise<boolean> {
+    const { route } = await this.resolveRoute();
+    const result = await this.tryNotifyViaRuntimeHeartbeat(message, route);
+    if (!result.ok) {
+      this.logger.error(`Feed main-session delivery failed: ${result.error ?? 'unknown'}`);
+    }
+    return result.ok;
+  }
+
+  /**
    * Seed the one-shot feed session's delivery context into the session store
    * BEFORE running the deliver:true subagent.
    *

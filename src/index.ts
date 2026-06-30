@@ -413,6 +413,26 @@ function createServerRuntime(
       const items = payload.data?.items ?? [];
       const notifications = payload.data?.notifications ?? [];
 
+      // mode 2a (default): inject feed into the user's MAIN session via a system
+      // event + heartbeat wake (plan §五·附) so feed-derived broadcasts can read
+      // the user's own context and the prompt cache stays warm. Set
+      // EIGENFLUX_FEED_DELIVERY=oneshot to roll back to the legacy isolated path.
+      if (process.env.EIGENFLUX_FEED_DELIVERY !== 'oneshot') {
+        // Nothing worth surfacing → don't wake the heartbeat at all.
+        if (items.length === 0 && notifications.length === 0) {
+          return;
+        }
+        // Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so
+        // the poll loop needs no backpressure guard and never stalls on delivery.
+        void notifier
+          .deliverToMainSession(buildFeedPayloadPromptTemplate(payload, getPromptContext()))
+          .catch((err) =>
+            logger.error(`Feed main-session delivery error for server=${server.name}: ${String(err)}`)
+          );
+        return;
+      }
+
+      // ── legacy one-shot path (EIGENFLUX_FEED_DELIVERY=oneshot) ───────────────
       // Check for stale delivery flag (delivery promise hung)
       if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
         const elapsed = Date.now() - feedDeliveryStartedAt;

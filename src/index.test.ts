@@ -117,10 +117,15 @@ describe('register unit', () => {
 
     // Default eigenflux CLI response so session-route-memory reads succeed (unset key).
     execEigenfluxMock.mockResolvedValue({ kind: 'success', data: undefined });
+
+    // These tests assert the legacy one-shot feed path; opt into it explicitly.
+    // The new default (main-session 2a) is covered by its own test below.
+    process.env.EIGENFLUX_FEED_DELIVERY = 'oneshot';
   });
 
   afterEach(() => {
     __testHomeDir = undefined;
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
