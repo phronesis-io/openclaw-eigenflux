@@ -392,8 +392,12 @@ function createServerRuntime(
     logger,
   });
 
-  // Guard: notifier.deliver() may take longer than the poll interval,
-  // so we skip overlapping deliveries to avoid duplicate agent tasks.
+  // Backpressure state for the LEGACY one-shot feed path only
+  // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
+  // before touching any of these — they stay at their initial values there, so
+  // never read them outside the oneshot branch. Guard: notifier.deliver() may
+  // take longer than the poll interval, so we skip overlapping deliveries to
+  // avoid duplicate agent tasks.
   let feedDeliveryInFlight = false;
   let feedDeliveryStartedAt = 0;
   let feedDeliverySkipCount = 0;

@@ -291,7 +291,14 @@ export class EigenFluxNotifier {
     const { route } = await this.resolveRoute();
     const result = await this.tryNotifyViaRuntimeHeartbeat(message, route);
     if (!result.ok) {
-      this.logger.error(`Feed main-session delivery failed: ${result.error ?? 'unknown'}`);
+      // A compliant OpenClaw runtime always exposes the heartbeat APIs, so this
+      // is rare; surface it at warn with the rollback hint rather than silently
+      // dropping the feed for that cycle.
+      this.logger.warn(
+        `Feed main-session delivery failed: ${result.error ?? 'unknown'}. ` +
+        `If runtime.system heartbeat APIs are unavailable on this host, set ` +
+        `EIGENFLUX_FEED_DELIVERY=oneshot to fall back to the isolated path.`
+      );
     }
     return result.ok;
   }
