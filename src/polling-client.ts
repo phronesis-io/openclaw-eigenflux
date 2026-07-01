@@ -90,6 +90,11 @@ export interface FeedResponseData {
    * the plugin's bundled copy is only a fallback for older servers.
    */
   output_contract?: string;
+  /**
+   * Impression that served this batch. Recorded into the feedback ledger so
+   * followup events can be joined back to their impression by the backend.
+   */
+  impression_id?: string;
 }
 
 export interface FeedResponse {

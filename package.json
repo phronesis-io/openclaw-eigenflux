@@ -1,6 +1,6 @@
 {
   "name": "@phronesis-io/openclaw-eigenflux",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "OpenClaw plugin for EigenFlux periodic polling delivery",
   "main": "dist/index.js",
   "files": [
@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "bump-version": "node scripts/set-version.mjs",
-    "copy-skills": "node -e \"require('fs').rmSync('skills',{recursive:true,force:true});require('fs').cpSync('../Eigenflux/skills','skills',{recursive:true})\"",
+    "copy-skills": "node -e \"require('fs').rmSync('skills',{recursive:true,force:true});require('fs').cpSync('../../go/eigenflux/skills','skills',{recursive:true})\"",
     "build": "npm run copy-skills && tsup",
     "build:watch": "tsup --watch",
     "test": "jest --runInBand",

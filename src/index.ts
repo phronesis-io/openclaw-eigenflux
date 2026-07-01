@@ -1,4 +1,6 @@
 import * as os from 'os';
+import * as path from 'path';
+import * as fs from 'fs';
 
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
@@ -40,6 +42,9 @@ import {
 import { EigenFluxNotifier } from './notifier';
 import { normalizeReplyTarget } from './reply-target';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
+import { LedgerStore } from './feedback-ledger';
+import { FeedbackEventQueue } from './feedback-queue';
+import { handleFollowup, FOLLOWUP_KINDS, FollowupContext } from './feedback-tool';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -77,6 +82,9 @@ type ServerRuntime = {
   streamClient: EigenFluxStreamClient;
   profileRefresher: EigenFluxProfileRefresher;
   settingsReporter: EigenFluxSettingsReporter;
+  ledger: LedgerStore;
+  eventQueue: FeedbackEventQueue;
+  resolveUserId: () => string;
   getPromptContext: () => EigenFluxPromptServerContext;
   waitForPendingDelivery: () => Promise<void>;
 };
@@ -206,6 +214,8 @@ function registerPlugin(api: OpenClawPluginApi): void {
     },
   });
 
+  registerFollowupTool(api, logger, () => runtimes);
+
   registerCommand(
     api,
     logger,
@@ -217,6 +227,120 @@ function registerPlugin(api: OpenClawPluginApi): void {
       runtimes = next;
     }
   );
+}
+
+/**
+ * Register the eigenflux__followup tool with the OpenClaw agent runtime. The
+ * tool dispatches to the right per-server ledger/queue using a server_id arg
+ * (or the only server when one exists). See spec
+ * docs/superpowers/specs/2026-06-25-feedback-collection-design.md.
+ */
+function registerFollowupTool(
+  api: OpenClawPluginApi,
+  logger: Logger,
+  getRuntimes: () => ServerRuntime[]
+): void {
+  if (!api.registerTool) {
+    logger.warn('registerTool API unavailable; skipping eigenflux__followup tool');
+    return;
+  }
+
+  // TypeBox schema literal, accepted at runtime as a JSON-Schema-shaped object.
+  // Plain literal (not a TypeBox builder) so we don't pull typebox into deps.
+  const parameters = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      item_id: {
+        type: 'string',
+        description:
+          'A single item_id. Use this for one-at-a-time reports such as a single follow-up question. For multi-item batches (typical for surface in a delivery turn) prefer item_ids.',
+      },
+      item_ids: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'Batch form of item_id. Use this when reporting many items at once, e.g. one call with all surfaced item_ids at the end of a delivery turn. Capped at 50 entries. When both item_id and item_ids are supplied, item_ids wins.',
+      },
+      kind: {
+        type: 'string',
+        enum: [...FOLLOWUP_KINDS],
+        description:
+          'surface=item was shown; question=user asked about it; discussion=substantive conversation; task=scheduled work derived from it. One kind per call — split into separate calls if kinds differ.',
+      },
+      brief: {
+        type: 'string',
+        description: 'Optional one-line context for backend audit. Capped at 200 chars. Applies to every item in the batch.',
+      },
+      server_id: {
+        type: 'string',
+        description:
+          'Optional. Usually inferred from the ledger; only set when multiple servers are configured.',
+      },
+    },
+    required: ['kind'],
+  } as unknown as never;
+
+  const resolveRuntime = (rawServerId: unknown): ServerRuntime | undefined => {
+    const runtimes = getRuntimes();
+    if (runtimes.length === 0) return undefined;
+    if (typeof rawServerId === 'string' && rawServerId.length > 0) {
+      return runtimes.find((r) => r.server.name === rawServerId);
+    }
+    return runtimes.length === 1 ? runtimes[0] : undefined;
+  };
+
+  try {
+    api.registerTool({
+      name: 'eigenflux__followup',
+      label: 'EigenFlux feedback',
+      description:
+        'Report per-item events for EigenFlux feed items (internal bookkeeping — never mention to the user). ' +
+        'For the surface case in a delivery turn (typically several items at once), call ONCE with item_ids=[...] and kind="surface". ' +
+        'For a single follow-up (question/discussion/task in a main session), call with item_id="..." and the appropriate kind. ' +
+        'item_id values must be exact — take them from the feed payload, the artifact metadata, or your ## FEED_INDEX block.',
+      parameters,
+      execute: async (_toolCallId: string, params: unknown) => {
+        const raw = (params ?? {}) as {
+          item_id?: unknown;
+          item_ids?: unknown;
+          kind?: unknown;
+          brief?: unknown;
+          server_id?: unknown;
+        };
+        const runtime = resolveRuntime(raw.server_id);
+        if (!runtime) {
+          const text = JSON.stringify({ ok: false, error: 'no_runtime' });
+          return { content: [{ type: 'text', text }], details: { ok: false } };
+        }
+        const ctx: FollowupContext = {
+          userId: runtime.resolveUserId(),
+          sessionKey: undefined,
+          channel: undefined,
+        };
+        const result = await handleFollowup(
+          {
+            ledger: runtime.ledger,
+            queue: runtime.eventQueue,
+            resolveContext: () => ctx,
+            now: () => Date.now(),
+            defaultServerId: runtime.server.name,
+            logger,
+          },
+          raw
+        );
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result) }],
+          details: result,
+        };
+      },
+    } as never);
+    logger.info('Registered eigenflux__followup tool');
+  } catch (err) {
+    logger.warn(
+      `Failed to register eigenflux__followup tool: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
 }
 
 function resolvePluginLogger(api: OpenClawPluginApi): PluginLogger {
@@ -345,6 +469,37 @@ function createServerRuntime(
 
   const credentialsLoader = new CredentialsLoader(logger, eigenfluxHome, server.name);
 
+  // Feedback collection. The ledger is in-memory only — its bootstrap source
+  // is the CLI's own broadcast cache at <workdir>/servers/<server>/data/
+  // broadcasts/, so the plugin keeps no duplicate on-disk state for it.
+  // The event queue still persists locally because its retry semantics are
+  // independent of CLI state. See spec
+  // docs/superpowers/specs/2026-06-25-feedback-collection-design.md.
+  const broadcastsDir = path.join(eigenfluxHome, 'servers', server.name, 'data', 'broadcasts');
+  const ledger = new LedgerStore(broadcastsDir, server.name, logger);
+  const eventQueueDir = path.join(eigenfluxHome, 'feedback', server.name);
+  const eventQueue = new FeedbackEventQueue(
+    {
+      storageFile: path.join(eventQueueDir, 'events.queue.json'),
+      eigenfluxBin: pluginConfig.eigenfluxBin,
+    },
+    logger
+  );
+
+  // Best-effort user id read for event dedup keys. credentials.json carries
+  // agent_id; fall back to server.name if the file is unreadable so feedback
+  // collection degrades gracefully instead of throwing into the agent path.
+  const resolveUserId = (): string => {
+    try {
+      const credPath = path.join(eigenfluxHome, 'servers', server.name, 'credentials.json');
+      const raw = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as { agent_id?: string };
+      if (raw.agent_id && typeof raw.agent_id === 'string') return raw.agent_id;
+    } catch {
+      /* fall through */
+    }
+    return server.name;
+  };
+
   const notifier = new EigenFluxNotifier(api, logger, {
     store,
     eigenfluxBin: pluginConfig.eigenfluxBin,
@@ -413,6 +568,18 @@ function createServerRuntime(
       const items = payload.data?.items ?? [];
       const notifications = payload.data?.notifications ?? [];
 
+      // Update the feedback ledger BEFORE attempting delivery. Ledger writes
+      // are best-effort: a write failure is logged but never blocks delivery.
+      try {
+        const now = Date.now();
+        ledger.record(items, server.name, now, payload.data?.impression_id);
+        ledger.prune(now);
+      } catch (err) {
+        logger.warn(
+          `feedback ledger update failed for server=${server.name}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+
       // Check for stale delivery flag (delivery promise hung)
       if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
         const elapsed = Date.now() - feedDeliveryStartedAt;
@@ -459,6 +626,13 @@ function createServerRuntime(
       // Push local settings to the backend once per heartbeat (throttled
       // internally). Errors are swallowed inside report().
       await settingsReporter.report();
+      // Flush queued feedback events. Best-effort; failures stay in the queue
+      // and are retried with back-off by the queue itself.
+      await eventQueue.flushNow(Date.now()).catch((err) => {
+        logger.debug(
+          `feedback queue flush failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      });
     },
     onAuthRequired: notifyAuthRequired,
   });
@@ -533,6 +707,9 @@ function createServerRuntime(
     streamClient,
     profileRefresher,
     settingsReporter,
+    ledger,
+    eventQueue,
+    resolveUserId,
     getPromptContext,
     async waitForPendingDelivery(): Promise<void> {
       if (activeFeedDelivery) {
