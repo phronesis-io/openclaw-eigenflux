@@ -69,7 +69,11 @@ describe('agent prompt templates', () => {
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
-  test('prefers the backend-delivered output_contract and strips it from the echoed payload', () => {
+  // TEMP(local-contract-override): the backend-delivered output_contract is
+  // intentionally ignored in favor of the bundled copy. Revert this test to the
+  // "prefers the backend-delivered output_contract" expectation when the override
+  // in agent-prompt-templates.ts is rolled back.
+  test('ignores the backend-delivered output_contract and uses the bundled copy', () => {
     const prompt = buildFeedPayloadPromptTemplate(
       {
         code: 0,
@@ -84,10 +88,13 @@ describe('agent prompt templates', () => {
       context
     );
 
-    // The server copy leads the prompt...
-    expect(prompt).toContain('SERVER CONTRACT vTest');
-    expect(prompt.indexOf('SERVER CONTRACT vTest')).toBeLessThan(prompt.indexOf('Payload:'));
-    // ...and is not duplicated inside the echoed payload JSON.
+    // The server copy is dropped entirely...
+    expect(prompt).not.toContain('SERVER CONTRACT vTest');
+    // ...the bundled contract leads the prompt instead (FEED_INDEX is a stable
+    // marker unique to the bundled copy)...
+    expect(prompt).toContain('FEED_INDEX');
+    expect(prompt.indexOf('FEED_INDEX')).toBeLessThan(prompt.indexOf('Payload:'));
+    // ...and output_contract never leaks into the echoed payload JSON.
     const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
     expect(payloadBlock).not.toContain('output_contract');
   });
