@@ -288,7 +288,17 @@ export class EigenFluxNotifier {
    * poll loop needs no backpressure guard.
    */
   async deliverToMainSession(message: string): Promise<boolean> {
-    const { route } = await this.resolveRoute();
+    // Build the route straight from config. The main session's key / agentId /
+    // reply target are configured and stable for the run, so we deliberately
+    // skip resolveRoute()'s session-store scan (it walks ~/.openclaw/agents/*
+    // and parses every sessions.json) — pointless work on this per-poll path.
+    const route: ResolvedNotificationRoute = {
+      sessionKey: this.config.sessionKey,
+      agentId: this.config.agentId,
+      ...(this.config.replyChannel ? { replyChannel: this.config.replyChannel } : {}),
+      ...(this.config.replyTo ? { replyTo: this.config.replyTo } : {}),
+      ...(this.config.replyAccountId ? { replyAccountId: this.config.replyAccountId } : {}),
+    };
     const result = await this.tryNotifyViaRuntimeHeartbeat(message, route);
     if (!result.ok) {
       // A compliant OpenClaw runtime always exposes the heartbeat APIs, so this
