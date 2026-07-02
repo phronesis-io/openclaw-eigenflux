@@ -274,6 +274,46 @@ export class EigenFluxNotifier {
   }
 
   /**
+   * Deliver feed into the user's MAIN session via a system event + heartbeat
+   * wake, instead of a throwaway one-shot subagent session (plan §五·附, mode
+   * 2a). This is what lets feed-derived broadcasts read the user's own working
+   * context, keeps the main session's prompt cache warm (vs a cold one-shot
+   * each cycle), and makes feed visible for in-session discussion.
+   *
+   * It deliberately uses ONLY the heartbeat transport — OpenClaw defers a
+   * heartbeat while the main lane is busy (`requests-in-flight`), so this never
+   * jumps ahead of the user's own messages. It does NOT fall back to a
+   * deliver:true subagent (that was the path that contended on the user lane).
+   * Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so the
+   * poll loop needs no backpressure guard.
+   */
+  async deliverToMainSession(message: string): Promise<boolean> {
+    // Build the route straight from config. The main session's key / agentId /
+    // reply target are configured and stable for the run, so we deliberately
+    // skip resolveRoute()'s session-store scan (it walks ~/.openclaw/agents/*
+    // and parses every sessions.json) — pointless work on this per-poll path.
+    const route: ResolvedNotificationRoute = {
+      sessionKey: this.config.sessionKey,
+      agentId: this.config.agentId,
+      ...(this.config.replyChannel ? { replyChannel: this.config.replyChannel } : {}),
+      ...(this.config.replyTo ? { replyTo: this.config.replyTo } : {}),
+      ...(this.config.replyAccountId ? { replyAccountId: this.config.replyAccountId } : {}),
+    };
+    const result = await this.tryNotifyViaRuntimeHeartbeat(message, route);
+    if (!result.ok) {
+      // A compliant OpenClaw runtime always exposes the heartbeat APIs, so this
+      // is rare; surface it at warn with the rollback hint rather than silently
+      // dropping the feed for that cycle.
+      this.logger.warn(
+        `Feed main-session delivery failed: ${result.error ?? 'unknown'}. ` +
+        `If runtime.system heartbeat APIs are unavailable on this host, set ` +
+        `EIGENFLUX_FEED_DELIVERY=oneshot to fall back to the isolated path.`
+      );
+    }
+    return result.ok;
+  }
+
+  /**
    * Seed the one-shot feed session's delivery context into the session store
    * BEFORE running the deliver:true subagent.
    *

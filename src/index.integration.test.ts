@@ -127,10 +127,15 @@ describe('register integration', () => {
     discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
       { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
     ] });
+
+    // These integration tests assert the legacy one-shot subagent feed path;
+    // opt into it explicitly (default is now main-session 2a).
+    process.env.EIGENFLUX_FEED_DELIVERY = 'oneshot';
   });
 
   afterEach(async () => {
     __testHomeDir = undefined;
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
@@ -175,6 +180,46 @@ describe('register integration', () => {
     // The output contract must ride along the real delivery path, ahead of the payload.
     expect(message).toContain('OUTPUT CONTRACT');
     expect(message).toContain('📡 Powered by EigenFlux');
+
+    await services[0].stop();
+  });
+
+  test('mode 2a: injects feed into the main session via system event + heartbeat (no subagent)', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = main-session
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-should-not-be-used' });
+    const enqueueSystemEvent = jest.fn().mockReturnValue(true);
+    const requestHeartbeatNow = jest.fn();
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: {
+        subagent: { run: subagentRun },
+        system: { enqueueSystemEvent, requestHeartbeatNow },
+      },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => {
+        services.push(service);
+      },
+    } as any);
+
+    await services[0].start();
+    await waitFor(() => enqueueSystemEvent.mock.calls.length === 1);
+
+    const [message, opts] = enqueueSystemEvent.mock.calls[0];
+    expect(String(message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
+    expect(String(message)).toContain('OUTPUT CONTRACT');
+    expect(String(message)).toContain('"item_id": "501"');
+    // Injected into a persistent main session, NOT a throwaway one-shot key.
+    expect(opts.sessionKey).toEqual(expect.any(String));
+    expect(opts.sessionKey).not.toMatch(/^eigenflux:feed:/);
+    expect(requestHeartbeatNow).toHaveBeenCalled();
+    // The feed must NOT go through the deliver:true subagent path in 2a.
+    expect(subagentRun).not.toHaveBeenCalled();
 
     await services[0].stop();
   });
