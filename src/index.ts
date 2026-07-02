@@ -273,7 +273,7 @@ function registerFollowupTool(
       server_id: {
         type: 'string',
         description:
-          'Optional. Usually inferred from the ledger; only set when multiple servers are configured.',
+          "Optional. Defaults to the CLI's active server; only set when multiple servers are configured.",
       },
     },
     required: ['kind'],
