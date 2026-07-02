@@ -1,6 +1,4 @@
 import * as os from 'os';
-import * as path from 'path';
-import * as fs from 'fs';
 
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
@@ -42,9 +40,8 @@ import {
 import { EigenFluxNotifier } from './notifier';
 import { normalizeReplyTarget } from './reply-target';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
-import { LedgerStore } from './feedback-ledger';
-import { FeedbackEventQueue } from './feedback-queue';
-import { handleFollowup, FOLLOWUP_KINDS, FollowupContext } from './feedback-tool';
+import { handleFollowup, FOLLOWUP_KINDS } from './feedback-tool';
+import { FeedbackFlushLoop } from './feedback-flush-loop';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -82,9 +79,7 @@ type ServerRuntime = {
   streamClient: EigenFluxStreamClient;
   profileRefresher: EigenFluxProfileRefresher;
   settingsReporter: EigenFluxSettingsReporter;
-  ledger: LedgerStore;
-  eventQueue: FeedbackEventQueue;
-  resolveUserId: () => string;
+  flushLoop: FeedbackFlushLoop;
   getPromptContext: () => EigenFluxPromptServerContext;
   waitForPendingDelivery: () => Promise<void>;
 };
@@ -175,6 +170,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         await runtime.feedPoller.start();
         await runtime.streamClient.start();
         runtime.profileRefresher.start();
+        runtime.flushLoop.start();
       }
 
       // CLI is installed and running; if it's older than this plugin expects,
@@ -207,6 +203,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
         runtime.profileRefresher.stop();
+        runtime.flushLoop.stop();
       }
       runtimes = [];
       notInstalledPromptDelivered = false;
@@ -214,7 +211,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
     },
   });
 
-  registerFollowupTool(api, logger, () => runtimes);
+  registerFollowupTool(api, logger, pluginConfig.eigenfluxBin, () => runtimes);
 
   registerCommand(
     api,
@@ -231,13 +228,14 @@ function registerPlugin(api: OpenClawPluginApi): void {
 
 /**
  * Register the eigenflux__followup tool with the OpenClaw agent runtime. The
- * tool dispatches to the right per-server ledger/queue using a server_id arg
- * (or the only server when one exists). See spec
- * docs/superpowers/specs/2026-06-25-feedback-collection-design.md.
+ * handler is a thin shell that shells out to `eigenflux feed event record`;
+ * the server is selected via a server_id arg (or the only server when one
+ * exists). All verification/enrichment/dedup/queueing lives in the CLI.
  */
 function registerFollowupTool(
   api: OpenClawPluginApi,
   logger: Logger,
+  eigenfluxBin: string,
   getRuntimes: () => ServerRuntime[]
 ): void {
   if (!api.registerTool) {
@@ -275,7 +273,7 @@ function registerFollowupTool(
       server_id: {
         type: 'string',
         description:
-          'Optional. Usually inferred from the ledger; only set when multiple servers are configured.',
+          "Optional. Defaults to the CLI's active server; only set when multiple servers are configured.",
       },
     },
     required: ['kind'],
@@ -313,22 +311,18 @@ function registerFollowupTool(
           const text = JSON.stringify({ ok: false, error: 'no_runtime' });
           return { content: [{ type: 'text', text }], details: { ok: false } };
         }
-        const ctx: FollowupContext = {
-          userId: runtime.resolveUserId(),
-          sessionKey: undefined,
-          channel: undefined,
-        };
+        // Thin shell: shell out to `eigenflux feed event record`; the CLI owns
+        // verification/enrichment/dedup/queueing. Nudge the flush loop so the
+        // just-recorded event drains promptly.
         const result = await handleFollowup(
           {
-            ledger: runtime.ledger,
-            queue: runtime.eventQueue,
-            resolveContext: () => ctx,
-            now: () => Date.now(),
-            defaultServerId: runtime.server.name,
+            eigenfluxBin,
+            serverName: runtime.server.name,
             logger,
           },
           raw
         );
+        runtime.flushLoop.kick();
         return {
           content: [{ type: 'text', text: JSON.stringify(result) }],
           details: result,
@@ -469,36 +463,15 @@ function createServerRuntime(
 
   const credentialsLoader = new CredentialsLoader(logger, eigenfluxHome, server.name);
 
-  // Feedback collection. The ledger is in-memory only — its bootstrap source
-  // is the CLI's own broadcast cache at <workdir>/servers/<server>/data/
-  // broadcasts/, so the plugin keeps no duplicate on-disk state for it.
-  // The event queue still persists locally because its retry semantics are
-  // independent of CLI state. See spec
-  // docs/superpowers/specs/2026-06-25-feedback-collection-design.md.
-  const broadcastsDir = path.join(eigenfluxHome, 'servers', server.name, 'data', 'broadcasts');
-  const ledger = new LedgerStore(broadcastsDir, server.name, logger);
-  const eventQueueDir = path.join(eigenfluxHome, 'feedback', server.name);
-  const eventQueue = new FeedbackEventQueue(
-    {
-      storageFile: path.join(eventQueueDir, 'events.queue.json'),
-      eigenfluxBin: pluginConfig.eigenfluxBin,
-    },
-    logger
-  );
-
-  // Best-effort user id read for event dedup keys. credentials.json carries
-  // agent_id; fall back to server.name if the file is unreadable so feedback
-  // collection degrades gracefully instead of throwing into the agent path.
-  const resolveUserId = (): string => {
-    try {
-      const credPath = path.join(eigenfluxHome, 'servers', server.name, 'credentials.json');
-      const raw = JSON.parse(fs.readFileSync(credPath, 'utf-8')) as { agent_id?: string };
-      if (raw.agent_id && typeof raw.agent_id === 'string') return raw.agent_id;
-    } catch {
-      /* fall through */
-    }
-    return server.name;
-  };
+  // Feedback collection is downsunk into the CLI (`feed event record` verifies
+  // item_ids against its own broadcast cache, enriches, dedups, queues on disk,
+  // and opportunistically flushes). The plugin's only resident piece is the
+  // retry cadence below, which drives `feed event flush` with back-off.
+  const flushLoop = new FeedbackFlushLoop({
+    serverName: server.name,
+    eigenfluxBin: pluginConfig.eigenfluxBin,
+    logger,
+  });
 
   const notifier = new EigenFluxNotifier(api, logger, {
     store,
@@ -572,17 +545,8 @@ function createServerRuntime(
       const items = payload.data?.items ?? [];
       const notifications = payload.data?.notifications ?? [];
 
-      // Update the feedback ledger BEFORE attempting delivery. Ledger writes
-      // are best-effort: a write failure is logged but never blocks delivery.
-      try {
-        const now = Date.now();
-        ledger.record(items, server.name, now, payload.data?.impression_id);
-        ledger.prune(now);
-      } catch (err) {
-        logger.warn(
-          `feedback ledger update failed for server=${server.name}: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
+      // The CLI caches every feed response itself, so `feed event record` reads
+      // item_ids straight from that cache — the plugin no longer mirrors them.
 
       // mode 2a (default): inject feed into the user's MAIN session via a system
       // event + heartbeat wake (plan §五·附) so feed-derived broadcasts can read
@@ -650,13 +614,10 @@ function createServerRuntime(
       // Push local settings to the backend once per heartbeat (throttled
       // internally). Errors are swallowed inside report().
       await settingsReporter.report();
-      // Flush queued feedback events. Best-effort; failures stay in the queue
-      // and are retried with back-off by the queue itself.
-      await eventQueue.flushNow(Date.now()).catch((err) => {
-        logger.debug(
-          `feedback queue flush failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      });
+      // Nudge the feedback flush loop once per heartbeat so any queued events
+      // (from an out-of-band `record`) drain even on an idle server. The loop
+      // owns the back-off; this is just an opportunistic kick.
+      flushLoop.kick();
     },
     onAuthRequired: notifyAuthRequired,
   });
@@ -731,9 +692,7 @@ function createServerRuntime(
     streamClient,
     profileRefresher,
     settingsReporter,
-    ledger,
-    eventQueue,
-    resolveUserId,
+    flushLoop,
     getPromptContext,
     async waitForPendingDelivery(): Promise<void> {
       if (activeFeedDelivery) {

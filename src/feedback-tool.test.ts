@@ -1,217 +1,111 @@
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { Logger } from './logger';
-import { LedgerStore } from './feedback-ledger';
-import { FeedbackEventQueue } from './feedback-queue';
-import {
-  handleFollowup,
-  validateInput,
-  computeDedupKey,
-  FOLLOWUP_KINDS,
-  FollowupDeps,
-} from './feedback-tool';
+import type { CliResult } from './cli-executor';
+
+jest.mock('./cli-executor');
+import { execEigenflux } from './cli-executor';
+import { handleFollowup, FOLLOWUP_KINDS, FollowupDeps, FollowupResult } from './feedback-tool';
+
+const execMock = execEigenflux as jest.MockedFunction<typeof execEigenflux>;
 
 function createLogger(): Logger {
   return new Logger({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() });
 }
 
-describe('validateInput', () => {
-  test('rejects missing item_id and item_ids', () => {
-    expect(validateInput({ kind: 'surface' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('rejects empty/whitespace item_id', () => {
-    expect(validateInput({ item_id: '   ', kind: 'surface' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('rejects unknown kind', () => {
-    expect(validateInput({ item_id: 'a', kind: 'bogus' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('accepts scalar item_id and normalizes to item_ids', () => {
-    const r = validateInput({ item_id: ' a1 ', kind: 'surface' });
-    expect(r).toMatchObject({ item_ids: ['a1'], kind: 'surface' });
-  });
-  test('accepts item_ids array', () => {
-    const r = validateInput({ item_ids: ['a', 'b', ' c '], kind: 'surface' });
-    expect(r).toMatchObject({ item_ids: ['a', 'b', 'c'], kind: 'surface' });
-  });
-  test('item_ids deduplicates within a single call', () => {
-    const r = validateInput({ item_ids: ['a', 'a', 'b'], kind: 'surface' }) as { item_ids: string[] };
-    expect(r.item_ids).toEqual(['a', 'b']);
-  });
-  test('item_ids drops blank entries', () => {
-    const r = validateInput({ item_ids: ['a', '', '  ', 'b'], kind: 'surface' }) as { item_ids: string[] };
-    expect(r.item_ids).toEqual(['a', 'b']);
-  });
-  test('item_ids wins when both scalar and array are supplied', () => {
-    const r = validateInput({ item_id: 'scalar', item_ids: ['a'], kind: 'surface' });
-    expect(r).toMatchObject({ item_ids: ['a'] });
-  });
-  test('rejects non-string entries in item_ids', () => {
-    expect(validateInput({ item_ids: ['a', 42, 'b'], kind: 'surface' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('rejects empty item_ids array', () => {
-    expect(validateInput({ item_ids: [], kind: 'surface' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('rejects item_ids exceeding batch limit', () => {
-    const big = Array.from({ length: 60 }, (_, i) => `i${i}`);
-    expect(validateInput({ item_ids: big, kind: 'surface' })).toMatchObject({ error: 'invalid_params' });
-  });
-  test('truncates brief to 200 chars', () => {
-    const long = 'x'.repeat(500);
-    const r = validateInput({ item_id: 'a', kind: 'surface', brief: long }) as { brief: string };
-    expect(r.brief.length).toBe(200);
-  });
-  test('all four FOLLOWUP_KINDS pass validation', () => {
-    for (const k of FOLLOWUP_KINDS) {
-      expect(validateInput({ item_id: 'a', kind: k })).toMatchObject({ kind: k });
-    }
+function makeDeps(): FollowupDeps {
+  return { eigenfluxBin: 'eigenflux', serverName: 'srv-a', logger: createLogger() };
+}
+
+function okResult(data: FollowupResult): CliResult<FollowupResult> {
+  return { kind: 'success', data } as CliResult<FollowupResult>;
+}
+
+/** Extract argv from the single execEigenflux call. */
+function calledArgs(): string[] {
+  expect(execMock).toHaveBeenCalledTimes(1);
+  return execMock.mock.calls[0][1];
+}
+
+describe('FOLLOWUP_KINDS', () => {
+  test('exposes the four backend kinds', () => {
+    expect([...FOLLOWUP_KINDS]).toEqual(['surface', 'question', 'discussion', 'task']);
   });
 });
 
-describe('computeDedupKey', () => {
-  test('same hour bucket yields same key', () => {
-    const t1 = 1_700_000_000_000;
-    const t2 = t1 + 60_000;
-    expect(computeDedupKey('u', 'a', 'surface', t1)).toBe(computeDedupKey('u', 'a', 'surface', t2));
-  });
-  test('different hour bucket yields different key', () => {
-    const t1 = 1_700_000_000_000;
-    const t2 = t1 + 2 * 60 * 60 * 1000;
-    expect(computeDedupKey('u', 'a', 'surface', t1)).not.toBe(computeDedupKey('u', 'a', 'surface', t2));
-  });
-  test('different kind yields different key', () => {
-    const t = 1_700_000_000_000;
-    expect(computeDedupKey('u', 'a', 'surface', t)).not.toBe(computeDedupKey('u', 'a', 'task', t));
-  });
-  test('different user yields different key', () => {
-    const t = 1_700_000_000_000;
-    expect(computeDedupKey('u1', 'a', 'surface', t)).not.toBe(computeDedupKey('u2', 'a', 'surface', t));
-  });
-});
-
-describe('handleFollowup', () => {
-  let tmp: string;
-  let ledger: LedgerStore;
-  let queue: FeedbackEventQueue;
-  let deps: FollowupDeps;
-
+describe('handleFollowup thin shell', () => {
   beforeEach(() => {
-    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ftool-'));
-    ledger = new LedgerStore(path.join(tmp, 'broadcasts'), 'srv-a', createLogger());
-    queue = new FeedbackEventQueue(
-      { storageFile: path.join(tmp, 'q.json'), eigenfluxBin: 'eigenflux' },
-      createLogger()
-    );
-    deps = {
-      ledger,
-      queue,
-      resolveContext: () => ({ userId: 'u1', sessionKey: 'sess', channel: 'feed' }),
-      now: () => 1_000_000,
-      defaultServerId: 'srv-default',
-      logger: createLogger(),
-    };
-  });
-  afterEach(() => {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    execMock.mockReset();
   });
 
-  test('returns invalid_params on bad input', async () => {
-    const r = await handleFollowup(deps, { kind: 'surface' });
+  test('returns invalid_params without shelling out when no item_id/item_ids', async () => {
+    const r = await handleFollowup(makeDeps(), { kind: 'surface' });
     expect(r).toEqual({ ok: false, error: 'invalid_params' });
-    expect(queue.size()).toBe(0);
+    expect(execMock).not.toHaveBeenCalled();
   });
 
-  test('per-item unknown_item when ledger has no match (scalar input)', async () => {
-    const r = await handleFollowup(deps, { item_id: 'nope', kind: 'surface' });
-    expect(r.ok).toBe(true);
-    expect(r.accepted).toBe(0);
-    expect(r.results).toEqual([{ item_id: 'nope', ok: false, error: 'unknown_item' }]);
-    expect(queue.size()).toBe(0);
-  });
+  test('scalar item_id builds `feed event record` with comma-joined --item-ids', async () => {
+    execMock.mockResolvedValue(okResult({ ok: true, accepted: 1, results: [{ item_id: 'a1', ok: true, dedup_key: 'k' }] }));
+    const r = await handleFollowup(makeDeps(), { item_id: ' a1 ', kind: 'task', brief: 'wrote up' });
 
-  test('per-item expired when ledger entry has aged past TTL', async () => {
-    ledger.record([{ item_id: 'a1' }], 'srv-a', 1_000_000);
-    const future = 1_000_000 + 30 * 24 * 60 * 60 * 1000;
-    const futureDeps = { ...deps, now: () => future };
-    const r = await futureDeps && (await handleFollowup(futureDeps, { item_id: 'a1', kind: 'surface' }));
-    expect(r.ok).toBe(true);
-    expect(r.accepted).toBe(0);
-    expect(r.results).toEqual([{ item_id: 'a1', ok: false, error: 'expired' }]);
-    expect(queue.size()).toBe(0);
-  });
-
-  test('scalar input enqueues a single event with dedup_key', async () => {
-    ledger.record([{ item_id: 'a1' }], 'srv-a', 1_000_000);
-    const r = await handleFollowup(deps, { item_id: 'a1', kind: 'task', brief: 'wrote up' });
-    expect(r.ok).toBe(true);
-    expect(r.accepted).toBe(1);
-    expect(r.results?.length).toBe(1);
-    expect(r.results?.[0]).toMatchObject({ item_id: 'a1', ok: true });
-    expect(typeof r.results?.[0].dedup_key).toBe('string');
-    expect(queue.size()).toBe(1);
-  });
-
-  test('batch input enqueues one event per known item, skips unknowns', async () => {
-    ledger.record([{ item_id: 'a1' }, { item_id: 'a2' }], 'srv-a', 1_000_000);
-    const r = await handleFollowup(deps, {
-      item_ids: ['a1', 'a2', 'ghost'],
-      kind: 'surface',
-    });
-    expect(r.ok).toBe(true);
-    expect(r.accepted).toBe(2);
-    expect(r.results).toEqual([
-      { item_id: 'a1', ok: true, dedup_key: expect.any(String) },
-      { item_id: 'a2', ok: true, dedup_key: expect.any(String) },
-      { item_id: 'ghost', ok: false, error: 'unknown_item' },
+    const args = calledArgs();
+    expect(execMock.mock.calls[0][0]).toBe('eigenflux');
+    expect(args.slice(0, 3)).toEqual(['feed', 'event', 'record']);
+    expect(args).toEqual([
+      'feed', 'event', 'record',
+      '--item-ids', 'a1',
+      '--kind', 'task',
+      '-s', 'srv-a',
+      '--brief', 'wrote up',
     ]);
-    expect(queue.size()).toBe(2);
+    // CLI JSON passes straight through to the agent.
+    expect(r).toEqual({ ok: true, accepted: 1, results: [{ item_id: 'a1', ok: true, dedup_key: 'k' }] });
   });
 
-  test('batch input yields distinct dedup_keys per item under the same kind/hour', async () => {
-    ledger.record([{ item_id: 'a1' }, { item_id: 'a2' }], 'srv-a', 1_000_000);
-    const r = await handleFollowup(deps, { item_ids: ['a1', 'a2'], kind: 'surface' });
-    expect(r.results?.[0].dedup_key).not.toBe(r.results?.[1].dedup_key);
+  test('item_ids array is comma-joined (dedup + trim only, no verification)', async () => {
+    execMock.mockResolvedValue(okResult({ ok: true, accepted: 2, results: [] }));
+    await handleFollowup(makeDeps(), { item_ids: ['a', 'a', ' b ', ''], kind: 'surface' });
+
+    const args = calledArgs();
+    const idx = args.indexOf('--item-ids');
+    expect(args[idx + 1]).toBe('a,b');
+    expect(args).toContain('--kind');
+    expect(args[args.indexOf('--kind') + 1]).toBe('surface');
+    // No brief supplied → no --brief flag.
+    expect(args).not.toContain('--brief');
   });
 
-  test('uses ledger server_id when not supplied by agent', async () => {
-    ledger.record([{ item_id: 'a1' }], 'srv-a', 1_000_000);
-    await handleFollowup(deps, { item_id: 'a1', kind: 'surface' });
-    const persisted = JSON.parse(fs.readFileSync(path.join(tmp, 'q.json'), 'utf-8'));
-    expect(persisted.events[0].server_id).toBe('srv-a');
+  test('item_ids wins when both scalar and array are supplied', async () => {
+    execMock.mockResolvedValue(okResult({ ok: true, accepted: 1, results: [] }));
+    await handleFollowup(makeDeps(), { item_id: 'scalar', item_ids: ['a'], kind: 'surface' });
+    const args = calledArgs();
+    expect(args[args.indexOf('--item-ids') + 1]).toBe('a');
   });
 
-  test('respects explicit server_id override across the whole batch', async () => {
-    ledger.record([{ item_id: 'a1' }, { item_id: 'a2' }], 'srv-a', 1_000_000);
-    await handleFollowup(deps, { item_ids: ['a1', 'a2'], kind: 'surface', server_id: 'srv-override' });
-    const persisted = JSON.parse(fs.readFileSync(path.join(tmp, 'q.json'), 'utf-8'));
-    expect(persisted.events.map((e: { server_id: string }) => e.server_id)).toEqual([
-      'srv-override',
-      'srv-override',
-    ]);
+  test('always targets the runtime server via -s', async () => {
+    execMock.mockResolvedValue(okResult({ ok: true, accepted: 1, results: [] }));
+    await handleFollowup({ ...makeDeps(), serverName: 'other' }, { item_id: 'a', kind: 'surface' });
+    const args = calledArgs();
+    expect(args[args.indexOf('-s') + 1]).toBe('other');
   });
 
-  test('propagates session_key and channel from context to every queued event', async () => {
-    ledger.record([{ item_id: 'a1' }, { item_id: 'a2' }], 'srv-a', 1_000_000);
-    await handleFollowup(deps, { item_ids: ['a1', 'a2'], kind: 'surface' });
-    const persisted = JSON.parse(fs.readFileSync(path.join(tmp, 'q.json'), 'utf-8'));
-    expect(persisted.events.every((e: { session_key: string }) => e.session_key === 'sess')).toBe(true);
-    expect(persisted.events.every((e: { channel: string }) => e.channel === 'feed')).toBe(true);
+  test('brief is truncated to 200 chars before passing to the CLI', async () => {
+    execMock.mockResolvedValue(okResult({ ok: true, accepted: 1, results: [] }));
+    await handleFollowup(makeDeps(), { item_id: 'a', kind: 'surface', brief: 'x'.repeat(500) });
+    const args = calledArgs();
+    expect(args[args.indexOf('--brief') + 1].length).toBe(200);
   });
 
-  test('carries impression_id from the ledger onto every queued event', async () => {
-    ledger.record([{ item_id: 'a1' }, { item_id: 'a2' }], 'srv-a', 1_000_000, 'imp-42');
-    await handleFollowup(deps, { item_ids: ['a1', 'a2'], kind: 'surface' });
-    const persisted = JSON.parse(fs.readFileSync(path.join(tmp, 'q.json'), 'utf-8'));
-    expect(persisted.events.map((e: { impression_id?: string }) => e.impression_id)).toEqual([
-      'imp-42',
-      'imp-42',
-    ]);
+  test('passes an unknown kind straight to the CLI (CLI owns validation)', async () => {
+    execMock.mockResolvedValue(okResult({ ok: false, error: 'invalid_params' }));
+    const r = await handleFollowup(makeDeps(), { item_id: 'a', kind: 'bogus' });
+    const args = calledArgs();
+    expect(args[args.indexOf('--kind') + 1]).toBe('bogus');
+    // CLI's rejection is surfaced verbatim.
+    expect(r).toEqual({ ok: false, error: 'invalid_params' });
   });
 
-  test('omits impression_id when the ledger entry has none', async () => {
-    ledger.record([{ item_id: 'a1' }], 'srv-a', 1_000_000);
-    await handleFollowup(deps, { item_id: 'a1', kind: 'surface' });
-    const persisted = JSON.parse(fs.readFileSync(path.join(tmp, 'q.json'), 'utf-8'));
-    expect(persisted.events[0].impression_id).toBeUndefined();
+  test('surfaces cli_error when the CLI process fails', async () => {
+    execMock.mockResolvedValue({ kind: 'error', error: new Error('boom'), exitCode: 1, stderr: 'boom' } as CliResult<FollowupResult>);
+    const r = await handleFollowup(makeDeps(), { item_id: 'a', kind: 'surface' });
+    expect(r).toEqual({ ok: false, error: 'cli_error' });
   });
 });

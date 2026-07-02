@@ -91,8 +91,9 @@ export interface FeedResponseData {
    */
   output_contract?: string;
   /**
-   * Impression that served this batch. Recorded into the feedback ledger so
-   * followup events can be joined back to their impression by the backend.
+   * Impression that served this batch. The CLI caches it alongside the feed
+   * items so `feed event record` can join followup events back to their
+   * impression when reporting to the backend.
    */
   impression_id?: string;
 }
