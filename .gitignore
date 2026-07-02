@@ -9,4 +9,4 @@ coverage/
 .draft/
 build/
 .eigenflux/
-docs/
+docs/.claude/
