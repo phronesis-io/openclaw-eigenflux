@@ -50,10 +50,18 @@ type EigenFluxRuntimeApi = {
   agent?: {
     session?: {
       resolveStorePath?: (store: string | undefined, opts?: { agentId?: string }) => string;
-      updateSessionStore?: (
-        storePath: string,
-        mutator: (store: Record<string, SessionStoreEntryLike>) => unknown
-      ) => Promise<unknown>;
+      /** Row-scoped write: patch a single session entry by identity. Replaces the
+       *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
+       *  `sdk-session-store-write`). Merges the returned partial into the entry. */
+      patchSessionEntry?: (params: {
+        agentId?: string;
+        sessionKey: string;
+        storePath?: string;
+        update: (
+          entry: SessionStoreEntryLike,
+          context: { existingEntry?: SessionStoreEntryLike }
+        ) => Partial<SessionStoreEntryLike> | null;
+      }) => Promise<unknown>;
     };
   };
   /** Task-run management. Used to truly cancel a run that outlived our wait budget
@@ -371,7 +379,7 @@ export class EigenFluxNotifier {
       return;
     }
     const session = this.runtime.agent?.session;
-    if (typeof session?.resolveStorePath !== 'function' || typeof session?.updateSessionStore !== 'function') {
+    if (typeof session?.resolveStorePath !== 'function' || typeof session?.patchSessionEntry !== 'function') {
       this.logger.warn(
         'runtime.agent.session store API unavailable; cannot seed deliveryContext for one-shot session'
       );
@@ -385,16 +393,18 @@ export class EigenFluxNotifier {
     try {
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
-      await session.updateSessionStore(storePath, (store) => {
-        const existing = store[sessionKey] ?? {};
-        store[sessionKey] = {
-          ...existing,
+      // Row-scoped write (patchSessionEntry) instead of the deprecated whole-store
+      // updateSessionStore: patch merges the returned partial into just this entry.
+      await session.patchSessionEntry({
+        agentId: route.agentId,
+        sessionKey,
+        storePath,
+        update: () => ({
           deliveryContext,
           lastChannel: route.replyChannel,
           lastTo: route.replyTo,
           ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
-        };
-        return undefined;
+        }),
       });
       this.logger.info(
         `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
