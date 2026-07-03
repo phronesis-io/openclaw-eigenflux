@@ -303,10 +303,13 @@ describe('EigenFluxNotifier', () => {
     );
 
     await expect(notifier.deliverToMainSession('[EIGENFLUX_TEST] payload')).resolves.toBe(true);
-    // Event goes into the MAIN session (config sessionKey), but the reply target
-    // is borrowed from the remembered route so the heartbeat reply is deliverable.
+    // The event must be enqueued under the CANONICAL session key from the
+    // remembered route, NOT the config alias "main": the host bridge does not
+    // canonicalize on enqueue, while every consumer (heartbeat runner,
+    // user-message runs) drains the canonical key — an alias-keyed event would
+    // never be drained. Reply target is borrowed from the same route.
     expect(enqueueSystemEvent).toHaveBeenCalledWith('[EIGENFLUX_TEST] payload', {
-      sessionKey: 'main',
+      sessionKey: 'agent:main:feishu:direct:ou_123',
       deliveryContext: {
         channel: 'feishu',
         to: 'user:ou_123',
@@ -317,7 +320,7 @@ describe('EigenFluxNotifier', () => {
       reason: 'plugin:eigenflux',
       coalesceMs: 0,
       agentId: 'main',
-      sessionKey: 'main',
+      sessionKey: 'agent:main:feishu:direct:ou_123',
     });
 
     fs.rmSync(stateDir, { recursive: true, force: true });

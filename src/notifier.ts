@@ -306,31 +306,53 @@ export class EigenFluxNotifier {
       ...(this.config.replyTo ? { replyTo: this.config.replyTo } : {}),
       ...(this.config.replyAccountId ? { replyAccountId: this.config.replyAccountId } : {}),
     };
-    // The feed poller's config usually has NO reply target (channel/to), so the
-    // system event we enqueue would carry deliveryContext=none and the main
-    // session's heartbeat reply would have nowhere to go — the feed lands in the
-    // session but never reaches the user. Recover the target from the remembered
-    // route in the session store (the same source PM delivery resolves through),
-    // keeping the main session's own sessionKey/agentId so the event still wakes
-    // the main lane; we only borrow channel/to/accountId.
-    if (!route.replyChannel || !route.replyTo) {
+    // The feed poller's config usually has NO reply target (channel/to) and an
+    // INTERNAL sessionKey alias ("main"). Both must be recovered from the
+    // session store's remembered route (the same source PM delivery resolves
+    // through), for two distinct reasons:
+    //
+    // 1. Reply target: without channel/to the enqueued system event carries
+    //    deliveryContext=none, so the main session's reply has nowhere to go.
+    //
+    // 2. CANONICAL sessionKey: the runtime bridge's enqueueSystemEvent does NOT
+    //    canonicalize the key — an event enqueued under the literal alias
+    //    "main" sits in a queue that NO consumer ever drains: both the
+    //    heartbeat runner (resolveHeartbeatSession) and ordinary user-message
+    //    runs (get-reply) canonicalize first and drain e.g. "agent:main:main".
+    //    Enqueuing under the alias means the feed rots in memory until the
+    //    gateway restarts. With the canonical key, the NEXT user message run
+    //    drains the event even if no heartbeat ever fires — the heartbeat wake
+    //    below is just an accelerator, not a dependency.
+    if (!route.replyChannel || !route.replyTo || isInternalSessionKey(route.sessionKey)) {
       try {
         const { route: remembered, source } = await this.resolveRoute();
-        if (remembered.replyChannel && remembered.replyTo) {
-          route.replyChannel = remembered.replyChannel;
-          route.replyTo = remembered.replyTo;
-          if (remembered.replyAccountId) {
-            route.replyAccountId = remembered.replyAccountId;
+        if (!route.replyChannel || !route.replyTo) {
+          if (remembered.replyChannel && remembered.replyTo) {
+            route.replyChannel = remembered.replyChannel;
+            route.replyTo = remembered.replyTo;
+            if (remembered.replyAccountId) {
+              route.replyAccountId = remembered.replyAccountId;
+            }
+            this.logger.info(
+              `deliverToMainSession recovered reply target from ${source} route: ` +
+              `channel=${remembered.replyChannel}, to=${remembered.replyTo}`
+            );
+          } else {
+            this.logger.warn(
+              'deliverToMainSession: no reply target in config or remembered route; ' +
+              'feed reply may not reach the user this cycle'
+            );
           }
+        }
+        if (isInternalSessionKey(route.sessionKey) && !isInternalSessionKey(remembered.sessionKey)) {
           this.logger.info(
-            `deliverToMainSession recovered reply target from ${source} route: ` +
-            `channel=${remembered.replyChannel}, to=${remembered.replyTo}`
+            `deliverToMainSession adopting canonical session key from ${source} route: ` +
+            `${route.sessionKey} -> ${remembered.sessionKey}`
           );
-        } else {
-          this.logger.warn(
-            'deliverToMainSession: no reply target in config or remembered route; ' +
-            'feed reply may not reach the user this cycle'
-          );
+          route.sessionKey = remembered.sessionKey;
+          if (remembered.agentId) {
+            route.agentId = remembered.agentId;
+          }
         }
       } catch (error) {
         this.logger.warn(
