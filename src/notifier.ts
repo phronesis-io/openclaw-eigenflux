@@ -288,10 +288,9 @@ export class EigenFluxNotifier {
    * poll loop needs no backpressure guard.
    */
   async deliverToMainSession(message: string): Promise<boolean> {
-    // Build the route straight from config. The main session's key / agentId /
-    // reply target are configured and stable for the run, so we deliberately
-    // skip resolveRoute()'s session-store scan (it walks ~/.openclaw/agents/*
-    // and parses every sessions.json) — pointless work on this per-poll path.
+    // Build the route from config. When the notifier config carries an explicit
+    // reply target we use it as-is and skip resolveRoute()'s session-store scan
+    // (it walks ~/.openclaw/agents/* and parses every sessions.json).
     const route: ResolvedNotificationRoute = {
       sessionKey: this.config.sessionKey,
       agentId: this.config.agentId,
@@ -299,6 +298,38 @@ export class EigenFluxNotifier {
       ...(this.config.replyTo ? { replyTo: this.config.replyTo } : {}),
       ...(this.config.replyAccountId ? { replyAccountId: this.config.replyAccountId } : {}),
     };
+    // The feed poller's config usually has NO reply target (channel/to), so the
+    // system event we enqueue would carry deliveryContext=none and the main
+    // session's heartbeat reply would have nowhere to go — the feed lands in the
+    // session but never reaches the user. Recover the target from the remembered
+    // route in the session store (the same source PM delivery resolves through),
+    // keeping the main session's own sessionKey/agentId so the event still wakes
+    // the main lane; we only borrow channel/to/accountId.
+    if (!route.replyChannel || !route.replyTo) {
+      try {
+        const { route: remembered, source } = await this.resolveRoute();
+        if (remembered.replyChannel && remembered.replyTo) {
+          route.replyChannel = remembered.replyChannel;
+          route.replyTo = remembered.replyTo;
+          if (remembered.replyAccountId) {
+            route.replyAccountId = remembered.replyAccountId;
+          }
+          this.logger.info(
+            `deliverToMainSession recovered reply target from ${source} route: ` +
+            `channel=${remembered.replyChannel}, to=${remembered.replyTo}`
+          );
+        } else {
+          this.logger.warn(
+            'deliverToMainSession: no reply target in config or remembered route; ' +
+            'feed reply may not reach the user this cycle'
+          );
+        }
+      } catch (error) {
+        this.logger.warn(
+          `deliverToMainSession: resolveRoute failed while recovering reply target: ${formatError(error)}`
+        );
+      }
+    }
     const result = await this.tryNotifyViaRuntimeHeartbeat(message, route);
     if (!result.ok) {
       // A compliant OpenClaw runtime always exposes the heartbeat APIs, so this

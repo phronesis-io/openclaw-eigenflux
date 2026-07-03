@@ -267,6 +267,62 @@ describe('EigenFluxNotifier', () => {
     });
   });
 
+  test('deliverToMainSession recovers reply target from remembered route when config has none', async () => {
+    // The feed poller's config carries no reply target; without recovery the
+    // enqueued system event would have deliveryContext=none and the main
+    // session's heartbeat reply would never reach the user.
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-main-session-'));
+    const sessionStorePath = path.join(stateDir, 'sessions.json');
+    fs.writeFileSync(sessionStorePath, JSON.stringify({}), 'utf-8');
+
+    readStoredNotificationRouteMock.mockResolvedValue({
+      sessionKey: 'agent:main:feishu:direct:ou_123',
+      agentId: 'main',
+      replyChannel: 'feishu',
+      replyTo: 'user:ou_123',
+      replyAccountId: 'default',
+    });
+
+    const enqueueSystemEvent = jest.fn().mockReturnValue(true);
+    const requestHeartbeatNow = jest.fn();
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          system: { enqueueSystemEvent, requestHeartbeatNow },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      {
+        ...createConfig(),
+        sessionKey: 'main',
+        replyChannel: undefined,
+        replyTo: undefined,
+        replyAccountId: undefined,
+        sessionStorePath,
+      }
+    );
+
+    await expect(notifier.deliverToMainSession('[EIGENFLUX_TEST] payload')).resolves.toBe(true);
+    // Event goes into the MAIN session (config sessionKey), but the reply target
+    // is borrowed from the remembered route so the heartbeat reply is deliverable.
+    expect(enqueueSystemEvent).toHaveBeenCalledWith('[EIGENFLUX_TEST] payload', {
+      sessionKey: 'main',
+      deliveryContext: {
+        channel: 'feishu',
+        to: 'user:ou_123',
+        accountId: 'default',
+      },
+    });
+    expect(requestHeartbeatNow).toHaveBeenCalledWith({
+      reason: 'plugin:eigenflux',
+      coalesceMs: 0,
+      agentId: 'main',
+      sessionKey: 'main',
+    });
+
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  });
+
   test('prefers direct session over newer group session when scanning session store', async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-session-store-'));
     const sessionStorePath = path.join(stateDir, 'sessions.json');
