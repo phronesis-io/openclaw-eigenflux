@@ -90,10 +90,10 @@ describe('agent prompt templates', () => {
 
     // The server copy is dropped entirely...
     expect(prompt).not.toContain('SERVER CONTRACT vTest');
-    // ...the bundled contract leads the prompt instead (FEED_INDEX is a stable
-    // marker unique to the bundled copy)...
-    expect(prompt).toContain('FEED_INDEX');
-    expect(prompt.indexOf('FEED_INDEX')).toBeLessThan(prompt.indexOf('Payload:'));
+    // ...the bundled contract leads the prompt instead ("OUTPUT CONTRACT" heads
+    // the bundled contract.md / fallback and never appears in the server copy)...
+    expect(prompt).toContain('OUTPUT CONTRACT');
+    expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
     // ...and output_contract never leaks into the echoed payload JSON.
     const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
     expect(payloadBlock).not.toContain('output_contract');

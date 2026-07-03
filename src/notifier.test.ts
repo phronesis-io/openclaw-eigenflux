@@ -842,22 +842,15 @@ describe('EigenFluxNotifier', () => {
   describe('seeds deliveryContext for one-shot feed sessions', () => {
     test('writes the resolved route into the one-shot session store before the run', async () => {
       const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
-      const updateSessionStore = jest.fn(async (_storePath: string, mutator: (store: any) => unknown) => {
-        const store: Record<string, any> = {};
-        await mutator(store);
-        return store;
+      // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
+      const callOrder: string[] = [];
+      const patchSessionEntry = jest.fn(async (_params: any) => {
+        callOrder.push('seed');
+        return null;
       });
       const resolveStorePath = jest.fn(() => '/tmp/sessions/main.json');
 
-      // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
-      const callOrder: string[] = [];
-      updateSessionStore.mockImplementationOnce(async (_p: string, mutator: (s: any) => unknown) => {
-        callOrder.push('seed');
-        const store: Record<string, any> = {};
-        await mutator(store);
-        return store;
-      });
-      run.mockImplementationOnce(async (params: any) => {
+      run.mockImplementationOnce(async (_params: any) => {
         callOrder.push('run');
         return { runId: 'run-seed' };
       });
@@ -867,7 +860,7 @@ describe('EigenFluxNotifier', () => {
           config: { session: { store: 'sessions' } } as any,
           runtime: {
             subagent: { run },
-            agent: { session: { resolveStorePath, updateSessionStore } },
+            agent: { session: { resolveStorePath, patchSessionEntry } },
           } as unknown as OpenClawPluginApi['runtime'],
         }),
         createLogger(),
@@ -879,15 +872,17 @@ describe('EigenFluxNotifier', () => {
       ).resolves.toBe(true);
 
       expect(resolveStorePath).toHaveBeenCalledWith('sessions', { agentId: 'main' });
-      expect(updateSessionStore).toHaveBeenCalledTimes(1);
+      expect(patchSessionEntry).toHaveBeenCalledTimes(1);
 
-      // The mutator must write deliveryContext (+ last* mirror) under the one-shot key.
-      const [, mutator] = updateSessionStore.mock.calls[0];
-      const store: Record<string, any> = {};
-      mutator(store);
+      // Row-scoped patch targets the one-shot key and merges deliveryContext (+ last* mirror).
+      const params = patchSessionEntry.mock.calls[0][0];
       const sessionKey = run.mock.calls[0][0].sessionKey;
       expect(sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
-      expect(store[sessionKey]).toMatchObject({
+      expect(params.sessionKey).toBe(sessionKey);
+      expect(params.agentId).toBe('main');
+      expect(params.storePath).toBe('/tmp/sessions/main.json');
+      const patch = params.update({}, { existingEntry: undefined });
+      expect(patch).toMatchObject({
         deliveryContext: { channel: 'feishu', to: 'user:ou_123', accountId: 'default' },
         lastChannel: 'feishu',
         lastTo: 'user:ou_123',
