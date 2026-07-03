@@ -548,11 +548,21 @@ function createServerRuntime(
       // The CLI caches every feed response itself, so `feed event record` reads
       // item_ids straight from that cache — the plugin no longer mirrors them.
 
-      // mode 2a (default): inject feed into the user's MAIN session via a system
-      // event + heartbeat wake (plan §五·附) so feed-derived broadcasts can read
-      // the user's own context and the prompt cache stays warm. Set
-      // EIGENFLUX_FEED_DELIVERY=oneshot to roll back to the legacy isolated path.
-      if (process.env.EIGENFLUX_FEED_DELIVERY !== 'oneshot') {
+      // Delivery modes (EIGENFLUX_FEED_DELIVERY):
+      //
+      // (default)      — the original pre-oneshot path: notifier.deliver() runs
+      //                  the agent ON the user's real main session via
+      //                  runtime.subagent (deliver:true). The PLUGIN initiates
+      //                  the run, so feed is an ACTIVE push with full user
+      //                  context and no dependency on the host heartbeat
+      //                  scheduler (which has been observed to stall for hours).
+      // 'system-event' — mode 2a: enqueue into the main session + heartbeat
+      //                  wake. Fully non-blocking, but delivery timing depends
+      //                  on the host heartbeat actually firing; until that is
+      //                  reliable this mode is opt-in only.
+      // 'oneshot'      — legacy isolated one-shot session (no user context).
+      const feedDeliveryMode = process.env.EIGENFLUX_FEED_DELIVERY;
+      if (feedDeliveryMode === 'system-event') {
         // Nothing worth surfacing → don't wake the heartbeat at all.
         if (items.length === 0 && notifications.length === 0) {
           return;
@@ -567,7 +577,7 @@ function createServerRuntime(
         return;
       }
 
-      // ── legacy one-shot path (EIGENFLUX_FEED_DELIVERY=oneshot) ───────────────
+      // ── guarded delivery (default main-session push, or legacy one-shot) ─────
       // Check for stale delivery flag (delivery promise hung)
       if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
         const elapsed = Date.now() - feedDeliveryStartedAt;
@@ -596,7 +606,9 @@ function createServerRuntime(
       feedDeliveryStartedAt = startedAt;
       activeFeedDelivery = notifier.deliver(
         buildFeedPayloadPromptTemplate(payload, getPromptContext()),
-        { targetSessionKey: buildFeedSessionKey(server.name) }
+        feedDeliveryMode === 'oneshot'
+          ? { targetSessionKey: buildFeedSessionKey(server.name) }
+          : undefined
       ).finally(() => {
         const duration = Date.now() - startedAt;
         logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);

@@ -184,8 +184,46 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('mode 2a: injects feed into the main session via system event + heartbeat (no subagent)', async () => {
-    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = main-session
+  test('default mode: active push — runs the subagent on the main session, not a one-shot key', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = classic main-session push
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-main-session-feed' });
+    const enqueueSystemEvent = jest.fn().mockReturnValue(true);
+    const requestHeartbeatNow = jest.fn();
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: {
+        subagent: { run: subagentRun },
+        system: { enqueueSystemEvent, requestHeartbeatNow },
+      },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => {
+        services.push(service);
+      },
+    } as any);
+
+    await services[0].start();
+    await waitFor(() => subagentRun.mock.calls.length === 1);
+
+    // The plugin itself initiates the run (active push) on a persistent main
+    // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
+    const params = subagentRun.mock.calls[0][0];
+    expect(params.deliver).toBe(true);
+    expect(params.lane).toBe('eigenflux-bg');
+    expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
+    expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+
+    await services[0].stop();
+  });
+
+  test('mode 2a (opt-in): injects feed into the main session via system event + heartbeat (no subagent)', async () => {
+    process.env.EIGENFLUX_FEED_DELIVERY = 'system-event';
     jest.resetModules();
     const { default: plugin } = await import('./index');
     const services: any[] = [];
