@@ -37,7 +37,13 @@ import {
   buildPmStreamEventPromptTemplate,
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
+import { FeedPushScheduler } from './feed-push-scheduler';
 import { EigenFluxNotifier } from './notifier';
+
+/** "Recently active" window for the busy-aware feed push: the main session
+ *  counts as busy while its last activity is fresher than this. Each user turn
+ *  refreshes it, so the push waits for an actual lull in the conversation. */
+const FEED_RECENT_ACTIVITY_MS = 90_000;
 import { normalizeReplyTarget } from './reply-target';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 import { handleFollowup, FOLLOWUP_KINDS } from './feedback-tool';
@@ -80,6 +86,7 @@ type ServerRuntime = {
   profileRefresher: EigenFluxProfileRefresher;
   settingsReporter: EigenFluxSettingsReporter;
   flushLoop: FeedbackFlushLoop;
+  feedPushScheduler: FeedPushScheduler;
   getPromptContext: () => EigenFluxPromptServerContext;
   waitForPendingDelivery: () => Promise<void>;
 };
@@ -199,6 +206,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       for (const runtime of runtimes) {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
+        runtime.feedPushScheduler.stop();
         await runtime.waitForPendingDelivery();
         await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
@@ -532,6 +540,67 @@ function createServerRuntime(
   let activeFeedDelivery: Promise<boolean> | null = null;
   const FEED_DELIVERY_TIMEOUT_MS = 300_000;
 
+  /** Overlap-guarded notifier.deliver() — shared by the default main-session
+   *  push (via the scheduler) and the legacy one-shot path. */
+  async function runGuardedFeedDelivery(
+    prompt: string,
+    options?: { targetSessionKey?: string },
+    skipContext?: { items: number; notifications: number }
+  ): Promise<void> {
+    // Check for stale delivery flag (delivery promise hung)
+    if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
+      const elapsed = Date.now() - feedDeliveryStartedAt;
+      if (elapsed > FEED_DELIVERY_TIMEOUT_MS) {
+        logger.error(
+          `Feed delivery flag stuck for ${Math.round(elapsed / 1000)}s on server=${server.name}, force-resetting`
+        );
+        feedDeliveryInFlight = false;
+        activeFeedDelivery = null;
+      }
+    }
+
+    if (feedDeliveryInFlight) {
+      feedDeliverySkipCount += 1;
+      const elapsed = Date.now() - feedDeliveryStartedAt;
+      logger.warn(
+        `Skipping feed delivery for server=${server.name}: previous delivery still in progress ` +
+        `(elapsed=${Math.round(elapsed / 1000)}s, skipped_items=${skipContext?.items ?? 'n/a'}, ` +
+        `skipped_notifications=${skipContext?.notifications ?? 'n/a'}, total_skips=${feedDeliverySkipCount})`
+      );
+      return;
+    }
+
+    feedDeliveryInFlight = true;
+    const startedAt = Date.now();
+    feedDeliveryStartedAt = startedAt;
+    activeFeedDelivery = notifier.deliver(prompt, options).finally(() => {
+      const duration = Date.now() - startedAt;
+      logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
+      // Only clear flags if this delivery is still the current one.
+      // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
+      if (feedDeliveryStartedAt === startedAt) {
+        feedDeliveryInFlight = false;
+        activeFeedDelivery = null;
+      }
+    });
+
+    await activeFeedDelivery;
+  }
+
+  // Busy-aware push for the default mode: pick a quiet moment on the main
+  // session instead of grabbing its lock while the user is mid-conversation.
+  // See FeedPushScheduler for the full policy.
+  const feedPushScheduler = new FeedPushScheduler({
+    isBusy: async () =>
+      feedDeliveryInFlight || notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS),
+    pushNow: (prompt) => runGuardedFeedDelivery(prompt),
+    piggyback: async (prompt) => {
+      await notifier.deliverToMainSession(prompt);
+    },
+    logger,
+    serverName: server.name,
+  });
+
   const feedPoller = new EigenFluxPollingClient({
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
@@ -577,50 +646,23 @@ function createServerRuntime(
         return;
       }
 
-      // ── guarded delivery (default main-session push, or legacy one-shot) ─────
-      // Check for stale delivery flag (delivery promise hung)
-      if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
-        const elapsed = Date.now() - feedDeliveryStartedAt;
-        if (elapsed > FEED_DELIVERY_TIMEOUT_MS) {
-          logger.error(
-            `Feed delivery flag stuck for ${Math.round(elapsed / 1000)}s on server=${server.name}, force-resetting`
-          );
-          feedDeliveryInFlight = false;
-          activeFeedDelivery = null;
-        }
-      }
+      const prompt = buildFeedPayloadPromptTemplate(payload, getPromptContext());
 
-      if (feedDeliveryInFlight) {
-        feedDeliverySkipCount += 1;
-        const elapsed = Date.now() - feedDeliveryStartedAt;
-        logger.warn(
-          `Skipping feed delivery for server=${server.name}: previous delivery still in progress ` +
-          `(elapsed=${Math.round(elapsed / 1000)}s, skipped_items=${items.length}, ` +
-          `skipped_notifications=${notifications.length}, total_skips=${feedDeliverySkipCount})`
+      if (feedDeliveryMode === 'oneshot') {
+        // Legacy isolated path: unchanged semantics (immediate, awaited,
+        // overlap-guarded with skip logging).
+        await runGuardedFeedDelivery(
+          prompt,
+          { targetSessionKey: buildFeedSessionKey(server.name) },
+          { items: items.length, notifications: notifications.length }
         );
         return;
       }
 
-      feedDeliveryInFlight = true;
-      const startedAt = Date.now();
-      feedDeliveryStartedAt = startedAt;
-      activeFeedDelivery = notifier.deliver(
-        buildFeedPayloadPromptTemplate(payload, getPromptContext()),
-        feedDeliveryMode === 'oneshot'
-          ? { targetSessionKey: buildFeedSessionKey(server.name) }
-          : undefined
-      ).finally(() => {
-        const duration = Date.now() - startedAt;
-        logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
-        // Only clear flags if this delivery is still the current one.
-        // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
-        if (feedDeliveryStartedAt === startedAt) {
-          feedDeliveryInFlight = false;
-          activeFeedDelivery = null;
-        }
-      });
-
-      await activeFeedDelivery;
+      // Default: busy-aware active push. Hold the payload while the user's
+      // conversation is active and deliver at the next quiet moment; a newer
+      // poll's payload supersedes the held one (latest batch wins).
+      feedPushScheduler.schedule(prompt);
     },
     onPollSuccess: async () => {
       // Push local settings to the backend once per heartbeat (throttled
@@ -705,6 +747,7 @@ function createServerRuntime(
     profileRefresher,
     settingsReporter,
     flushLoop,
+    feedPushScheduler,
     getPromptContext,
     async waitForPendingDelivery(): Promise<void> {
       if (activeFeedDelivery) {

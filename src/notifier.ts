@@ -50,6 +50,13 @@ type EigenFluxRuntimeApi = {
   agent?: {
     session?: {
       resolveStorePath?: (store: string | undefined, opts?: { agentId?: string }) => string;
+      /** Row-scoped read: one session entry by agent/session identity. Used by
+       *  the busy check to see how recently the main conversation was active. */
+      getSessionEntry?: (params: {
+        agentId?: string;
+        sessionKey: string;
+        storePath?: string;
+      }) => SessionStoreEntryLike | undefined;
       /** Row-scoped write: patch a single session entry by identity. Replaces the
        *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
        *  `sdk-session-store-write`). Merges the returned partial into the entry. */
@@ -772,6 +779,59 @@ export class EigenFluxNotifier {
       this.logger,
       options
     );
+  }
+
+  /**
+   * Busy check for the busy-aware feed push: should the main conversation be
+   * left alone right now?
+   *
+   * Two independent signals, both cheap local reads (no LLM, no network):
+   * 1. Active task runs bound to the target session — covers our own feed /
+   *    subagent runs (same runtime.tasks.runs API tryCancelRun already uses).
+   * 2. Recent session activity via the row-scoped session entry's updatedAt —
+   *    covers the user's reply runs, which are NOT task runs. "Recently
+   *    updated" is a proxy for "mid-conversation": each turn refreshes it, so
+   *    it only goes quiet once the user has actually stopped talking.
+   *
+   * Unavailable APIs contribute `false` (degrade to pushing immediately, the
+   * pre-scheduler behavior). Never throws.
+   */
+  async isMainRouteBusy(recentActivityMs: number): Promise<boolean> {
+    let route: ResolvedNotificationRoute;
+    try {
+      ({ route } = await this.resolveRoute());
+    } catch {
+      return false;
+    }
+
+    const runs = this.runtime.tasks?.runs;
+    if (runs && typeof runs.bindSession === 'function') {
+      try {
+        if (runs.bindSession({ sessionKey: route.sessionKey }).list().length > 0) {
+          return true;
+        }
+      } catch {
+        // ignore — fall through to the activity signal
+      }
+    }
+
+    const session = this.runtime.agent?.session;
+    if (typeof session?.getSessionEntry === 'function') {
+      try {
+        const entry = session.getSessionEntry({
+          agentId: route.agentId,
+          sessionKey: route.sessionKey,
+        });
+        const updatedAt = typeof entry?.updatedAt === 'number' ? entry.updatedAt : undefined;
+        if (updatedAt !== undefined && Date.now() - updatedAt < recentActivityMs) {
+          return true;
+        }
+      } catch {
+        // ignore — assume idle
+      }
+    }
+
+    return false;
   }
 
   /**
