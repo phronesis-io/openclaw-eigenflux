@@ -13,11 +13,10 @@ import { Logger } from './logger';
  *   feed arrives → target session busy?
  *     idle → push now (plugin-initiated deliver:true subagent run)
  *     busy → hold the payload, recheck every `recheckMs`, push when quiet
- *     still busy after `budgetMs` → the user has been chatting the whole
- *       time, so piggyback instead: enqueue a system event under the
- *       canonical session key — their very next message drains it. This
- *       fallback is only taken in the one scenario where it is guaranteed
- *       to work (an actively chatting user), so it never strands.
+ *     still busy after `budgetMs` → push anyway. A genuinely busy session
+ *       just queues the run behind the user's turns (the host serializes per
+ *       session), and a false busy signal costs nothing — either way the
+ *       feed is delivered, never stranded.
  *
  * A newer poll's payload supersedes the held one — only the latest batch is
  * pushed, nothing queues up. Timers are plain setTimeout (same mechanism as
@@ -28,8 +27,6 @@ export type FeedPushSchedulerDeps = {
   isBusy: () => Promise<boolean>;
   /** Active push (guarded deliver:true subagent run on the main session). */
   pushNow: (prompt: string) => Promise<void>;
-  /** Budget-exhausted fallback: enqueue so the live conversation drains it. */
-  piggyback: (prompt: string) => Promise<void>;
   logger: Logger;
   serverName: string;
   /** Recheck cadence while busy. Default 30s. */
@@ -106,19 +103,19 @@ export class FeedPushScheduler {
     if (busy) {
       const waited = Date.now() - this.deferStartedAt;
       if (waited >= this.budgetMs) {
-        // User has been active for the whole budget — piggyback their live
-        // conversation instead of waiting forever.
+        // Waited long enough — push anyway. If the session really is busy the
+        // run just queues behind the user's turns; the feed is never stranded.
         const held = this.pendingPrompt;
         this.pendingPrompt = null;
         this.deps.logger.info(
           `Feed push budget exhausted after ${Math.round(waited / 1000)}s; ` +
-          `piggybacking via system event for server=${this.deps.serverName}`
+          `pushing despite busy signal for server=${this.deps.serverName}`
         );
         try {
-          await this.deps.piggyback(held);
+          await this.deps.pushNow(held);
         } catch (error) {
           this.deps.logger.error(
-            `Feed piggyback delivery failed for server=${this.deps.serverName}: ${String(error)}`
+            `Feed push delivery failed for server=${this.deps.serverName}: ${String(error)}`
           );
         }
         return;

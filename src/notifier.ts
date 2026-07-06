@@ -76,7 +76,10 @@ type EigenFluxRuntimeApi = {
   tasks?: {
     runs?: {
       bindSession?: (params: { sessionKey: string }) => {
-        list: () => Array<{ id: string; runId?: string }>;
+        /** Returns ALL task records related to the session — including
+         *  terminal ones (succeeded/failed/cancelled/timed_out). Callers that
+         *  care about "running right now" must filter, e.g. on `endedAt`. */
+        list: () => Array<{ id: string; runId?: string; status?: string; endedAt?: number }>;
         cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
           found: boolean;
           cancelled: boolean;
@@ -807,7 +810,13 @@ export class EigenFluxNotifier {
     const runs = this.runtime.tasks?.runs;
     if (runs && typeof runs.bindSession === 'function') {
       try {
-        if (runs.bindSession({ sessionKey: route.sessionKey }).list().length > 0) {
+        // list() returns the session's FULL task history, terminal records
+        // included — only a task without endedAt is actually running.
+        const active = runs
+          .bindSession({ sessionKey: route.sessionKey })
+          .list()
+          .some((task) => task.endedAt === undefined);
+        if (active) {
           return true;
         }
       } catch {
