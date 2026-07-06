@@ -22,34 +22,30 @@ describe('FeedPushScheduler', () => {
   function createScheduler(overrides: {
     isBusy?: jest.Mock;
     pushNow?: jest.Mock;
-    piggyback?: jest.Mock;
     recheckMs?: number;
     budgetMs?: number;
   } = {}) {
     const isBusy = overrides.isBusy ?? jest.fn().mockResolvedValue(false);
     const pushNow = overrides.pushNow ?? jest.fn().mockResolvedValue(undefined);
-    const piggyback = overrides.piggyback ?? jest.fn().mockResolvedValue(undefined);
     const scheduler = new FeedPushScheduler({
       isBusy,
       pushNow,
-      piggyback,
       logger: createLogger(),
       serverName: 'eigenflux',
       recheckMs: overrides.recheckMs ?? 30_000,
       budgetMs: overrides.budgetMs ?? 600_000,
     });
-    return { scheduler, isBusy, pushNow, piggyback };
+    return { scheduler, isBusy, pushNow };
   }
 
   test('idle → pushes immediately, no timer involved', async () => {
-    const { scheduler, pushNow, piggyback } = createScheduler();
+    const { scheduler, pushNow } = createScheduler();
 
     scheduler.schedule('[FEED] batch-1');
     await jest.advanceTimersByTimeAsync(0); // flush the immediate attempt
 
     expect(pushNow).toHaveBeenCalledTimes(1);
     expect(pushNow).toHaveBeenCalledWith('[FEED] batch-1');
-    expect(piggyback).not.toHaveBeenCalled();
   });
 
   test('busy → defers on a recheck timer, pushes once idle', async () => {
@@ -88,9 +84,9 @@ describe('FeedPushScheduler', () => {
     expect(pushNow).toHaveBeenCalledWith('[FEED] batch-2');
   });
 
-  test('budget exhausted while busy → piggybacks via system event instead of pushing', async () => {
+  test('budget exhausted while busy → pushes anyway (never strands)', async () => {
     const isBusy = jest.fn().mockResolvedValue(true); // busy forever
-    const { scheduler, pushNow, piggyback } = createScheduler({
+    const { scheduler, pushNow } = createScheduler({
       isBusy,
       budgetMs: 90_000, // 3 rechecks at 30s
     });
@@ -99,11 +95,11 @@ describe('FeedPushScheduler', () => {
     await jest.advanceTimersByTimeAsync(0);
     await jest.advanceTimersByTimeAsync(30_000);
     await jest.advanceTimersByTimeAsync(30_000);
+    expect(pushNow).not.toHaveBeenCalled();
     await jest.advanceTimersByTimeAsync(30_000); // waited >= budget
 
-    expect(pushNow).not.toHaveBeenCalled();
-    expect(piggyback).toHaveBeenCalledTimes(1);
-    expect(piggyback).toHaveBeenCalledWith('[FEED] batch-1');
+    expect(pushNow).toHaveBeenCalledTimes(1);
+    expect(pushNow).toHaveBeenCalledWith('[FEED] batch-1');
   });
 
   test('isBusy throwing degrades to an immediate push (pre-scheduler behavior)', async () => {
@@ -118,7 +114,7 @@ describe('FeedPushScheduler', () => {
 
   test('stop() cancels the pending payload and recheck timer', async () => {
     const isBusy = jest.fn().mockResolvedValue(true);
-    const { scheduler, pushNow, piggyback } = createScheduler({ isBusy });
+    const { scheduler, pushNow } = createScheduler({ isBusy });
 
     scheduler.schedule('[FEED] batch-1');
     await jest.advanceTimersByTimeAsync(0); // busy → timer armed
@@ -126,6 +122,5 @@ describe('FeedPushScheduler', () => {
 
     await jest.advanceTimersByTimeAsync(600_000);
     expect(pushNow).not.toHaveBeenCalled();
-    expect(piggyback).not.toHaveBeenCalled();
   });
 });

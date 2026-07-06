@@ -326,6 +326,55 @@ describe('EigenFluxNotifier', () => {
     fs.rmSync(stateDir, { recursive: true, force: true });
   });
 
+  describe('isMainRouteBusy', () => {
+    function createBusyProbe(runtime: Record<string, unknown>) {
+      return new EigenFluxNotifier(
+        createApi({ runtime: runtime as unknown as OpenClawPluginApi['runtime'] }),
+        createLogger(),
+        createConfig()
+      );
+    }
+
+    test('terminal task history alone does NOT count as busy', async () => {
+      const list = jest.fn().mockReturnValue([
+        { id: 't1', runId: 'r1', status: 'succeeded', endedAt: 111 },
+        { id: 't2', runId: 'r2', status: 'timed_out', endedAt: 222 },
+      ]);
+      const notifier = createBusyProbe({
+        tasks: { runs: { bindSession: () => ({ list, cancel: jest.fn() }) } },
+      });
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(false);
+    });
+
+    test('a task without endedAt counts as busy', async () => {
+      const list = jest.fn().mockReturnValue([
+        { id: 't1', runId: 'r1', status: 'succeeded', endedAt: 111 },
+        { id: 't2', runId: 'r2', status: 'running' }, // no endedAt → live
+      ]);
+      const notifier = createBusyProbe({
+        tasks: { runs: { bindSession: () => ({ list, cancel: jest.fn() }) } },
+      });
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(true);
+    });
+
+    test('fresh session updatedAt counts as busy; stale does not', async () => {
+      const getSessionEntry = jest
+        .fn()
+        .mockReturnValueOnce({ updatedAt: Date.now() - 5_000 })   // fresh
+        .mockReturnValueOnce({ updatedAt: Date.now() - 120_000 }); // stale
+      const notifier = createBusyProbe({
+        agent: { session: { getSessionEntry } },
+      });
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(true);
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(false);
+    });
+
+    test('no busy APIs at all → idle (degrades to immediate push)', async () => {
+      const notifier = createBusyProbe({});
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(false);
+    });
+  });
+
   test('prefers direct session over newer group session when scanning session store', async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-session-store-'));
     const sessionStorePath = path.join(stateDir, 'sessions.json');

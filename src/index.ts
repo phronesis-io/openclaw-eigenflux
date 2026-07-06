@@ -594,9 +594,6 @@ function createServerRuntime(
     isBusy: async () =>
       feedDeliveryInFlight || notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS),
     pushNow: (prompt) => runGuardedFeedDelivery(prompt),
-    piggyback: async (prompt) => {
-      await notifier.deliverToMainSession(prompt);
-    },
     logger,
     serverName: server.name,
   });
