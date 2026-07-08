@@ -39,6 +39,14 @@ export interface ProfileRefresherConfig {
    * Best-effort — implementations should never throw.
    */
   collectContext?: () => RefreshContext | Promise<RefreshContext>;
+  /**
+   * Best-effort side task run on every daily tick, independent of the profile
+   * refresh (which skips when there's no memory/session context). Used to
+   * piggy-back the daily skills auto-sync onto the same once/day cadence, so a
+   * long-running plugin refreshes its bundled skills without waiting for an
+   * openclaw restart. Must never throw.
+   */
+  onTick?: () => Promise<void>;
 }
 
 /**
@@ -118,6 +126,17 @@ export class EigenFluxProfileRefresher {
         this.config.logger.error(
           `Profile refresh crashed: ${err instanceof Error ? err.message : String(err)}`
         );
+      }
+      // Piggy-back best-effort daily tasks (e.g. skills auto-sync) on the same
+      // once/day cadence, independent of whether the refresh above ran.
+      if (this.config.onTick) {
+        try {
+          await this.config.onTick();
+        } catch (err) {
+          this.config.logger.warn(
+            `Daily tick hook crashed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
       }
       this.scheduleNext();
     }, delay);
