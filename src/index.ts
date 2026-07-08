@@ -776,6 +776,12 @@ function createServerRuntime(
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
     },
+    // Piggy-back the daily skills auto-sync on the profile refresher's once/day
+    // dawn tick: syncPluginSkills refreshes our bundled skills from R2, so a
+    // long-running plugin picks up skill updates without an openclaw restart
+    // (startup sync covers restarts; this covers the long-lived case). --if-stale
+    // makes it a no-op when unchanged; the call never throws.
+    onTick: () => syncPluginSkills(pluginConfig.eigenfluxBin, logger),
   });
 
   return {

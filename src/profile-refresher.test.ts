@@ -106,6 +106,37 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
   });
 
+  test('fires onTick (daily side task, e.g. skills sync) once per daily cadence', async () => {
+    const onTick = jest.fn().mockResolvedValue(undefined);
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
+
+    const refresher = makeRefresher({ onTick });
+    refresher.start();
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    expect(onTick).toHaveBeenCalledTimes(1);
+    refresher.stop();
+  });
+
+  test('a throwing onTick never breaks the refresh loop (best-effort, keeps rescheduling)', async () => {
+    const onTick = jest.fn().mockRejectedValue(new Error('boom'));
+    execMock.mockResolvedValue({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
+
+    const refresher = makeRefresher({ onTick });
+    refresher.start();
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(onTick).toHaveBeenCalledTimes(1);
+
+    // The loop must have rescheduled despite onTick throwing.
+    jest.advanceTimersByTime(24 * 60 * 60 * 1000);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(onTick).toHaveBeenCalledTimes(2);
+
+    refresher.stop();
+  });
+
   test('emits delivered telemetry with memory_dirs/session counts', async () => {
     const spies = createLoggerSpies();
     execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
