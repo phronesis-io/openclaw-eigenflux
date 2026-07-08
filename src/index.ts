@@ -1,4 +1,5 @@
 import * as os from 'os';
+import { join } from 'node:path';
 
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
@@ -116,6 +117,40 @@ const DEFAULT_ROUTING: RoutingConfig = {
   },
 };
 
+/**
+ * Best-effort skill auto-update for the OpenClaw host. Syncs the R2 skill
+ * bundle into this plugin's own bundled `skills/` directory — the directory
+ * OpenClaw loads our skills from — so a skill fix ships via a CLI/R2 release
+ * instead of requiring a plugin republish. Never throws: a CDN/network failure
+ * is swallowed and logged. Resolves once the sync attempt settles.
+ *
+ * `--if-stale` makes it a zero-network no-op when the local revision already
+ * matches remote. `--into` targets the bundle explicitly because OpenClaw does
+ * NOT read the CLI's host skill-load dir (~/.agents/skills) for our skills.
+ */
+export async function syncPluginSkills(
+  eigenfluxBin: string,
+  logger: Logger
+): Promise<void> {
+  // Bundle skills dir, relative to the compiled dist/index.js (cjs → __dirname
+  // is available). Same base agent-prompt-templates.ts reads its contract from.
+  const pluginSkillsDir = join(__dirname, '..', 'skills');
+  try {
+    const res = await execEigenflux(
+      eigenfluxBin,
+      ['skills', 'sync', '--if-stale', '--quiet', '--into', pluginSkillsDir],
+      { logger, parseJson: false }
+    );
+    if (res.kind === 'success') {
+      logger.info(`Skill auto-sync ok (into=${pluginSkillsDir})`);
+    } else {
+      logger.warn(`Skill auto-sync skipped (kind=${res.kind}, into=${pluginSkillsDir})`);
+    }
+  } catch (err) {
+    logger.warn(`Skill auto-sync error: ${String(err)}`);
+  }
+}
+
 function registerPlugin(api: OpenClawPluginApi): void {
   const logger = new Logger(resolvePluginLogger(api));
 
@@ -151,6 +186,15 @@ function registerPlugin(api: OpenClawPluginApi): void {
         }
         return;
       }
+
+      // Best-effort skill auto-update. Pull the latest skill bundle from R2 into
+      // this plugin's OWN bundled skills dir — the only directory OpenClaw loads
+      // our skills from (it does not read ~/.agents/skills on our behalf). This
+      // lets a skill fix ride a CLI/R2 release instead of a plugin republish.
+      // Non-blocking and offline-safe: --if-stale is a no-op when the local
+      // revision already matches remote, and a CDN/network failure must never
+      // delay or break startup. Applies to the next session's skill load.
+      void syncPluginSkills(pluginConfig.eigenfluxBin, logger);
 
       const servers = discovery.servers;
       if (servers.length === 0) {
