@@ -773,6 +773,29 @@ function createServerRuntime(
       // (not a one-shot) so the agent retains recent-session context as a source.
       await notifier.deliver(prompt, { silent: true });
     },
+    // Gate for the daily status broadcast that chains after the bio refresh:
+    // recurring_publish is the user's "publish on my behalf" consent. Auto
+    // silently sends the user's status to the public network, so this is
+    // fail-closed: only an explicit "true" enables it. A missing/unset key, an
+    // empty value, a read failure, or any other value falls back to
+    // draft-and-confirm — an ambiguous state must never auto-publish. onboarding
+    // sets this explicitly, so normal users still get their chosen value.
+    readRecurringPublish: async () => {
+      const r = await execEigenflux<string>(
+        pluginConfig.eigenfluxBin,
+        ['config', 'get', '--key', 'recurring_publish', '-s', server.name],
+        { logger, parseJson: false }
+      );
+      if (r.kind !== 'success') return false;
+      return (r.data ?? '').trim().toLowerCase() === 'true';
+    },
+    // Deliver the status-broadcast prompt. silent=true (recurring_publish on):
+    // the agent publishes without user-facing chatter. silent=false (off): the
+    // agent drafts and must be able to send the user a confirmation message.
+    onStatusPrompt: async (prompt: string, { silent }: { silent: boolean }) => {
+      resetAuthPromptGate();
+      await notifier.deliver(prompt, { silent });
+    },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
     },
