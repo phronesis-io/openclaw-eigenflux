@@ -47,6 +47,21 @@ export interface ProfileRefresherConfig {
    * openclaw restart. Must never throw.
    */
   onTick?: () => Promise<void>;
+  /**
+   * Read the user's `recurring_publish` setting (true = auto-publish on the
+   * user's behalf). Gates the daily status broadcast that chains after the bio
+   * refresh: `true` → publish silently; `false` → draft and ask the user to
+   * confirm. Optional; when absent (or with `onStatusPrompt` unset) the status
+   * broadcast step is skipped entirely. Best-effort — never throws; default true.
+   */
+  readRecurringPublish?: () => Promise<boolean>;
+  /**
+   * Deliver the status-broadcast prompt to the host AI. `silent` mirrors
+   * `recurring_publish`: when `true` the agent publishes without user-facing
+   * chatter; when `false` it must be able to send the user a confirmation
+   * message, so delivery is NOT silent. Optional; paired with readRecurringPublish.
+   */
+  onStatusPrompt?: (prompt: string, opts: { silent: boolean }) => Promise<void>;
 }
 
 /**
@@ -64,6 +79,23 @@ interface RefreshTelemetry {
   outcome: string;
   memory_dirs: number;
   session_snippets: number;
+  prompt_bytes: number;
+  delivered: boolean;
+}
+
+/**
+ * Layer-1 telemetry for the daily status broadcast that chains after the bio
+ * refresh. Emitted as `status_broadcast_telemetry <json>` so it can be grepped
+ * to confirm the once/day broadcast step actually fired and which branch (auto
+ * vs draft-and-confirm) it took. Whether a broadcast was actually published is
+ * the agent's job (auto branch) or the user's (confirm branch) — this only
+ * proves the prompt was assembled and delivered.
+ */
+interface StatusBroadcastTelemetry {
+  server: string;
+  /** delivered | skipped_no_context | auth_required | not_installed | error | delivery_failed */
+  outcome: string;
+  auto: boolean;
   prompt_bytes: number;
   delivered: boolean;
 }
@@ -213,9 +245,11 @@ export class EigenFluxProfileRefresher {
     );
 
     // 3. Deliver the prompt silently.
+    let bioDelivered = false;
     try {
       if (!opts.manual && !this.running) return;
       await this.config.onRefreshPrompt(prompt);
+      bioDelivered = true;
       this.config.logger.info(`Profile refresh prompt delivered for server=${this.config.serverName}`);
       this.emitTelemetry({
         outcome: 'delivered',
@@ -235,6 +269,129 @@ export class EigenFluxProfileRefresher {
         prompt_bytes: Buffer.byteLength(prompt, 'utf-8'),
         delivered: false,
       });
+    }
+
+    // 4. Chain the daily status broadcast — only after the bio was delivered,
+    // so the broadcast reflects the freshly-updated identity. Best-effort and
+    // fully self-contained: never throws, never affects the bio result above.
+    if (bioDelivered) {
+      await this.maybeBroadcastStatus(memoryDirs, sessionSnippets, opts);
+    }
+  }
+
+  /**
+   * Assemble and deliver the daily status broadcast that follows the bio
+   * refresh. Reads `recurring_publish` to pick the branch (auto-publish vs
+   * draft-and-confirm), asks the host-agnostic CLI core for the prompt, and
+   * hands it to the host — silent when auto-publishing, non-silent when the
+   * agent must send the user a confirmation message. Skipped when the callbacks
+   * are unwired. Best-effort: never throws.
+   */
+  private async maybeBroadcastStatus(
+    memoryDirs: string[],
+    sessionSnippets: string[],
+    opts: { manual?: boolean }
+  ): Promise<void> {
+    if (!this.config.readRecurringPublish || !this.config.onStatusPrompt) return;
+    try {
+      if (!opts.manual && !this.running) return;
+
+      // Fail-closed: default to draft-and-confirm. Auto-publish sends the
+      // user's status to the public network without review, so an unreadable
+      // setting must never enable it — only an explicit true does.
+      let auto = false;
+      try {
+        auto = await this.config.readRecurringPublish();
+      } catch (err) {
+        this.config.logger.warn(
+          `Status broadcast: reading recurring_publish failed, defaulting to draft-and-confirm: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+
+      // Pass the bool as `--auto-publish=<bool>` (single arg). The space form
+      // `--auto-publish false` does NOT work: cobra bool flags don't consume the
+      // next token, so it would silently coerce to true and flip an OFF user
+      // into auto-publish. See profile_status_test.go.
+      const args = [
+        'profile', 'status-prompt',
+        '-s', this.config.serverName,
+        `--auto-publish=${auto}`,
+        ...memoryDirs.flatMap((d) => ['--memory-dir', d]),
+        ...sessionSnippets.flatMap((s) => ['--session-snippet', s]),
+      ];
+      const result = await execEigenflux<string>(this.config.eigenfluxBin, args, {
+        logger: this.config.logger,
+        parseJson: false,
+      });
+
+      if (!opts.manual && !this.running) return;
+
+      if (result.kind === 'auth_required') {
+        this.config.logger.warn(`Status broadcast: auth required for server=${this.config.serverName}`);
+        this.emitStatusTelemetry({ outcome: 'auth_required', auto, prompt_bytes: 0, delivered: false });
+        await this.config.onAuthRequired();
+        return;
+      }
+      if (result.kind === 'not_installed') {
+        this.config.logger.error(`eigenflux CLI not found (bin=${this.config.eigenfluxBin})`);
+        this.emitStatusTelemetry({ outcome: 'not_installed', auto, prompt_bytes: 0, delivered: false });
+        return;
+      }
+      if (result.kind !== 'success') {
+        this.config.logger.error(`status-prompt failed: ${result.error.message}`);
+        this.emitStatusTelemetry({ outcome: 'error', auto, prompt_bytes: 0, delivered: false });
+        return;
+      }
+
+      const prompt = (result.data ?? '').trim();
+      if (!prompt) {
+        this.config.logger.info('Status broadcast skipped: CLI produced no prompt');
+        this.emitStatusTelemetry({ outcome: 'skipped_no_context', auto, prompt_bytes: 0, delivered: false });
+        return;
+      }
+
+      if (!opts.manual && !this.running) return;
+      try {
+        await this.config.onStatusPrompt(prompt, { silent: auto });
+        this.config.logger.info(
+          `Status broadcast prompt delivered (auto=${auto}) for server=${this.config.serverName}`
+        );
+        this.emitStatusTelemetry({
+          outcome: 'delivered',
+          auto,
+          prompt_bytes: Buffer.byteLength(prompt, 'utf-8'),
+          delivered: true,
+        });
+      } catch (err) {
+        // Delivery failure is observable (mirrors the bio refresh's
+        // delivery_failed), not swallowed silently by the outer catch.
+        this.config.logger.error(
+          `Status broadcast delivery failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+        this.emitStatusTelemetry({
+          outcome: 'delivery_failed',
+          auto,
+          prompt_bytes: Buffer.byteLength(prompt, 'utf-8'),
+          delivered: false,
+        });
+      }
+    } catch (err) {
+      this.config.logger.warn(
+        `Status broadcast step crashed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  /**
+   * Emit one structured layer-1 telemetry line for the status broadcast step.
+   * Grep `status_broadcast_telemetry` to confirm it fired. Best-effort: never throws.
+   */
+  private emitStatusTelemetry(t: Omit<StatusBroadcastTelemetry, 'server'>): void {
+    try {
+      const payload: StatusBroadcastTelemetry = { server: this.config.serverName, ...t };
+      this.config.logger.info(`status_broadcast_telemetry ${JSON.stringify(payload)}`);
+    } catch {
+      // Telemetry must never break the refresh loop.
     }
   }
 

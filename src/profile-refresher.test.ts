@@ -71,6 +71,12 @@ const telemetry = (spies: ReturnType<typeof createLoggerSpies>) => {
   return line ? JSON.parse(line.slice(line.indexOf(marker) + marker.length)) : undefined;
 };
 
+const statusTelemetry = (spies: ReturnType<typeof createLoggerSpies>) => {
+  const marker = 'status_broadcast_telemetry ';
+  const line = spies.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes(marker));
+  return line ? JSON.parse(line.slice(line.indexOf(marker) + marker.length)) : undefined;
+};
+
 describe('EigenFluxProfileRefresher', () => {
   beforeEach(() => {
     jest.useFakeTimers();
@@ -234,6 +240,169 @@ describe('EigenFluxProfileRefresher', () => {
     refresher.stop();
     jest.advanceTimersByTime(24 * 60 * 60 * 1000);
     expect(execMock).not.toHaveBeenCalled();
+  });
+});
+
+// The status-broadcast prompt the CLI core (`profile status-prompt`) prints.
+const STATUS_PROMPT = 'STATUS BROADCAST PROMPT\n## What to broadcast\n...';
+
+describe('EigenFluxProfileRefresher daily status broadcast', () => {
+  beforeEach(() => {
+    execMock.mockReset();
+  });
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  // triggerNow avoids fake timers: a deterministic bio-refresh → status chain.
+  function primeBioThenStatus() {
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>) // refresh-prompt
+      .mockResolvedValueOnce({ kind: 'success', data: STATUS_PROMPT } as CliResult<any>); // status-prompt
+  }
+
+  test('auto branch: recurring_publish on → status-prompt --auto-publish true, delivered silently', async () => {
+    primeBioThenStatus();
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      readRecurringPublish: jest.fn().mockResolvedValue(true),
+      onStatusPrompt,
+    });
+
+    await refresher.triggerNow();
+
+    expect(execMock).toHaveBeenNthCalledWith(
+      2,
+      'eigenflux',
+      [
+        'profile', 'status-prompt', '-s', 'eigenflux', '--auto-publish=true',
+        '--memory-dir', '/state/workspace/memory',
+        '--session-snippet', 'Working on operator fusion memory peaks in Halcyon',
+      ],
+      expect.objectContaining({ parseJson: false }),
+    );
+    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: true });
+  });
+
+  test('confirm branch: recurring_publish off → --auto-publish false, delivered non-silent', async () => {
+    primeBioThenStatus();
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      readRecurringPublish: jest.fn().mockResolvedValue(false),
+      onStatusPrompt,
+    });
+
+    await refresher.triggerNow();
+
+    // Single-arg equals form — never `'--auto-publish', 'false'` (space form
+    // would be coerced to true by cobra, flipping OFF into auto-publish).
+    expect(execMock.mock.calls[1][1]).toContain('--auto-publish=false');
+    expect(execMock.mock.calls[1][1]).not.toContain('--auto-publish');
+    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: false });
+  });
+
+  test('empty status-prompt stdout → skip, no delivery', async () => {
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'success', data: '   ' } as CliResult<any>);
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      readRecurringPublish: jest.fn().mockResolvedValue(true),
+      onStatusPrompt,
+    });
+
+    await refresher.triggerNow();
+    expect(onStatusPrompt).not.toHaveBeenCalled();
+  });
+
+  test('status step is skipped when callbacks are unwired (no second exec)', async () => {
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
+    const refresher = makeRefresher(); // no readRecurringPublish/onStatusPrompt
+
+    await refresher.triggerNow();
+    expect(execMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('a failing status step never throws and never blocks the bio result', async () => {
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'error', error: new Error('boom'), exitCode: 1, stderr: '' } as CliResult<any>);
+    const onRefreshPrompt = jest.fn().mockResolvedValue(undefined);
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      onRefreshPrompt,
+      readRecurringPublish: jest.fn().mockResolvedValue(true),
+      onStatusPrompt,
+    });
+
+    await expect(refresher.triggerNow()).resolves.toBeUndefined();
+    expect(onRefreshPrompt).toHaveBeenCalledTimes(1); // bio still delivered
+    expect(onStatusPrompt).not.toHaveBeenCalled();
+  });
+
+  test('status broadcast is not attempted when the bio delivery fails', async () => {
+    execMock.mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>);
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const readRecurringPublish = jest.fn().mockResolvedValue(true);
+    const refresher = makeRefresher({
+      onRefreshPrompt: jest.fn().mockRejectedValue(new Error('deliver failed')),
+      readRecurringPublish,
+      onStatusPrompt,
+    });
+
+    await refresher.triggerNow();
+    expect(readRecurringPublish).not.toHaveBeenCalled();
+    expect(onStatusPrompt).not.toHaveBeenCalled();
+    expect(execMock).toHaveBeenCalledTimes(1); // no status-prompt call
+  });
+
+  test('status-prompt auth_required → onAuthRequired + telemetry, no delivery', async () => {
+    const spies = createLoggerSpies();
+    execMock
+      .mockResolvedValueOnce({ kind: 'success', data: CLI_PROMPT } as CliResult<any>)
+      .mockResolvedValueOnce({ kind: 'auth_required', stderr: '' } as CliResult<any>);
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      logger: createLogger(spies),
+      readRecurringPublish: jest.fn().mockResolvedValue(true),
+      onStatusPrompt,
+      onAuthRequired,
+    });
+
+    await refresher.triggerNow();
+    expect(onAuthRequired).toHaveBeenCalledTimes(1);
+    expect(onStatusPrompt).not.toHaveBeenCalled();
+    expect(statusTelemetry(spies)?.outcome).toBe('auth_required');
+  });
+
+  test('fail-closed: readRecurringPublish throwing defaults to draft-and-confirm (auto=false)', async () => {
+    primeBioThenStatus();
+    const onStatusPrompt = jest.fn().mockResolvedValue(undefined);
+    const refresher = makeRefresher({
+      readRecurringPublish: jest.fn().mockRejectedValue(new Error('config unreadable')),
+      onStatusPrompt,
+    });
+
+    await refresher.triggerNow();
+    // Unreadable setting must NOT auto-publish: falls back to non-silent confirm.
+    expect(execMock.mock.calls[1][1]).toContain('--auto-publish=false');
+    expect(onStatusPrompt).toHaveBeenCalledWith(STATUS_PROMPT, { silent: false });
+  });
+
+  test('onStatusPrompt failure is observable: emits delivery_failed telemetry, never throws', async () => {
+    const spies = createLoggerSpies();
+    primeBioThenStatus();
+    const refresher = makeRefresher({
+      logger: createLogger(spies),
+      readRecurringPublish: jest.fn().mockResolvedValue(true),
+      onStatusPrompt: jest.fn().mockRejectedValue(new Error('channel down')),
+    });
+
+    await expect(refresher.triggerNow()).resolves.toBeUndefined();
+    const t = statusTelemetry(spies);
+    expect(t?.outcome).toBe('delivery_failed');
+    expect(t?.delivered).toBe(false);
   });
 });
 
