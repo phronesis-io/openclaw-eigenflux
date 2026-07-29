@@ -69,11 +69,7 @@ describe('agent prompt templates', () => {
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
-  // TEMP(local-contract-override): the backend-delivered output_contract is
-  // intentionally ignored in favor of the bundled copy. Revert this test to the
-  // "prefers the backend-delivered output_contract" expectation when the override
-  // in agent-prompt-templates.ts is rolled back.
-  test('ignores the backend-delivered output_contract and uses the bundled copy', () => {
+  test('prefers the backend-delivered output_contract over the bundled copy', () => {
     const prompt = buildFeedPayloadPromptTemplate(
       {
         code: 0,
@@ -88,13 +84,31 @@ describe('agent prompt templates', () => {
       context
     );
 
-    // The server copy is dropped entirely...
-    expect(prompt).not.toContain('SERVER CONTRACT vTest');
-    // ...the bundled contract leads the prompt instead ("OUTPUT CONTRACT" heads
-    // the bundled contract.md / fallback and never appears in the server copy)...
-    expect(prompt).toContain('OUTPUT CONTRACT');
-    expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
-    // ...and output_contract never leaks into the echoed payload JSON.
+    // The delivered copy leads the prompt; the bundled copy stays out ("OUTPUT
+    // CONTRACT" heads the bundled contract.md / fallback, not the server copy).
+    expect(prompt).toContain('SERVER CONTRACT vTest');
+    expect(prompt).not.toContain('OUTPUT CONTRACT');
+    expect(prompt.indexOf('SERVER CONTRACT vTest')).toBeLessThan(prompt.indexOf('Payload:'));
+    // output_contract never leaks into the echoed payload JSON.
+    const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
+    expect(payloadBlock).not.toContain('output_contract');
+  });
+
+  test('explicit empty output_contract injects no rules and no fallback', () => {
+    // A present-but-empty field is the server saying "this payload needs no
+    // output rules" (the common empty-poll case) — falling back would reinstate
+    // the very rules the server withheld.
+    const prompt = buildFeedPayloadPromptTemplate(
+      {
+        code: 0,
+        msg: 'ok',
+        data: { items: [], has_more: false, notifications: [], output_contract: '' },
+      },
+      context
+    );
+
+    expect(prompt).not.toContain('OUTPUT CONTRACT');
+    expect(prompt).toContain('Payload:');
     const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
     expect(payloadBlock).not.toContain('output_contract');
   });
