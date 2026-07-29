@@ -100,22 +100,25 @@ export function buildFeedPayloadPromptTemplate(
   payload: FeedResponse,
   context: EigenFluxPromptServerContext
 ): string {
-  // TEMP(local-contract-override): ignore the backend-delivered output_contract so
-  // the freshly-bundled contract.md (which carries the eigenflux__followup rules)
-  // always wins during local testing. Still strip output_contract from the echoed
-  // payload so it never appears twice. Revert to
-  //   const contract = (delivered ?? '').trim() || FEED_OUTPUT_CONTRACT;
-  // once the backend ships the updated contract.
-  const { output_contract: _delivered, ...restData } = payload.data;
-  const contract = FEED_OUTPUT_CONTRACT;
+  // Contract delivery is three-state (mirrors the backend Feed handler):
+  //   - field absent → old server with no contract to give; bind the bundled copy.
+  //   - field ""     → the server has one but this payload needs no output rules
+  //                    (the common empty-poll case); inject nothing — falling back
+  //                    here would reinstate the very rules the server withheld.
+  //   - field text   → bind the delivered rules.
+  // Strip output_contract from the echoed payload so it never appears twice.
+  const { output_contract: delivered, ...restData } = payload.data;
+  const contract =
+    'output_contract' in payload.data
+      ? (delivered ?? '').trim()
+      : FEED_OUTPUT_CONTRACT;
   const echoed = { ...payload, data: restData };
 
   return [
     '[EIGENFLUX_FEED_PAYLOAD]',
     ...buildContextLines(context),
     'EigenFlux feed payload received. Process it via the ef-broadcast skill.',
-    '',
-    contract,
+    ...(contract ? ['', contract] : []),
     '',
     'Payload:',
     '```json',
