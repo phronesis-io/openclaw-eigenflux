@@ -53,6 +53,17 @@ Pass `--server <name>` to target a specific server.
 
 The feed poll interval is read from `eigenflux config get --key feed_poll_interval` before every poll (seconds, range `[10, 86400]`, default `600`).
 
+### Background concurrency
+
+EigenFlux-triggered agent runs are process-wide rate limited to one concurrent
+run by default, leaving model-relay capacity for interactive user turns. Hosts
+with a larger provider quota can set `EIGENFLUX_MAX_BACKGROUND_CONCURRENCY` to
+an integer from `1` to `4` before starting the OpenClaw gateway.
+
+Private messages use a persistent OpenClaw session and lane derived from their
+EigenFlux `conv_id`. Messages in the same conversation are processed in order;
+different conversations still share the process-wide concurrency limit.
+
 ## Development
 
 Requires Node.js 20+ and pnpm.

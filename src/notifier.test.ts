@@ -115,7 +115,7 @@ describe('EigenFluxNotifier', () => {
     expect(requestHeartbeatNow).not.toHaveBeenCalled();
   });
 
-  test('on waitForRun timeout: reports ok without fallback (older host, no tasks API)', async () => {
+  test('on waitForRun timeout: reports failure without fallback (older host, no tasks API)', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-subagent-pending' });
     const waitForRun = jest.fn().mockResolvedValue({ status: 'timeout' });
     const runCommandWithTimeout = jest.fn();
@@ -131,7 +131,7 @@ describe('EigenFluxNotifier', () => {
       createConfig()
     );
 
-    await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(true);
+    await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(false);
     expect(run).toHaveBeenCalledTimes(1);
     expect(waitForRun).toHaveBeenCalledTimes(1);
     // Fallbacks must not run — retrying via CLI would re-run the loop and dup-deliver.
@@ -143,9 +143,10 @@ describe('EigenFluxNotifier', () => {
     const waitForRun = jest.fn().mockResolvedValue({ status: 'timeout' });
     const cancel = jest.fn().mockResolvedValue({ found: true, cancelled: true });
     // list() returns the run keyed by runId; its `id` is the taskId cancel needs.
+    const startedAt = Date.now() - 20_000;
     const list = jest.fn().mockReturnValue([
-      { id: 'task-other', runId: 'run-unrelated' },
-      { id: 'task-stuck', runId: 'run-stuck' },
+      { id: 'task-other', runId: 'run-unrelated', startedAt: Date.now() },
+      { id: 'task-stuck', runId: 'run-stuck', createdAt: startedAt - 5_000, startedAt },
     ]);
     const bindSession = jest.fn().mockReturnValue({ list, cancel });
     const runCommandWithTimeout = jest.fn();
@@ -162,8 +163,11 @@ describe('EigenFluxNotifier', () => {
       createConfig()
     );
 
-    await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(true);
+    await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(false);
     expect(bindSession).toHaveBeenCalledWith({ sessionKey: 'agent:main:feishu:direct:ou_123' });
+    const executionTimeout = waitForRun.mock.calls[0][0].timeoutMs;
+    expect(executionTimeout).toBeLessThanOrEqual(160_000);
+    expect(executionTimeout).toBeGreaterThan(158_000);
     // Cancels the matching run by its taskId — not the unrelated one.
     expect(cancel).toHaveBeenCalledWith({ taskId: 'task-stuck', cfg: expect.anything() });
     // Still no CLI fallback (would dup-deliver).
@@ -747,6 +751,38 @@ describe('EigenFluxNotifier', () => {
     expect(callArgs.sessionKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(callArgs.message).toBe('[EIGENFLUX_FEED_PAYLOAD] test');
     expect(callArgs.deliver).toBe(true);
+  });
+
+  test('uses a stable persistent PM session and conversation-specific lane without cleanup', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-pm' });
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, deleteSession },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await expect(
+      notifier.deliver('[EIGENFLUX_MSG_PAYLOAD] test', {
+        persistentSessionKey: 'eigenflux:pm:server:conversation',
+        lane: 'eigenflux-pm:server:conversation',
+      })
+    ).resolves.toBe(true);
+
+    expect(run).toHaveBeenCalledWith({
+      sessionKey: 'eigenflux:pm:server:conversation',
+      message: '[EIGENFLUX_MSG_PAYLOAD] test',
+      deliver: true,
+      idempotencyKey: expect.any(String),
+      lane: 'eigenflux-pm:server:conversation',
+    });
+    expect(deleteSession).not.toHaveBeenCalled();
+    expect(writeStoredNotificationRouteMock).not.toHaveBeenCalled();
   });
 
   test('deletes one-shot session after successful delivery', async () => {

@@ -44,14 +44,18 @@ const streamClientStartMock = jest.fn().mockResolvedValue(undefined);
 const streamClientStopMock = jest.fn().mockResolvedValue(undefined);
 const streamClientIsRunningMock = jest.fn().mockReturnValue(false);
 const streamClientGetLastCursorMock = jest.fn().mockReturnValue(null);
+let streamClientConfig: any;
 
 jest.mock('./stream-client', () => ({
-  EigenFluxStreamClient: jest.fn().mockImplementation(() => ({
-    start: streamClientStartMock,
-    stop: streamClientStopMock,
-    isRunning: streamClientIsRunningMock,
-    getLastCursor: streamClientGetLastCursorMock,
-  })),
+  EigenFluxStreamClient: jest.fn().mockImplementation((config: any) => {
+    streamClientConfig = config;
+    return {
+      start: streamClientStartMock,
+      stop: streamClientStopMock,
+      isRunning: streamClientIsRunningMock,
+      getLastCursor: streamClientGetLastCursorMock,
+    };
+  }),
 }));
 
 function waitFor(condition: () => boolean, timeoutMs = 8000): Promise<void> {
@@ -83,6 +87,7 @@ describe('register integration', () => {
   }>;
 
   beforeEach(async () => {
+    streamClientConfig = undefined;
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-openclaw-home-'));
     eigenfluxHome = path.join(homeDir, '.eigenflux');
     __testHomeDir = homeDir;
@@ -258,6 +263,49 @@ describe('register integration', () => {
     expect(requestHeartbeatNow).toHaveBeenCalled();
     // The feed must NOT go through the deliver:true subagent path in 2a.
     expect(subagentRun).not.toHaveBeenCalled();
+
+    await services[0].stop();
+  });
+
+  test('routes PMs to a stable session and lane derived from conv_id, outside main', async () => {
+    feedItems = [];
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-pm' });
+
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+
+    await services[0].start();
+    await streamClientConfig.onPmEvent({
+      type: 'pm_push',
+      data: {
+        messages: [
+          {
+            msg_id: 'pm-1',
+            conv_id: 'conv-341466745984253952',
+            sender_id: 'agent-kyrie',
+            content: 'compact 运行正常吗？',
+            created_at: 1786605839498,
+          },
+        ],
+      },
+    });
+
+    expect(subagentRun).toHaveBeenCalledTimes(1);
+    const params = subagentRun.mock.calls[0][0];
+    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.sessionKey).not.toBe('agent:main:main');
+    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
+    expect(params.message).toContain('eigenflux msg history --conv-id <conv_id>');
 
     await services[0].stop();
   });
