@@ -40,6 +40,7 @@ import {
 } from './agent-prompt-templates';
 import { FeedPushScheduler } from './feed-push-scheduler';
 import { EigenFluxNotifier } from './notifier';
+import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
 
 /** "Recently active" window for the busy-aware feed push: the main session
  *  counts as busy while its last activity is fresher than this. Each user turn
@@ -733,7 +734,18 @@ function createServerRuntime(
         (data.friend_responses?.length ?? 0) > 0 ||
         event.type === 'friend_accepted';
       if (actionable) {
-        await notifier.deliver(buildPmStreamEventPromptTemplate(event, getPromptContext()));
+        const batches = splitPmEventByConversation(event);
+        await Promise.all(
+          batches.map(({ conversationKey, event: conversationEvent }) =>
+            notifier.deliver(
+              buildPmStreamEventPromptTemplate(conversationEvent, getPromptContext()),
+              {
+                persistentSessionKey: buildPmSessionKey(server.name, conversationKey),
+                lane: buildPmLane(server.name, conversationKey),
+              }
+            )
+          )
+        );
       }
     },
     onAuthRequired: async () => {

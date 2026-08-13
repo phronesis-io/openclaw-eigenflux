@@ -11,6 +11,7 @@ import {
   type ResolvedNotificationRouteResult,
 } from './notification-route-resolver';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
+import { globalDeliveryCoordinator } from './delivery-coordinator';
 
 /**
  * Typed subset of the OpenClaw runtime API used by the notifier.
@@ -79,7 +80,14 @@ type EigenFluxRuntimeApi = {
         /** Returns ALL task records related to the session — including
          *  terminal ones (succeeded/failed/cancelled/timed_out). Callers that
          *  care about "running right now" must filter, e.g. on `endedAt`. */
-        list: () => Array<{ id: string; runId?: string; status?: string; endedAt?: number }>;
+        list: () => Array<{
+          id: string;
+          runId?: string;
+          status?: string;
+          createdAt?: number;
+          startedAt?: number;
+          endedAt?: number;
+        }>;
         cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
           found: boolean;
           cancelled: boolean;
@@ -114,6 +122,8 @@ const COMMAND_TIMEOUT_MS = 15000;
 // take well over a minute on long feed payloads. 3 minutes gives agents plenty
 // of room to complete while still bounding a genuinely stuck run.
 const SUBAGENT_WAIT_TIMEOUT_MS = 180_000;
+const SUBAGENT_QUEUE_TIMEOUT_MS = 300_000;
+const TASK_START_POLL_INTERVAL_MS = 100;
 // Background deliveries (feed / PM / profile) run on a dedicated queue lane so a
 // slow or stuck agent run never serializes behind / ahead of the user's own
 // interactive (per-chat) lane. The lane is orthogonal to the session key.
@@ -144,6 +154,14 @@ export type DeliverOptions = {
    */
   targetSessionKey?: string;
   /**
+   * Deliver to this stable, isolated session without deleting it afterwards.
+   * PM delivery uses one key per EigenFlux conv_id so conversation context is
+   * retained without sharing the user's agent:main:main session.
+   */
+  persistentSessionKey?: string;
+  /** Stable queue lane for this delivery. PMs use one lane per conversation. */
+  lane?: string;
+  /**
    * When true, deliver *silently*: run the host agent loop (so it can read its
    * own memory/session and execute CLI tools like `eigenflux profile update`)
    * but suppress the user-facing channel reply. Used by the daily profile
@@ -173,6 +191,8 @@ type NotifyAttemptResult =
       ok: false;
       mode: string;
       error: string;
+      /** Stop the transport chain. Retrying could duplicate a timed-out run. */
+      terminal?: boolean;
     };
 
 export class EigenFluxNotifier {
@@ -192,13 +212,22 @@ export class EigenFluxNotifier {
   }
 
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
+    const serializationKey =
+      options?.persistentSessionKey ?? options?.targetSessionKey ?? this.config.sessionKey;
+    return globalDeliveryCoordinator.run(serializationKey, () =>
+      this.deliverCoordinated(message, options)
+    );
+  }
+
+  private async deliverCoordinated(message: string, options?: DeliverOptions): Promise<boolean> {
     const targetKey = options?.targetSessionKey;
+    const persistentKey = options?.persistentSessionKey;
     const silent = options?.silent === true;
 
-    // When a target session prefix is provided, generate a one-shot session key
-    // (random suffix ensures no context accumulation across heartbeat cycles),
-    // skip full route resolution, and clean up the session after delivery.
-    if (targetKey) {
+    // Isolated deliveries never touch the user's main conversation. A target
+    // prefix creates a one-shot session; a persistent key (PM conv_id) retains
+    // its own conversation context across messages.
+    if (targetKey || persistentKey) {
       // Sweep any pending cleanups from previous deliveries before starting a new one.
       // This prevents orphan sessions from accumulating if deleteSession was slow.
       await this.drainPendingCleanups();
@@ -207,7 +236,7 @@ export class EigenFluxNotifier {
       // then override the sessionKey with a one-shot key to avoid context accumulation.
       const baseRoute = await this.resolveRoute();
 
-      const sessionKey = `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const sessionKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
       const route: ResolvedNotificationRoute = {
         sessionKey,
         agentId: baseRoute.route.agentId,
@@ -216,10 +245,10 @@ export class EigenFluxNotifier {
         ...(baseRoute.route.replyAccountId && { replyAccountId: baseRoute.route.replyAccountId }),
       };
       this.logger.info(
-        `Delivery route resolved: source=targeted-oneshot, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
+        `Delivery route resolved: source=${persistentKey ? 'targeted-persistent' : 'targeted-oneshot'}, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
       );
 
-      // Seed the one-shot session's delivery context BEFORE the run. A deliver:true
+      // Seed the isolated session's delivery context BEFORE the run. A deliver:true
       // subagent resolves its reply target from the session store (it cannot be passed
       // through subagent.run), and a fresh one-shot session has none — without this the
       // run fails with Feishu "requires target" (missing target). Skip when silent
@@ -228,10 +257,14 @@ export class EigenFluxNotifier {
         await this.seedOneShotDeliveryContext(sessionKey, route);
       }
 
-      // Targeted delivery uses only subagent and command-agent transports.
-      // Heartbeat fallbacks are excluded because they re-resolve to the main
-      // DM session, which would break session isolation.
-      const result = await this.attemptDelivery(message, route, { skipHeartbeat: true, silent });
+      // Isolated delivery uses only runtime.subagent. Current command/heartbeat
+      // fallbacks cannot preserve an arbitrary session key and would leak back
+      // into the main DM session.
+      const result = await this.attemptDelivery(message, route, {
+        subagentOnly: true,
+        silent,
+        lane: options?.lane,
+      });
       if (result.result.ok) {
         this.logDispatch(result.result);
       } else {
@@ -240,7 +273,9 @@ export class EigenFluxNotifier {
 
       // Fire-and-forget: queue cleanup so it doesn't block the next delivery.
       // Pending cleanups are drained at the start of the next delivery and on stop().
-      this.enqueueCleanup(sessionKey);
+      if (!persistentKey) {
+        this.enqueueCleanup(sessionKey);
+      }
 
       return result.result.ok;
     }
@@ -251,7 +286,10 @@ export class EigenFluxNotifier {
       `Delivery route resolved: source=${initial.source}, ${formatRouteForLog(initial.route)}, message_preview=${previewMessage(message)}`
     );
 
-    const firstAttempt = await this.attemptDelivery(message, initial.route, { silent });
+    const firstAttempt = await this.attemptDelivery(message, initial.route, {
+      silent,
+      lane: options?.lane,
+    });
     if (firstAttempt.result.ok) {
       await this.rememberRouteIfChanged(firstAttempt.finalRoute, initial.source);
       this.logDispatch(firstAttempt.result);
@@ -273,7 +311,10 @@ export class EigenFluxNotifier {
         this.logger.info(
           `Retrying delivery with fresh route: source=${fallback.source}, ${formatRouteForLog(fallback.route)}`
         );
-        const retry = await this.attemptDelivery(message, fallback.route, { silent });
+        const retry = await this.attemptDelivery(message, fallback.route, {
+          silent,
+          lane: options?.lane,
+        });
         if (retry.result.ok) {
           await this.rememberRouteIfChanged(retry.finalRoute, fallback.source);
           this.logDispatch(retry.result);
@@ -451,7 +492,7 @@ export class EigenFluxNotifier {
   private async attemptDelivery(
     message: string,
     route: ResolvedNotificationRoute,
-    options: { skipHeartbeat?: boolean; silent?: boolean } = {}
+    options: { subagentOnly?: boolean; silent?: boolean; lane?: string } = {}
   ): Promise<{
     result: NotifyAttemptResult;
     finalRoute: ResolvedNotificationRoute;
@@ -459,13 +500,19 @@ export class EigenFluxNotifier {
   }> {
     const silent = options.silent === true;
     const attempts: Array<() => Promise<NotifyAttemptResult>> = [
-      () => this.tryNotifyViaRuntimeSubagent(message, route, silent),
-      () => this.tryNotifyViaRuntimeCommandAgent(message, route, silent),
+      () => this.tryNotifyViaRuntimeSubagent(message, route, silent, options.lane),
     ];
+
+    // The command-agent fallback cannot carry an arbitrary session key on the
+    // current host. Never use it for isolated PM/one-shot sessions because it
+    // would silently fall back into the main session and break isolation.
+    if (!options.subagentOnly) {
+      attempts.push(() => this.tryNotifyViaRuntimeCommandAgent(message, route, silent));
+    }
 
     // Heartbeat fallbacks surface in the user's main session, so they can never
     // be silent. Skip them entirely for silent delivery.
-    if (!options.skipHeartbeat && !silent) {
+    if (!options.subagentOnly && !silent) {
       attempts.push(
         () => this.tryNotifyViaRuntimeHeartbeat(message, route),
         () => this.tryNotifyViaRuntimeCommandHeartbeat(message),
@@ -489,6 +536,9 @@ export class EigenFluxNotifier {
         `Notification attempt failed: mode=${result.mode}, ${formatRouteForLog(route)}, error=${result.error}`
       );
       errors.push(`${result.mode}: ${result.error}`);
+      if (result.terminal) {
+        return { result, finalRoute: route, errors };
+      }
     }
     return {
       result: { ok: false, mode: 'all', error: errors.join(' | ') },
@@ -500,7 +550,8 @@ export class EigenFluxNotifier {
   private async tryNotifyViaRuntimeSubagent(
     message: string,
     route: ResolvedNotificationRoute,
-    silent = false
+    silent = false,
+    lane = BACKGROUND_LANE
   ): Promise<NotifyAttemptResult> {
     const runtimeSubagent = this.runtime.subagent;
 
@@ -517,23 +568,20 @@ export class EigenFluxNotifier {
       // agent can update its bio via the CLI — it just suppresses the channel reply.
       const deliver = !silent;
       this.logger.info(
-        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${BACKGROUND_LANE}`
+        `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${lane}`
       );
       const { runId } = await runtimeSubagent.run({
         sessionKey: route.sessionKey,
         message,
         deliver,
         idempotencyKey: randomUUID(),
-        lane: BACKGROUND_LANE,
+        lane,
       });
 
       // run() only enqueues; wait long enough for the full agent loop (LLM +
       // reply + channel send) to complete so we can surface real errors.
       if (typeof runtimeSubagent.waitForRun === 'function') {
-        const waited = await runtimeSubagent.waitForRun({
-          runId,
-          timeoutMs: SUBAGENT_WAIT_TIMEOUT_MS,
-        });
+        const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {
           return {
             ok: false,
@@ -542,11 +590,18 @@ export class EigenFluxNotifier {
           };
         }
         if (waited.status === 'timeout') {
-          // "Stop waiting" is not "stop the run": an un-cancelled run keeps holding
-          // host resources and accumulates as an orphan. Best-effort cancel it, then
-          // still report ok so we do NOT fall through to the CLI agent fallback,
-          // which would re-run the same loop and double-deliver.
-          await this.tryCancelRun(route.sessionKey, runId);
+          // "Stop waiting" is not "stop the run": truly cancel it and report
+          // failure. terminal=true prevents a fallback from double-delivering.
+          const cancelled = await this.tryCancelRun(route.sessionKey, runId);
+          return {
+            ok: false,
+            mode: 'runtime.subagent',
+            terminal: true,
+            error:
+              (waited.error ??
+                `subagent execution timed out after ${Math.round(SUBAGENT_WAIT_TIMEOUT_MS / 1000)}s`) +
+              (cancelled ? '; run cancelled' : '; cancellation unavailable or failed'),
+          };
         }
       }
 
@@ -566,17 +621,64 @@ export class EigenFluxNotifier {
   }
 
   /**
-   * Best-effort cancel of a background run that outlived SUBAGENT_WAIT_TIMEOUT_MS.
-   * Stopping the wait does not stop the run, so without this the orphaned run
-   * lingers on the host and accumulates. Failures are logged, never thrown.
+   * Start the execution timeout when OpenClaw marks the task running, not when
+   * subagent.run merely enqueues it. The coordinator normally removes queueing,
+   * but startedAt is the authoritative boundary when the host tasks API exists.
    */
-  private async tryCancelRun(sessionKey: string, runId: string): Promise<void> {
+  private async waitForRunFromExecutionStart(
+    sessionKey: string,
+    runId: string
+  ): Promise<{ status: 'ok' | 'error' | 'timeout'; error?: string }> {
+    const waitForRun = this.runtime.subagent?.waitForRun;
+    if (typeof waitForRun !== 'function') {
+      return { status: 'ok' };
+    }
+
+    const bindSession = this.runtime.tasks?.runs?.bindSession;
+    if (typeof bindSession !== 'function') {
+      // Older hosts do not expose startedAt. Preserve compatibility, but make
+      // the limitation explicit in logs.
+      this.logger.debug(
+        `Task startedAt unavailable for run_id=${runId}; timeout begins at enqueue`
+      );
+      return waitForRun({ runId, timeoutMs: SUBAGENT_WAIT_TIMEOUT_MS });
+    }
+
+    const bound = bindSession({ sessionKey });
+    const queueDeadline = Date.now() + SUBAGENT_QUEUE_TIMEOUT_MS;
+    while (true) {
+      const task = bound.list().find((candidate) => candidate.runId === runId);
+      if (task?.startedAt !== undefined) {
+        const elapsed = Math.max(0, Date.now() - task.startedAt);
+        const remaining = Math.max(1, SUBAGENT_WAIT_TIMEOUT_MS - elapsed);
+        this.logger.debug(
+          `Background run started: run_id=${runId}, queued_ms=${Math.max(0, task.startedAt - (task.createdAt ?? task.startedAt))}, execution_timeout_ms=${remaining}`
+        );
+        return waitForRun({ runId, timeoutMs: remaining });
+      }
+      if (task?.endedAt !== undefined) {
+        // The run can complete between enqueue and the first poll. waitForRun
+        // observes the already-terminal result immediately.
+        return waitForRun({ runId, timeoutMs: 1 });
+      }
+      if (Date.now() >= queueDeadline) {
+        return {
+          status: 'timeout',
+          error: `subagent queue wait timed out after ${Math.round(SUBAGENT_QUEUE_TIMEOUT_MS / 1000)}s`,
+        };
+      }
+      await delay(TASK_START_POLL_INTERVAL_MS);
+    }
+  }
+
+  /** Best-effort true cancellation after either queue or execution timeout. */
+  private async tryCancelRun(sessionKey: string, runId: string): Promise<boolean> {
     const runs = this.runtime.tasks?.runs;
     if (!runs || typeof runs.bindSession !== 'function') {
       this.logger.debug(
         `tryCancelRun: runtime.tasks.runs unavailable; cannot cancel run_id=${runId}`
       );
-      return;
+      return false;
     }
     try {
       const bound = runs.bindSession({ sessionKey });
@@ -585,15 +687,17 @@ export class EigenFluxNotifier {
         this.logger.warn(
           `tryCancelRun: no task found for run_id=${runId} on session=${sessionKey}; cannot cancel`
         );
-        return;
+        return false;
       }
       const result = await bound.cancel({ taskId: task.id, cfg: this.api.config });
       this.logger.warn(
-        `Cancelled stuck background run after ${Math.round(SUBAGENT_WAIT_TIMEOUT_MS / 1000)}s: ` +
-        `run_id=${runId}, task_id=${task.id}, found=${result.found}, cancelled=${result.cancelled}`
+        `Cancelled stuck background run: run_id=${runId}, task_id=${task.id}, ` +
+        `found=${result.found}, cancelled=${result.cancelled}`
       );
+      return result.cancelled;
     } catch (error) {
       this.logger.warn(`tryCancelRun failed for run_id=${runId}: ${formatError(error)}`);
+      return false;
     }
   }
 
@@ -939,6 +1043,10 @@ function formatError(error: unknown): string {
     return `${error.name}: ${error.message}`;
   }
   return String(error);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function formatRouteForLog(route: ResolvedNotificationRoute): string {

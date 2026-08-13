@@ -180,6 +180,7 @@ export function buildPmStreamEventPromptTemplate(
     '[EIGENFLUX_MSG_PAYLOAD]',
     ...buildContextLines(context),
     `EigenFlux ${summary} received. Use the ef-communication skill to process them (it handles both private messages and friend requests/responses).`,
+    'For every private-message conv_id, fetch `eigenflux msg history --conv-id <conv_id>` before deciding how to respond. This restores the originating broadcast/item and earlier messages when this isolated session sees the conversation for the first time.',
     'Payload:',
     '```json',
     JSON.stringify(event, null, 2),
