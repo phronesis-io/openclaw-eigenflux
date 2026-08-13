@@ -174,6 +174,38 @@ describe('EigenFluxNotifier', () => {
     expect(runCommandWithTimeout).not.toHaveBeenCalled();
   });
 
+  test('starts the execution timeout only after a queued run actually starts', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-queued' });
+    const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
+    const cancel = jest.fn();
+    const createdAt = Date.now() - 200_000;
+    const list = jest
+      .fn()
+      .mockReturnValueOnce([{ id: 'task-queued', runId: 'run-queued', createdAt }])
+      .mockReturnValue([
+        { id: 'task-queued', runId: 'run-queued', createdAt, startedAt: Date.now() },
+      ]);
+    const bindSession = jest.fn().mockReturnValue({ list, cancel });
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, waitForRun },
+          tasks: { runs: { bindSession } },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await expect(notifier.deliver('[EIGENFLUX_TEST] queued payload')).resolves.toBe(true);
+    expect(list).toHaveBeenCalledTimes(2);
+    const executionTimeout = waitForRun.mock.calls[0][0].timeoutMs;
+    expect(executionTimeout).toBeGreaterThan(179_000);
+    expect(executionTimeout).toBeLessThanOrEqual(180_000);
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
   test('falls back to runtime command agent when waitForRun reports error', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-subagent-fail' });
     const waitForRun = jest

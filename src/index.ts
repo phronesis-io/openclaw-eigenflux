@@ -736,12 +736,12 @@ function createServerRuntime(
       if (actionable) {
         const batches = splitPmEventByConversation(event);
         await Promise.all(
-          batches.map(({ conversationKey, event: conversationEvent }) =>
+          batches.map(({ conversationKey, peerKey, event: conversationEvent }) =>
             notifier.deliver(
               buildPmStreamEventPromptTemplate(conversationEvent, getPromptContext()),
               {
-                persistentSessionKey: buildPmSessionKey(server.name, conversationKey),
-                lane: buildPmLane(server.name, conversationKey),
+                persistentSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey),
+                lane: buildPmLane(server.name, peerKey, conversationKey),
               }
             )
           )
