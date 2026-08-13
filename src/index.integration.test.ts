@@ -267,7 +267,7 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('routes PMs to a stable session and lane derived from conv_id, outside main', async () => {
+  test('routes PMs to a stable session and lane derived from peer + conv_id, outside main', async () => {
     feedItems = [];
     jest.resetModules();
     const { default: plugin } = await import('./index');
@@ -301,11 +301,12 @@ describe('register integration', () => {
 
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const params = subagentRun.mock.calls[0][0];
-    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
     expect(params.sessionKey).not.toBe('agent:main:main');
-    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
     expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
-    expect(params.message).toContain('eigenflux msg history --conv-id <conv_id>');
+    expect(params.message).toContain('eigenflux msg history --conv-id <conv_id> --limit 20');
+    expect(params.message).toContain('stable isolated session');
 
     await services[0].stop();
   });

@@ -3,12 +3,19 @@ import type { PmStreamEvent } from './stream-client';
 
 export type PmDeliveryBatch = {
   conversationKey: string;
+  peerKey: string;
   event: PmStreamEvent;
 };
 
 /** Split a stream frame so every EigenFlux conversation has its own ordering key. */
 export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatch[] {
   const data = event.data ?? {};
+  // Reconnect frames can carry a large history_messages backfill together with
+  // one new relation/PM event. Stable PM sessions already retain conversation
+  // context, and the agent can fetch a bounded history on demand. Never copy
+  // this backfill into every delivery batch: it multiplies prompt size and can
+  // replay already-handled messages after each Gateway restart.
+  const { history_messages: _historyMessages, ...incrementalData } = data;
   const messagesByConversation = new Map<string, NonNullable<typeof data.messages>>();
 
   for (const message of data.messages ?? []) {
@@ -18,18 +25,22 @@ export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatc
     messagesByConversation.set(key, messages);
   }
 
-  const batches: PmDeliveryBatch[] = Array.from(messagesByConversation, ([conversationKey, messages]) => ({
-    conversationKey,
-    event: {
-      ...event,
-      data: {
-        ...data,
-        messages,
-        friend_requests: [],
-        friend_responses: [],
+  const batches: PmDeliveryBatch[] = Array.from(
+    messagesByConversation,
+    ([conversationKey, messages]) => ({
+      conversationKey,
+      peerKey: resolveMessagePeerKey(messages),
+      event: {
+        ...event,
+        data: {
+          ...incrementalData,
+          messages,
+          friend_requests: [],
+          friend_responses: [],
+        },
       },
-    },
-  }));
+    })
+  );
 
   const hasRelationEvent =
     (data.friend_requests?.length ?? 0) > 0 ||
@@ -38,9 +49,10 @@ export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatc
   if (hasRelationEvent) {
     batches.push({
       conversationKey: 'relations',
+      peerKey: 'relations',
       event: {
         ...event,
-        data: { ...data, messages: [] },
+        data: { ...incrementalData, messages: [] },
       },
     });
   }
@@ -48,12 +60,33 @@ export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatc
   return batches;
 }
 
-export function buildPmSessionKey(serverName: string, conversationKey: string): string {
-  return `eigenflux:pm:${stableKey(serverName)}:${stableKey(conversationKey)}`;
+export function buildPmSessionKey(
+  serverName: string,
+  peerKey: string,
+  conversationKey: string
+): string {
+  return `eigenflux:pm:${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
 }
 
-export function buildPmLane(serverName: string, conversationKey: string): string {
-  return `eigenflux-pm:${stableKey(serverName)}:${stableKey(conversationKey)}`;
+export function buildPmLane(
+  serverName: string,
+  peerKey: string,
+  conversationKey: string
+): string {
+  return `eigenflux-pm:${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
+}
+
+function resolveMessagePeerKey(
+  messages: NonNullable<PmStreamEvent['data']['messages']>
+): string {
+  const peerIds = Array.from(
+    new Set(
+      messages
+        .map((message) => message.sender_id?.trim())
+        .filter((value): value is string => Boolean(value))
+    )
+  ).sort();
+  return peerIds.length > 0 ? peerIds.join(',') : 'unknown-peer';
 }
 
 function stableKey(value: string): string {
