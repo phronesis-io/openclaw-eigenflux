@@ -77,9 +77,6 @@ function buildContextLines(context: EigenFluxPromptServerContext): string[] {
   ];
 }
 
-const SAFE_SERVER_NAME = /^[A-Za-z0-9._-]+$/u;
-const SAFE_BATCH_ID = /^[1-9][0-9]*$/u;
-
 export function buildAuthRequiredPromptTemplate({
   context,
   stderr,
@@ -104,34 +101,33 @@ export function buildFeedPayloadPromptTemplate(
   payload: FeedResponse,
   context: EigenFluxPromptServerContext
 ): string {
-  if (payload.data.schema_version === 'feed_batch.v2') {
-    const batchId = payload.data.batch_id ?? '';
+  if (payload.data.schema_version === 'feed.v2') {
     const personalization = payload.data.personalization ?? {};
-    const { control_context_snapshot: controlContext, ...networkPayload } = payload.data;
+    const { control_context_snapshot: controlContext, output_contract: deliveredContract, ...networkPayload } = payload.data;
     const expectedRevision = personalization.context_revision;
     const snapshotRevision = controlContext && typeof controlContext === 'object' && !Array.isArray(controlContext)
       ? (controlContext as Record<string, unknown>).context_revision
       : undefined;
     const baselineValid = personalization.mode === 'baseline' && (expectedRevision == null || expectedRevision === 0) && controlContext == null;
     const alignedValid = personalization.mode === 'intent_aligned' && typeof expectedRevision === 'number' && expectedRevision > 0 && snapshotRevision === expectedRevision;
-    const commandArgumentsSafe = SAFE_BATCH_ID.test(batchId) && SAFE_SERVER_NAME.test(context.serverName);
-    if ((!baselineValid && !alignedValid) || !commandArgumentsSafe) {
+    const contract = deliveredContract?.trim() || FEED_OUTPUT_CONTRACT;
+    if (!baselineValid && !alignedValid) {
       return [
         '[EIGENFLUX_FEED_V2_RECOVERY_REQUIRED]',
         ...buildContextLines(context),
         '',
-        FEED_OUTPUT_CONTRACT,
+        contract,
         '',
-        'Fail closed: the durable batch has invalid owner-context metadata or unsafe command identifiers.',
-        'Do not execute external actions and do not acknowledge this batch. Ask the owner to refresh the EigenFlux CLI/plugin.',
+        'Fail closed: the Feed response has invalid owner-context metadata.',
+        'Do not execute external actions. Ask the owner to refresh the EigenFlux CLI/plugin.',
       ].join('\n');
     }
     return [
       '[EIGENFLUX_FEED_V2_PAYLOAD]',
       ...buildContextLines(context),
-      'Process this durable batch via the ef-broadcast skill.',
+      'Process this latest Feed view via the ef-broadcast skill.',
       '',
-      FEED_OUTPUT_CONTRACT,
+      contract,
       '',
       '[TRUSTED OWNER-CONFIRMED CONTROL CONTEXT]',
       ...(baselineValid
@@ -147,13 +143,6 @@ export function buildFeedPayloadPromptTemplate(
       '```json',
       JSON.stringify(networkPayload, null, 2),
       '```',
-      '',
-      ...(batchId
-        ? [
-            `If processing lasts longer than 60 seconds, run \`eigenflux feed batch renew --batch-id ${batchId} -s ${context.serverName}\` at least once per minute.`,
-            `After processing, run \`eigenflux feed batch ack --batch-id ${batchId} -s ${context.serverName}\` exactly once; do not drop or silently acknowledge a fenced batch.`,
-          ]
-        : ['The V2 batch is missing batch_id; fail closed and do not perform external actions.']),
     ].join('\n');
   }
 

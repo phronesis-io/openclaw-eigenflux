@@ -18,7 +18,7 @@ import { Logger } from './logger';
  *       session), and a false busy signal costs nothing — either way the
  *       feed is delivered, never stranded.
  *
- * A newer poll's payload supersedes the held one — only the latest batch is
+ * A newer poll's payload supersedes the held one — only the latest view is
  * pushed, nothing queues up. Timers are plain setTimeout (same mechanism as
  * feedback-flush-loop and profile-refresher) and are cleared on stop().
  */
@@ -44,7 +44,6 @@ export class FeedPushScheduler {
   private readonly budgetMs: number;
 
   private pendingPrompt: string | null = null;
-  private pendingKeepAlive: (() => Promise<void>) | null = null;
   private timer: NodeJS.Timeout | null = null;
   private deferStartedAt = 0;
   private stopped = false;
@@ -59,11 +58,10 @@ export class FeedPushScheduler {
    * Hold `prompt` for delivery at the next quiet moment. A prompt scheduled
    * while an earlier one is still waiting REPLACES it (latest batch wins).
    */
-  schedule(prompt: string, keepAlive?: () => Promise<void>): void {
+  schedule(prompt: string): void {
     if (this.stopped) return;
     const superseded = this.pendingPrompt !== null;
     this.pendingPrompt = prompt;
-    this.pendingKeepAlive = keepAlive ?? null;
     if (this.timer) {
       // Recheck loop already armed; it will pick up the newer prompt.
       if (superseded) {
@@ -85,7 +83,6 @@ export class FeedPushScheduler {
       this.timer = null;
     }
     this.pendingPrompt = null;
-    this.pendingKeepAlive = null;
   }
 
   private async attempt(): Promise<void> {
@@ -110,7 +107,6 @@ export class FeedPushScheduler {
         // run just queues behind the user's turns; the feed is never stranded.
         const held = this.pendingPrompt;
         this.pendingPrompt = null;
-        this.pendingKeepAlive = null;
         this.deps.logger.info(
           `Feed push budget exhausted after ${Math.round(waited / 1000)}s; ` +
           `pushing despite busy signal for server=${this.deps.serverName}`
@@ -128,15 +124,6 @@ export class FeedPushScheduler {
         `Feed push deferred: main session busy (waited=${Math.round(waited / 1000)}s) ` +
         `for server=${this.deps.serverName}`
       );
-      if (this.pendingKeepAlive) {
-        try {
-          await this.pendingKeepAlive();
-        } catch (error) {
-          this.deps.logger.error(
-            `Feed lease keepalive failed for server=${this.deps.serverName}: ${String(error)}`
-          );
-        }
-      }
       this.timer = setTimeout(() => {
         void this.attempt();
       }, this.recheckMs);
@@ -146,7 +133,6 @@ export class FeedPushScheduler {
 
     const held = this.pendingPrompt;
     this.pendingPrompt = null;
-    this.pendingKeepAlive = null;
     this.deps.logger.info(
       `Feed push: main session idle; delivering now for server=${this.deps.serverName}`
     );

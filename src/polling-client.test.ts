@@ -114,14 +114,13 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
-  test('recognizes a durable Feed V2 batch and forwards its control-context envelope', async () => {
+  test('recognizes Feed V2 and forwards its control-context envelope', async () => {
     const onFeedPolled = jest.fn().mockResolvedValue(undefined);
     execEigenfluxMock.mockResolvedValue({
       kind: 'success',
       data: {
-        schema_version: 'feed_batch.v2',
-        batch_id: '42',
-        items: [{ batch_item_id: '7', source_ref: { type: 'broadcast', id: '9' } }],
+        schema_version: 'feed.v2',
+        items: [{ source_ref: { type: 'broadcast', id: '9' } }],
         has_more: false,
         personalization: {
           mode: 'intent_aligned',
@@ -147,8 +146,7 @@ describe('EigenFluxPollingClient', () => {
     expect(onFeedPolled).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({
-          schema_version: 'feed_batch.v2',
-          batch_id: '42',
+          schema_version: 'feed.v2',
           control_context_snapshot: expect.objectContaining({
             network_goal: { text: 'Find collaborators' },
           }),
@@ -269,25 +267,6 @@ describe('EigenFluxPollingClient', () => {
 
     expect(result.kind).toBe('success');
     expect(onFeedPolled).not.toHaveBeenCalled();
-  });
-
-  test('always delivers an empty durable Feed V2 batch so it can be acknowledged', async () => {
-    const onFeedPolled = jest.fn().mockResolvedValue(undefined);
-    execEigenfluxMock.mockResolvedValue({
-      kind: 'success',
-      data: {
-        schema_version: 'feed_batch.v2', batch_id: '42', items: [], notifications: [], has_more: false,
-        personalization: { mode: 'baseline', context_revision: null },
-        control_context_snapshot: null,
-      },
-    } as CliResult<any>);
-    const client = new EigenFluxPollingClient({
-      serverName: 'eigenflux', eigenfluxBin: 'eigenflux',
-      resolvePollIntervalSec: jest.fn().mockResolvedValue(600), logger: createLogger(),
-      onFeedPolled, onAuthRequired: jest.fn().mockResolvedValue(undefined),
-    });
-    await client.pollOnce();
-    expect(onFeedPolled).toHaveBeenCalledTimes(1);
   });
 
   test('invokes onPollSuccess on every successful poll, even with empty feed', async () => {
@@ -412,7 +391,7 @@ describe('EigenFluxPollingClient', () => {
       execEigenfluxMock.mockResolvedValue({
         kind: 'success',
         data: {
-          schema_version: 'feed_batch.v2', batch_id: '42', items: [], notifications: [], has_more: false,
+          schema_version: 'feed.v2', items: [], notifications: [], has_more: false,
           cadence: { poll_interval_seconds: 60, phase_seconds: 20 },
           personalization: { mode: 'baseline', context_revision: null }, control_context_snapshot: null,
         },

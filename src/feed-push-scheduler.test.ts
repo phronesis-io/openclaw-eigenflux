@@ -68,21 +68,7 @@ describe('FeedPushScheduler', () => {
     expect(pushNow).toHaveBeenCalledWith('[FEED] batch-1');
   });
 
-  test('keeps a durable batch lease alive while delivery waits for an idle session', async () => {
-    const isBusy = jest.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(true).mockResolvedValue(false);
-    const keepAlive = jest.fn().mockResolvedValue(undefined);
-    const { scheduler, pushNow } = createScheduler({ isBusy });
-    scheduler.schedule('[FEED] batch-1', keepAlive);
-    await jest.advanceTimersByTimeAsync(0);
-    expect(keepAlive).toHaveBeenCalledTimes(1);
-    await jest.advanceTimersByTimeAsync(30_000);
-    expect(keepAlive).toHaveBeenCalledTimes(2);
-    await jest.advanceTimersByTimeAsync(30_000);
-    expect(pushNow).toHaveBeenCalledTimes(1);
-    expect(keepAlive).toHaveBeenCalledTimes(2);
-  });
-
-  test('newer poll supersedes the held payload — only the latest batch is pushed', async () => {
+  test('newer poll supersedes the held payload — only the latest view is pushed', async () => {
     const isBusy = jest
       .fn()
       .mockResolvedValueOnce(true)

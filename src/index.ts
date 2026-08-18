@@ -679,7 +679,7 @@ function createServerRuntime(
       const feedDeliveryMode = process.env.EIGENFLUX_FEED_DELIVERY;
       if (feedDeliveryMode === 'system-event') {
         // Nothing worth surfacing → don't wake the heartbeat at all.
-        if (items.length === 0 && notifications.length === 0 && payload.data.schema_version !== 'feed_batch.v2') {
+        if (items.length === 0 && notifications.length === 0) {
           return;
         }
         // Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so
@@ -707,18 +707,8 @@ function createServerRuntime(
 
       // Default: busy-aware active push. Hold the payload while the user's
       // conversation is active and deliver at the next quiet moment; a newer
-      // poll's payload supersedes the held one (latest batch wins).
-      const batchId = payload.data.schema_version === 'feed_batch.v2' ? payload.data.batch_id : undefined;
-      feedPushScheduler.schedule(prompt, batchId ? async () => {
-        const renewed = await execEigenflux(
-          pluginConfig.eigenfluxBin,
-          ['feed', 'batch', 'renew', '--batch-id', batchId, '-s', server.name, '-f', 'json'],
-          { logger }
-        );
-        if (renewed.kind !== 'success') {
-          throw new Error(`Feed V2 lease renew failed (kind=${renewed.kind})`);
-        }
-      } : undefined);
+      // poll's payload supersedes the held one (latest view wins).
+      feedPushScheduler.schedule(prompt);
     },
     onPollSuccess: async () => {
       // Push local settings to the backend once per heartbeat (throttled

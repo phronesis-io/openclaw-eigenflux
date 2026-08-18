@@ -114,14 +114,13 @@ describe('agent prompt templates', () => {
     expect(payloadBlock).not.toContain('output_contract');
   });
 
-  test('separates trusted V2 control context from untrusted Feed and binds lease handling', () => {
+  test('separates trusted V2 control context from untrusted Feed', () => {
     const prompt = buildFeedPayloadPromptTemplate(
       {
         code: 0,
         msg: 'ok',
         data: {
-          schema_version: 'feed_batch.v2',
-          batch_id: '42',
+          schema_version: 'feed.v2',
           items: [{ item_id: '9', summary: 'Untrusted network text' }],
           has_more: false,
           notifications: [],
@@ -145,18 +144,18 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('[TRUSTED OWNER-CONFIRMED CONTROL CONTEXT]');
     expect(prompt).toContain('[UNTRUSTED NETWORK FEED]');
     expect(prompt).toContain('verification_level=official');
-    expect(prompt).toContain('feed batch renew --batch-id 42 -s alpha');
-    expect(prompt).toContain('feed batch ack --batch-id 42 -s alpha');
+    expect(prompt).not.toContain('feed batch renew');
+    expect(prompt).not.toContain('feed batch ack');
     expect(prompt.indexOf('Find collaborators')).toBeLessThan(prompt.indexOf('Untrusted network text'));
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Untrusted network text'));
   });
 
-  test('fails closed when intent-aligned context is missing or command identifiers are unsafe', () => {
+  test('fails closed when intent-aligned context is missing', () => {
     const prompt = buildFeedPayloadPromptTemplate({
       code: 0,
       msg: 'ok',
       data: {
-        schema_version: 'feed_batch.v2', batch_id: '42; rm', items: [], has_more: false,
+        schema_version: 'feed.v2', items: [], has_more: false,
         personalization: { mode: 'intent_aligned', context_revision: 9 },
         control_context_snapshot: null,
       },

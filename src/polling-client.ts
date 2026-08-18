@@ -86,9 +86,6 @@ export interface FeedResponseData {
   has_more: boolean;
   notifications?: FeedNotification[];
   schema_version?: string;
-  batch_id?: string;
-  status?: string;
-  lease?: { epoch?: number; token?: string; expires_at?: number };
   personalization?: {
     mode?: string;
     onboarding_state?: string;
@@ -106,11 +103,7 @@ export interface FeedResponseData {
    * the plugin's bundled copy is only a fallback for older servers.
    */
   output_contract?: string;
-  /**
-   * Impression that served this batch. The CLI caches it alongside the feed
-   * items so `feed event record` can join followup events back to their
-   * impression when reporting to the backend.
-   */
+  /** Impression associated with this latest Feed view. */
   impression_id?: string;
 }
 
@@ -295,7 +288,7 @@ export class EigenFluxPollingClient {
           msg: 'success',
           data: result.data,
         };
-        if (feedResponse.data.schema_version === 'feed_batch.v2' && feedResponse.data.cadence) {
+        if (feedResponse.data.schema_version === 'feed.v2' && feedResponse.data.cadence) {
           this.cadence = feedResponse.data.cadence;
         }
 
@@ -305,8 +298,7 @@ export class EigenFluxPollingClient {
           `Polled feed: ${items.length} items, notifications=${notifications.length}, has_more=${feedResponse.data.has_more}`
         );
 
-        const durableV2Batch = feedResponse.data.schema_version === 'feed_batch.v2' && Boolean(feedResponse.data.batch_id);
-        if (notifyFeed && (durableV2Batch || items.length > 0 || notifications.length > 0)) {
+        if (notifyFeed && (items.length > 0 || notifications.length > 0)) {
           await this.config.onFeedPolled(feedResponse);
         }
 
