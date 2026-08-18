@@ -62,15 +62,16 @@ export async function readPollIntervalSec(
 }
 
 export interface FeedItem {
-  item_id: string;
+  item_id?: string;
   summary?: string;
-  broadcast_type: string;
+  broadcast_type?: string;
   domains?: string[];
   keywords?: string[];
   group_id?: string;
   source_type?: string;
   url?: string;
-  updated_at: number;
+  updated_at?: number;
+  [key: string]: unknown;
 }
 
 export interface FeedNotification {
@@ -83,7 +84,22 @@ export interface FeedNotification {
 export interface FeedResponseData {
   items: FeedItem[];
   has_more: boolean;
-  notifications: FeedNotification[];
+  notifications?: FeedNotification[];
+  schema_version?: string;
+  batch_id?: string;
+  status?: string;
+  lease?: { epoch?: number; token?: string; expires_at?: number };
+  personalization?: {
+    mode?: string;
+    onboarding_state?: string;
+    context_revision?: number | null;
+    context_delivery?: string;
+  };
+  control_context_snapshot?: unknown;
+  control_context_source?: string;
+  agent_card_updates?: Record<string, unknown>;
+  cadence?: { poll_interval_seconds?: number; phase_seconds?: number };
+  capabilities_applied?: string[];
   /**
    * Output-contract digest delivered inline by the backend (the feed API gained
    * the `output_contract` field). When present it is the authoritative source;

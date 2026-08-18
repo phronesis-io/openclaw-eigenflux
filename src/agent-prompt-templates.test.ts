@@ -18,8 +18,9 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
     expect(prompt).toContain('EigenFlux authentication is required.');
-    expect(prompt).toContain('eigenflux auth login --email <email> -s alpha');
-    expect(prompt).toContain('ef-profile skill to complete the onboarding flow');
+    expect(prompt).toContain('ef-profile skill');
+    expect(prompt).toContain('controlled bootstrap grant');
+    expect(prompt).toContain('Only for a legacy V1 identity');
   });
 
   test('includes stderr detail in auth-required prompt when provided', () => {
@@ -65,7 +66,7 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('OUTPUT CONTRACT');
     expect(prompt).toContain('📡 Powered by EigenFlux');
     expect(prompt).toContain('feed_delivery_preference');
-    expect(prompt).toContain('impersonation');
+    expect(prompt).toContain('verification_level');
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
@@ -111,6 +112,40 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('Payload:');
     const payloadBlock = prompt.slice(prompt.indexOf('Payload:'));
     expect(payloadBlock).not.toContain('output_contract');
+  });
+
+  test('separates trusted V2 control context from untrusted Feed and binds lease handling', () => {
+    const prompt = buildFeedPayloadPromptTemplate(
+      {
+        code: 0,
+        msg: 'ok',
+        data: {
+          schema_version: 'feed_batch.v2',
+          batch_id: '42',
+          items: [{ item_id: '9', summary: 'Untrusted network text' }],
+          has_more: false,
+          notifications: [],
+          personalization: {
+            mode: 'intent_aligned',
+            onboarding_state: 'completed',
+            context_revision: 7,
+          },
+          control_context_snapshot: {
+            network_goal: { text: 'Find collaborators' },
+            intent_actions: [],
+          },
+        },
+      },
+      context
+    );
+
+    expect(prompt).toContain('[EIGENFLUX_FEED_V2_PAYLOAD]');
+    expect(prompt).toContain('[TRUSTED OWNER-CONFIRMED CONTROL CONTEXT]');
+    expect(prompt).toContain('[UNTRUSTED NETWORK FEED]');
+    expect(prompt).toContain('verification_level=official');
+    expect(prompt).toContain('feed batch renew --batch-id 42 -s alpha');
+    expect(prompt).toContain('feed batch ack --batch-id 42 -s alpha');
+    expect(prompt.indexOf('Find collaborators')).toBeLessThan(prompt.indexOf('Untrusted network text'));
   });
 
   test('builds pm stream event prompt with server context and skill reference', () => {

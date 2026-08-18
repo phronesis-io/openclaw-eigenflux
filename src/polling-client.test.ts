@@ -114,6 +114,49 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
+  test('recognizes a durable Feed V2 batch and forwards its control-context envelope', async () => {
+    const onFeedPolled = jest.fn().mockResolvedValue(undefined);
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: {
+        schema_version: 'feed_batch.v2',
+        batch_id: '42',
+        items: [{ batch_item_id: '7', source_ref: { type: 'broadcast', id: '9' } }],
+        has_more: false,
+        personalization: {
+          mode: 'intent_aligned',
+          onboarding_state: 'completed',
+          context_revision: 3,
+        },
+        control_context_snapshot: { network_goal: { text: 'Find collaborators' } },
+      },
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(600),
+      logger: createLogger(),
+      onFeedPolled,
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    });
+
+    const result = await client.pollOnce();
+
+    expect(result.kind).toBe('success');
+    expect(onFeedPolled).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          schema_version: 'feed_batch.v2',
+          batch_id: '42',
+          control_context_snapshot: expect.objectContaining({
+            network_goal: { text: 'Find collaborators' },
+          }),
+        }),
+      })
+    );
+  });
+
   test('emits auth-required callback when CLI returns auth_required', async () => {
     const onFeedPolled = jest.fn().mockResolvedValue(undefined);
     const onAuthRequired = jest.fn().mockResolvedValue(undefined);
