@@ -271,6 +271,25 @@ describe('EigenFluxPollingClient', () => {
     expect(onFeedPolled).not.toHaveBeenCalled();
   });
 
+  test('always delivers an empty durable Feed V2 batch so it can be acknowledged', async () => {
+    const onFeedPolled = jest.fn().mockResolvedValue(undefined);
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: {
+        schema_version: 'feed_batch.v2', batch_id: '42', items: [], notifications: [], has_more: false,
+        personalization: { mode: 'baseline', context_revision: null },
+        control_context_snapshot: null,
+      },
+    } as CliResult<any>);
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(600), logger: createLogger(),
+      onFeedPolled, onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    });
+    await client.pollOnce();
+    expect(onFeedPolled).toHaveBeenCalledTimes(1);
+  });
+
   test('invokes onPollSuccess on every successful poll, even with empty feed', async () => {
     const onPollSuccess = jest.fn().mockResolvedValue(undefined);
 
@@ -380,6 +399,36 @@ describe('EigenFluxPollingClient', () => {
       expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
       expect(resolvePollIntervalSec).toHaveBeenCalledTimes(2);
 
+      client.stop();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('uses the stable server cadence phase to spread subsequent V2 polls', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-08-18T00:00:05Z'));
+    try {
+      execEigenfluxMock.mockResolvedValue({
+        kind: 'success',
+        data: {
+          schema_version: 'feed_batch.v2', batch_id: '42', items: [], notifications: [], has_more: false,
+          cadence: { poll_interval_seconds: 60, phase_seconds: 20 },
+          personalization: { mode: 'baseline', context_revision: null }, control_context_snapshot: null,
+        },
+      } as CliResult<any>);
+      const client = new EigenFluxPollingClient({
+        serverName: 'eigenflux', eigenfluxBin: 'eigenflux',
+        resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+        onFeedPolled: jest.fn().mockResolvedValue(undefined),
+        onAuthRequired: jest.fn().mockResolvedValue(undefined),
+      });
+      await client.start();
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(14_000);
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
       client.stop();
     } finally {
       jest.useRealTimers();

@@ -170,6 +170,7 @@ export class EigenFluxPollingClient {
   private timeoutId: NodeJS.Timeout | null = null;
   private isRunning = false;
   private activePoll: Promise<PollResult> | null = null;
+  private cadence: FeedResponseData['cadence'] | null = null;
 
   constructor(config: PollingClientConfig) {
     this.config = config;
@@ -225,8 +226,16 @@ export class EigenFluxPollingClient {
       return;
     }
 
+    let delaySec = intervalSec;
+    const phase = this.cadence?.phase_seconds;
+    if (Number.isFinite(phase) && phase! >= 0) {
+      const normalizedPhase = Math.floor(phase!) % intervalSec;
+      const nowSec = Math.floor(Date.now() / 1000);
+      delaySec = (normalizedPhase - (nowSec % intervalSec) + intervalSec) % intervalSec;
+      if (delaySec < 5) delaySec += intervalSec;
+    }
     this.config.logger.debug(
-      `Scheduling next feed poll for server=${this.config.serverName} in ${intervalSec}s`
+      `Scheduling next feed poll for server=${this.config.serverName} in ${delaySec}s`
     );
     this.timeoutId = setTimeout(() => {
       this.timeoutId = null;
@@ -239,7 +248,7 @@ export class EigenFluxPollingClient {
         .finally(() => {
           this.scheduleNext();
         });
-    }, intervalSec * 1000);
+    }, delaySec * 1000);
   }
 
   async pollOnce(options: PollOnceOptions = {}): Promise<PollResult> {
@@ -286,6 +295,9 @@ export class EigenFluxPollingClient {
           msg: 'success',
           data: result.data,
         };
+        if (feedResponse.data.schema_version === 'feed_batch.v2' && feedResponse.data.cadence) {
+          this.cadence = feedResponse.data.cadence;
+        }
 
         const items = feedResponse.data.items ?? [];
         const notifications = feedResponse.data.notifications ?? [];
@@ -293,7 +305,8 @@ export class EigenFluxPollingClient {
           `Polled feed: ${items.length} items, notifications=${notifications.length}, has_more=${feedResponse.data.has_more}`
         );
 
-        if (notifyFeed && (items.length > 0 || notifications.length > 0)) {
+        const durableV2Batch = feedResponse.data.schema_version === 'feed_batch.v2' && Boolean(feedResponse.data.batch_id);
+        if (notifyFeed && (durableV2Batch || items.length > 0 || notifications.length > 0)) {
           await this.config.onFeedPolled(feedResponse);
         }
 

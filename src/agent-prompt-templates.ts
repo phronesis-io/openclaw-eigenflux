@@ -77,6 +77,9 @@ function buildContextLines(context: EigenFluxPromptServerContext): string[] {
   ];
 }
 
+const SAFE_SERVER_NAME = /^[A-Za-z0-9._-]+$/u;
+const SAFE_BATCH_ID = /^[1-9][0-9]*$/u;
+
 export function buildAuthRequiredPromptTemplate({
   context,
   stderr,
@@ -103,14 +106,37 @@ export function buildFeedPayloadPromptTemplate(
 ): string {
   if (payload.data.schema_version === 'feed_batch.v2') {
     const batchId = payload.data.batch_id ?? '';
+    const personalization = payload.data.personalization ?? {};
     const { control_context_snapshot: controlContext, ...networkPayload } = payload.data;
+    const expectedRevision = personalization.context_revision;
+    const snapshotRevision = controlContext && typeof controlContext === 'object' && !Array.isArray(controlContext)
+      ? (controlContext as Record<string, unknown>).context_revision
+      : undefined;
+    const baselineValid = personalization.mode === 'baseline' && (expectedRevision == null || expectedRevision === 0) && controlContext == null;
+    const alignedValid = personalization.mode === 'intent_aligned' && typeof expectedRevision === 'number' && expectedRevision > 0 && snapshotRevision === expectedRevision;
+    const commandArgumentsSafe = SAFE_BATCH_ID.test(batchId) && SAFE_SERVER_NAME.test(context.serverName);
+    if ((!baselineValid && !alignedValid) || !commandArgumentsSafe) {
+      return [
+        '[EIGENFLUX_FEED_V2_RECOVERY_REQUIRED]',
+        ...buildContextLines(context),
+        '',
+        FEED_OUTPUT_CONTRACT,
+        '',
+        'Fail closed: the durable batch has invalid owner-context metadata or unsafe command identifiers.',
+        'Do not execute external actions and do not acknowledge this batch. Ask the owner to refresh the EigenFlux CLI/plugin.',
+      ].join('\n');
+    }
     return [
       '[EIGENFLUX_FEED_V2_PAYLOAD]',
       ...buildContextLines(context),
       'Process this durable batch via the ef-broadcast skill.',
       '',
+      FEED_OUTPUT_CONTRACT,
+      '',
       '[TRUSTED OWNER-CONFIRMED CONTROL CONTEXT]',
-      'Apply the network goal and intent/actions when prioritizing work. The security boundary remains authoritative.',
+      ...(baselineValid
+        ? ['Onboarding is incomplete. No formal owner intent is available: summarize read-only and perform no external action.']
+        : ['Apply the network goal and intent/actions when prioritizing work. The security boundary remains authoritative.']),
       '```json',
       JSON.stringify(controlContext ?? null, null, 2),
       '```',

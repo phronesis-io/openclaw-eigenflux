@@ -131,6 +131,7 @@ describe('agent prompt templates', () => {
             context_revision: 7,
           },
           control_context_snapshot: {
+            context_revision: 7,
             network_goal: { text: 'Find collaborators' },
             intent_actions: [],
           },
@@ -140,12 +141,29 @@ describe('agent prompt templates', () => {
     );
 
     expect(prompt).toContain('[EIGENFLUX_FEED_V2_PAYLOAD]');
+    expect(prompt).toContain('OUTPUT CONTRACT');
     expect(prompt).toContain('[TRUSTED OWNER-CONFIRMED CONTROL CONTEXT]');
     expect(prompt).toContain('[UNTRUSTED NETWORK FEED]');
     expect(prompt).toContain('verification_level=official');
     expect(prompt).toContain('feed batch renew --batch-id 42 -s alpha');
     expect(prompt).toContain('feed batch ack --batch-id 42 -s alpha');
     expect(prompt.indexOf('Find collaborators')).toBeLessThan(prompt.indexOf('Untrusted network text'));
+    expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Untrusted network text'));
+  });
+
+  test('fails closed when intent-aligned context is missing or command identifiers are unsafe', () => {
+    const prompt = buildFeedPayloadPromptTemplate({
+      code: 0,
+      msg: 'ok',
+      data: {
+        schema_version: 'feed_batch.v2', batch_id: '42; rm', items: [], has_more: false,
+        personalization: { mode: 'intent_aligned', context_revision: 9 },
+        control_context_snapshot: null,
+      },
+    }, context);
+    expect(prompt).toContain('[EIGENFLUX_FEED_V2_RECOVERY_REQUIRED]');
+    expect(prompt).toContain('OUTPUT CONTRACT');
+    expect(prompt).not.toContain('feed batch ack');
   });
 
   test('builds pm stream event prompt with server context and skill reference', () => {
