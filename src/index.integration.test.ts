@@ -189,8 +189,8 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('default mode: active push — runs the subagent on the main session, not a one-shot key', async () => {
-    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = classic main-session push
+  test('default mode: active push — routes feed into the stable network inbox', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
     jest.resetModules();
     const { default: plugin } = await import('./index');
     const services: any[] = [];
@@ -215,12 +215,12 @@ describe('register integration', () => {
     await services[0].start();
     await waitFor(() => subagentRun.mock.calls.length === 1);
 
-    // The plugin itself initiates the run (active push) on a persistent main
-    // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
+    // The plugin itself initiates the run in one stable, isolated inbox.
     const params = subagentRun.mock.calls[0][0];
     expect(params.deliver).toBe(true);
-    expect(params.lane).toBe('eigenflux-bg');
-    expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
+    expect(params.lane).toBe('eigenflux-network-inbox');
+    expect(params.sessionKey).toBe('eigenflux:network-inbox');
+    expect(String(params.message).startsWith('EigenFlux 网络收件箱\n\n')).toBe(true);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
 
@@ -267,7 +267,7 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('routes PMs to a stable session and lane derived from peer + conv_id, outside main', async () => {
+  test('routes PMs to the same stable network inbox as feed', async () => {
     feedItems = [];
     jest.resetModules();
     const { default: plugin } = await import('./index');
@@ -301,9 +301,9 @@ describe('register integration', () => {
 
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const params = subagentRun.mock.calls[0][0];
-    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
-    expect(params.sessionKey).not.toBe('agent:main:main');
-    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.sessionKey).toBe('eigenflux:network-inbox');
+    expect(params.lane).toBe('eigenflux-network-inbox');
+    expect(String(params.message).startsWith('EigenFlux 网络收件箱\n\n')).toBe(true);
     expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
     expect(params.message).toContain('eigenflux msg history --conv-id <conv_id> --limit 20');
     expect(params.message).toContain('stable isolated session');

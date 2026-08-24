@@ -171,9 +171,10 @@ describe('register unit', () => {
 
     expect(subagentRun).toHaveBeenCalledWith(
       expect.objectContaining({
-        sessionKey: 'main',
+        sessionKey: 'eigenflux:network-inbox',
         message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]'),
         deliver: true,
+        lane: 'eigenflux-network-inbox',
       })
     );
     const promptMessage = String(subagentRun.mock.calls[0]?.[0]?.message);
@@ -498,11 +499,11 @@ describe('register unit', () => {
     await services[0].start();
 
     expect(subagentRun).toHaveBeenCalledWith({
-      sessionKey: 'main',
-      message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]'),
+      sessionKey: 'eigenflux:network-inbox',
+      message: expect.stringMatching(/^EigenFlux 网络收件箱\n\n.*\[EIGENFLUX_AUTH_REQUIRED\]/s),
       deliver: true,
       idempotencyKey: expect.any(String),
-      lane: 'eigenflux-bg',
+      lane: 'eigenflux-network-inbox',
     });
 
     await services[0].stop();

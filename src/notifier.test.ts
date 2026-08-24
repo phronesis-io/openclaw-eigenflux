@@ -817,6 +817,45 @@ describe('EigenFluxNotifier', () => {
     expect(writeStoredNotificationRouteMock).not.toHaveBeenCalled();
   });
 
+  test('labels a persistent network inbox and puts the title first in the task message', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-inbox' });
+    const patchSessionEntry = jest.fn(async (_params: any) => null);
+    const resolveStorePath = jest.fn(() => '/tmp/sessions/main.json');
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run },
+          agent: { session: { resolveStorePath, patchSessionEntry } },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    await expect(
+      notifier.deliver('[EIGENFLUX_MSG_PAYLOAD] test', {
+        persistentSessionKey: 'eigenflux:network-inbox',
+        sessionLabel: 'EigenFlux 网络收件箱',
+        lane: 'eigenflux-network-inbox',
+      })
+    ).resolves.toBe(true);
+
+    expect(run).toHaveBeenCalledWith({
+      sessionKey: 'eigenflux:network-inbox',
+      message: 'EigenFlux 网络收件箱\n\n[EIGENFLUX_MSG_PAYLOAD] test',
+      deliver: true,
+      idempotencyKey: expect.any(String),
+      lane: 'eigenflux-network-inbox',
+    });
+    const patchParams = patchSessionEntry.mock.calls[0][0];
+    expect(patchParams.sessionKey).toBe('eigenflux:network-inbox');
+    expect(patchParams.update({}, { existingEntry: undefined })).toMatchObject({
+      label: 'EigenFlux 网络收件箱',
+      displayName: 'EigenFlux 网络收件箱',
+    });
+  });
+
   test('deletes one-shot session after successful delivery', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-cleanup' });
     const deleteSession = jest.fn().mockResolvedValue(undefined);

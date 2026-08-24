@@ -18,6 +18,8 @@ import { globalDeliveryCoordinator } from './delivery-coordinator';
  */
 /** Minimal shape of a session-store entry we read/write when seeding a route. */
 type SessionStoreEntryLike = {
+  label?: string;
+  displayName?: string;
   deliveryContext?: { channel?: string; to?: string; accountId?: string };
   lastChannel?: string;
   lastTo?: string;
@@ -155,11 +157,13 @@ export type DeliverOptions = {
   targetSessionKey?: string;
   /**
    * Deliver to this stable, isolated session without deleting it afterwards.
-   * PM delivery uses one key per EigenFlux conv_id so conversation context is
-   * retained without sharing the user's agent:main:main session.
+   * EigenFlux network inbox delivery uses one shared key so feed, PM, and
+   * relation events stay in one conversation outside agent:main:main.
    */
   persistentSessionKey?: string;
-  /** Stable queue lane for this delivery. PMs use one lane per conversation. */
+  /** User-facing title for a stable, plugin-owned session. */
+  sessionLabel?: string;
+  /** Stable queue lane for this delivery. The network inbox uses one serial lane. */
   lane?: string;
   /**
    * When true, deliver *silently*: run the host agent loop (so it can read its
@@ -254,13 +258,17 @@ export class EigenFluxNotifier {
       // run fails with Feishu "requires target" (missing target). Skip when silent
       // (no channel reply) since there is nothing to route. Best-effort.
       if (!silent) {
-        await this.seedOneShotDeliveryContext(sessionKey, route);
+        await this.seedOneShotDeliveryContext(sessionKey, route, options?.sessionLabel);
       }
+
+      const deliveryMessage = options?.sessionLabel
+        ? `${options.sessionLabel}\n\n${message}`
+        : message;
 
       // Isolated delivery uses only runtime.subagent. Current command/heartbeat
       // fallbacks cannot preserve an arbitrary session key and would leak back
       // into the main DM session.
-      const result = await this.attemptDelivery(message, route, {
+      const result = await this.attemptDelivery(deliveryMessage, route, {
         subagentOnly: true,
         silent,
         lane: options?.lane,
@@ -443,9 +451,11 @@ export class EigenFluxNotifier {
    */
   private async seedOneShotDeliveryContext(
     sessionKey: string,
-    route: ResolvedNotificationRoute
+    route: ResolvedNotificationRoute,
+    sessionLabel?: string
   ): Promise<void> {
-    if (!route.replyChannel || !route.replyTo) {
+    const hasDeliveryTarget = Boolean(route.replyChannel && route.replyTo);
+    if (!hasDeliveryTarget && !sessionLabel) {
       this.logger.warn(
         `Cannot seed deliveryContext for one-shot session ${sessionKey}: route has no channel/to`
       );
@@ -458,11 +468,13 @@ export class EigenFluxNotifier {
       );
       return;
     }
-    const deliveryContext = {
-      channel: route.replyChannel,
-      to: route.replyTo,
-      ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
-    };
+    const deliveryContext = hasDeliveryTarget
+      ? {
+          channel: route.replyChannel as string,
+          to: route.replyTo as string,
+          ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
+        }
+      : undefined;
     try {
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
@@ -473,14 +485,19 @@ export class EigenFluxNotifier {
         sessionKey,
         storePath,
         update: () => ({
-          deliveryContext,
-          lastChannel: route.replyChannel,
-          lastTo: route.replyTo,
-          ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+          ...(sessionLabel ? { label: sessionLabel, displayName: sessionLabel } : {}),
+          ...(deliveryContext
+            ? {
+                deliveryContext,
+                lastChannel: route.replyChannel,
+                lastTo: route.replyTo,
+                ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+              }
+            : {}),
         }),
       });
       this.logger.info(
-        `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
+        `Seeded EigenFlux session ${sessionKey}: label=${sessionLabel ?? 'n/a'}, channel=${deliveryContext?.channel ?? 'n/a'}, to=${deliveryContext?.to ?? 'n/a'}, account=${route.replyAccountId ?? 'n/a'}`
       );
     } catch (error) {
       this.logger.warn(

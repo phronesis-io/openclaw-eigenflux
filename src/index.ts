@@ -40,7 +40,7 @@ import {
 } from './agent-prompt-templates';
 import { FeedPushScheduler } from './feed-push-scheduler';
 import { EigenFluxNotifier } from './notifier';
-import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
+import { splitPmEventByConversation } from './pm-delivery';
 
 /** "Recently active" window for the busy-aware feed push: the main session
  *  counts as busy while its last activity is fresher than this. Each user turn
@@ -508,6 +508,22 @@ function buildFeedSessionKey(serverName: string): string {
   return `eigenflux:feed:${serverName}`;
 }
 
+const NETWORK_INBOX_LABEL = 'EigenFlux 网络收件箱';
+const NETWORK_INBOX_SESSION_KEY = 'eigenflux:network-inbox';
+const NETWORK_INBOX_LANE = 'eigenflux-network-inbox';
+
+function networkInboxDeliveryOptions(): {
+  persistentSessionKey: string;
+  sessionLabel: string;
+  lane: string;
+} {
+  return {
+    persistentSessionKey: NETWORK_INBOX_SESSION_KEY,
+    sessionLabel: NETWORK_INBOX_LABEL,
+    lane: NETWORK_INBOX_LANE,
+  };
+}
+
 function createServerRuntime(
   api: OpenClawPluginApi,
   logger: Logger,
@@ -563,7 +579,8 @@ function createServerRuntime(
 
     lastAuthPromptKey = promptKey;
     await notifier.deliver(
-      buildAuthRequiredPromptTemplate({ context: getPromptContext() })
+      buildAuthRequiredPromptTemplate({ context: getPromptContext() }),
+      networkInboxDeliveryOptions()
     );
   };
 
@@ -577,23 +594,26 @@ function createServerRuntime(
     logger,
   });
 
-  // Backpressure state for the LEGACY one-shot feed path only
-  // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
-  // before touching any of these — they stay at their initial values there, so
-  // never read them outside the oneshot branch. Guard: notifier.deliver() may
-  // take longer than the poll interval, so we skip overlapping deliveries to
-  // avoid duplicate agent tasks.
+  // Backpressure state for active Feed delivery. The default path uses the
+  // persistent network inbox; the legacy oneshot mode uses a temporary session.
+  // Guard: notifier.deliver() may take longer than the poll interval, so skip
+  // overlapping deliveries to avoid duplicate agent tasks.
   let feedDeliveryInFlight = false;
   let feedDeliveryStartedAt = 0;
   let feedDeliverySkipCount = 0;
   let activeFeedDelivery: Promise<boolean> | null = null;
   const FEED_DELIVERY_TIMEOUT_MS = 300_000;
 
-  /** Overlap-guarded notifier.deliver() — shared by the default main-session
-   *  push (via the scheduler) and the legacy one-shot path. */
+  /** Overlap-guarded notifier.deliver() — shared by the persistent inbox push
+   *  and the legacy one-shot path. */
   async function runGuardedFeedDelivery(
     prompt: string,
-    options?: { targetSessionKey?: string },
+    options?: {
+      targetSessionKey?: string;
+      persistentSessionKey?: string;
+      sessionLabel?: string;
+      lane?: string;
+    },
     skipContext?: { items: number; notifications: number }
   ): Promise<void> {
     // Check for stale delivery flag (delivery promise hung)
@@ -640,9 +660,10 @@ function createServerRuntime(
   // session instead of grabbing its lock while the user is mid-conversation.
   // See FeedPushScheduler for the full policy.
   const feedPushScheduler = new FeedPushScheduler({
-    isBusy: async () =>
-      feedDeliveryInFlight || notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS),
-    pushNow: (prompt) => runGuardedFeedDelivery(prompt),
+    // The network inbox has its own session and queue lane, so activity in the
+    // user's interactive conversation must not defer inbox processing.
+    isBusy: async () => feedDeliveryInFlight,
+    pushNow: (prompt) => runGuardedFeedDelivery(prompt, networkInboxDeliveryOptions()),
     logger,
     serverName: server.name,
   });
@@ -665,12 +686,9 @@ function createServerRuntime(
 
       // Delivery modes (EIGENFLUX_FEED_DELIVERY):
       //
-      // (default)      — the original pre-oneshot path: notifier.deliver() runs
-      //                  the agent ON the user's real main session via
-      //                  runtime.subagent (deliver:true). The PLUGIN initiates
-      //                  the run, so feed is an ACTIVE push with full user
-      //                  context and no dependency on the host heartbeat
-      //                  scheduler (which has been observed to stall for hours).
+      // (default)      — active push into one stable "EigenFlux 网络收件箱"
+      //                  session, shared with PM/relation events and isolated
+      //                  from the user's interactive conversation.
       // 'system-event' — mode 2a: enqueue into the main session + heartbeat
       //                  wake. Fully non-blocking, but delivery timing depends
       //                  on the host heartbeat actually firing; until that is
@@ -740,13 +758,10 @@ function createServerRuntime(
       if (actionable) {
         const batches = splitPmEventByConversation(event);
         await Promise.all(
-          batches.map(({ conversationKey, peerKey, event: conversationEvent }) =>
+          batches.map(({ event: conversationEvent }) =>
             notifier.deliver(
               buildPmStreamEventPromptTemplate(conversationEvent, getPromptContext()),
-              {
-                persistentSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey),
-                lane: buildPmLane(server.name, peerKey, conversationKey),
-              }
+              networkInboxDeliveryOptions()
             )
           )
         );
