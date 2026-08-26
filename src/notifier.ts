@@ -123,7 +123,10 @@ const COMMAND_TIMEOUT_MS = 15000;
 // of room to complete while still bounding a genuinely stuck run.
 const SUBAGENT_WAIT_TIMEOUT_MS = 180_000;
 const SUBAGENT_QUEUE_TIMEOUT_MS = 300_000;
-const TASK_START_POLL_INTERVAL_MS = 100;
+// waitForRun is the authoritative lifecycle API. Preserve the previous maximum
+// queue + execution budget without relying on the ephemeral task registry.
+const SUBAGENT_TOTAL_WAIT_TIMEOUT_MS =
+  SUBAGENT_QUEUE_TIMEOUT_MS + SUBAGENT_WAIT_TIMEOUT_MS;
 // Background deliveries (feed / PM / profile) run on a dedicated queue lane so a
 // slow or stuck agent run never serializes behind / ahead of the user's own
 // interactive (per-chat) lane. The lane is orthogonal to the session key.
@@ -599,7 +602,7 @@ export class EigenFluxNotifier {
             terminal: true,
             error:
               (waited.error ??
-                `subagent execution timed out after ${Math.round(SUBAGENT_WAIT_TIMEOUT_MS / 1000)}s`) +
+                `subagent completion wait timed out after ${Math.round(SUBAGENT_TOTAL_WAIT_TIMEOUT_MS / 1000)}s`) +
               (cancelled ? '; run cancelled' : '; cancellation unavailable or failed'),
           };
         }
@@ -621,12 +624,12 @@ export class EigenFluxNotifier {
   }
 
   /**
-   * Start the execution timeout when OpenClaw marks the task running, not when
-   * subagent.run merely enqueues it. The coordinator normally removes queueing,
-   * but startedAt is the authoritative boundary when the host tasks API exists.
+   * Wait on the authoritative agent lifecycle API. The task registry is an
+   * ephemeral cancellation/telemetry view: a fast or already-terminal run may
+   * never appear in bindSession().list(), so it must not gate completion waits.
    */
   private async waitForRunFromExecutionStart(
-    sessionKey: string,
+    _sessionKey: string,
     runId: string
   ): Promise<{ status: 'ok' | 'error' | 'timeout'; error?: string }> {
     const waitForRun = this.runtime.subagent?.waitForRun;
@@ -634,41 +637,7 @@ export class EigenFluxNotifier {
       return { status: 'ok' };
     }
 
-    const bindSession = this.runtime.tasks?.runs?.bindSession;
-    if (typeof bindSession !== 'function') {
-      // Older hosts do not expose startedAt. Preserve compatibility, but make
-      // the limitation explicit in logs.
-      this.logger.debug(
-        `Task startedAt unavailable for run_id=${runId}; timeout begins at enqueue`
-      );
-      return waitForRun({ runId, timeoutMs: SUBAGENT_WAIT_TIMEOUT_MS });
-    }
-
-    const bound = bindSession({ sessionKey });
-    const queueDeadline = Date.now() + SUBAGENT_QUEUE_TIMEOUT_MS;
-    while (true) {
-      const task = bound.list().find((candidate) => candidate.runId === runId);
-      if (task?.startedAt !== undefined) {
-        const elapsed = Math.max(0, Date.now() - task.startedAt);
-        const remaining = Math.max(1, SUBAGENT_WAIT_TIMEOUT_MS - elapsed);
-        this.logger.debug(
-          `Background run started: run_id=${runId}, queued_ms=${Math.max(0, task.startedAt - (task.createdAt ?? task.startedAt))}, execution_timeout_ms=${remaining}`
-        );
-        return waitForRun({ runId, timeoutMs: remaining });
-      }
-      if (task?.endedAt !== undefined) {
-        // The run can complete between enqueue and the first poll. waitForRun
-        // observes the already-terminal result immediately.
-        return waitForRun({ runId, timeoutMs: 1 });
-      }
-      if (Date.now() >= queueDeadline) {
-        return {
-          status: 'timeout',
-          error: `subagent queue wait timed out after ${Math.round(SUBAGENT_QUEUE_TIMEOUT_MS / 1000)}s`,
-        };
-      }
-      await delay(TASK_START_POLL_INTERVAL_MS);
-    }
+    return waitForRun({ runId, timeoutMs: SUBAGENT_TOTAL_WAIT_TIMEOUT_MS });
   }
 
   /** Best-effort true cancellation after either queue or execution timeout. */

@@ -143,10 +143,9 @@ describe('EigenFluxNotifier', () => {
     const waitForRun = jest.fn().mockResolvedValue({ status: 'timeout' });
     const cancel = jest.fn().mockResolvedValue({ found: true, cancelled: true });
     // list() returns the run keyed by runId; its `id` is the taskId cancel needs.
-    const startedAt = Date.now() - 20_000;
     const list = jest.fn().mockReturnValue([
       { id: 'task-other', runId: 'run-unrelated', startedAt: Date.now() },
-      { id: 'task-stuck', runId: 'run-stuck', createdAt: startedAt - 5_000, startedAt },
+      { id: 'task-stuck', runId: 'run-stuck', startedAt: Date.now() - 20_000 },
     ]);
     const bindSession = jest.fn().mockReturnValue({ list, cancel });
     const runCommandWithTimeout = jest.fn();
@@ -165,26 +164,18 @@ describe('EigenFluxNotifier', () => {
 
     await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(false);
     expect(bindSession).toHaveBeenCalledWith({ sessionKey: 'agent:main:feishu:direct:ou_123' });
-    const executionTimeout = waitForRun.mock.calls[0][0].timeoutMs;
-    expect(executionTimeout).toBeLessThanOrEqual(160_000);
-    expect(executionTimeout).toBeGreaterThan(158_000);
+    expect(waitForRun).toHaveBeenCalledWith({ runId: 'run-stuck', timeoutMs: 480_000 });
     // Cancels the matching run by its taskId — not the unrelated one.
     expect(cancel).toHaveBeenCalledWith({ taskId: 'task-stuck', cfg: expect.anything() });
     // Still no CLI fallback (would dup-deliver).
     expect(runCommandWithTimeout).not.toHaveBeenCalled();
   });
 
-  test('starts the execution timeout only after a queued run actually starts', async () => {
-    const run = jest.fn().mockResolvedValue({ runId: 'run-queued' });
+  test('recognizes completion even when the task registry never exposes the run', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-completed' });
     const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
     const cancel = jest.fn();
-    const createdAt = Date.now() - 200_000;
-    const list = jest
-      .fn()
-      .mockReturnValueOnce([{ id: 'task-queued', runId: 'run-queued', createdAt }])
-      .mockReturnValue([
-        { id: 'task-queued', runId: 'run-queued', createdAt, startedAt: Date.now() },
-      ]);
+    const list = jest.fn().mockReturnValue([]);
     const bindSession = jest.fn().mockReturnValue({ list, cancel });
 
     const notifier = new EigenFluxNotifier(
@@ -198,11 +189,10 @@ describe('EigenFluxNotifier', () => {
       createConfig()
     );
 
-    await expect(notifier.deliver('[EIGENFLUX_TEST] queued payload')).resolves.toBe(true);
-    expect(list).toHaveBeenCalledTimes(2);
-    const executionTimeout = waitForRun.mock.calls[0][0].timeoutMs;
-    expect(executionTimeout).toBeGreaterThan(179_000);
-    expect(executionTimeout).toBeLessThanOrEqual(180_000);
+    await expect(notifier.deliver('[EIGENFLUX_TEST] completed payload')).resolves.toBe(true);
+    expect(waitForRun).toHaveBeenCalledWith({ runId: 'run-completed', timeoutMs: 480_000 });
+    expect(bindSession).not.toHaveBeenCalled();
+    expect(list).not.toHaveBeenCalled();
     expect(cancel).not.toHaveBeenCalled();
   });
 
