@@ -18,6 +18,8 @@ import { globalDeliveryCoordinator } from './delivery-coordinator';
  */
 /** Minimal shape of a session-store entry we read/write when seeding a route. */
 type SessionStoreEntryLike = {
+  sessionId?: string;
+  updatedAt?: number;
   deliveryContext?: { channel?: string; to?: string; accountId?: string };
   lastChannel?: string;
   lastTo?: string;
@@ -32,6 +34,7 @@ type EigenFluxRuntimeApi = {
       message: string;
       deliver?: boolean;
       idempotencyKey?: string;
+      lightContext?: boolean;
       /** Queue lane for this run. Background deliveries use a dedicated lane so a
        *  slow/stuck run never blocks the user's interactive (per-chat) lane. */
       lane?: string;
@@ -70,6 +73,13 @@ type EigenFluxRuntimeApi = {
           context: { existingEntry?: SessionStoreEntryLike }
         ) => Partial<SessionStoreEntryLike> | null;
       }) => Promise<unknown>;
+      /** Creates the row when an isolated session does not exist yet. */
+      upsertSessionEntry?: (params: {
+        agentId?: string;
+        sessionKey: string;
+        storePath?: string;
+        entry: SessionStoreEntryLike;
+      }) => Promise<void>;
     };
   };
   /** Task-run management. Used to truly cancel a run that outlived our wait budget
@@ -154,9 +164,8 @@ export type DeliverOptions = {
    */
   targetSessionKey?: string;
   /**
-   * Deliver to this stable, isolated session without deleting it afterwards.
-   * PM delivery uses one key per EigenFlux conv_id so conversation context is
-   * retained without sharing the user's agent:main:main session.
+   * Legacy alias for a one-shot session prefix. It no longer retains context;
+   * a unique suffix is always added and the session is deleted after delivery.
    */
   persistentSessionKey?: string;
   /** Stable queue lane for this delivery. PMs use one lane per conversation. */
@@ -200,6 +209,8 @@ export class EigenFluxNotifier {
   private readonly logger: Logger;
   private readonly config: EigenFluxNotifierConfig;
   private readonly pendingCleanups: Promise<void>[] = [];
+  private readonly activeRuns = new Map<string, { sessionKey: string }>();
+  private stopping = false;
 
   constructor(api: OpenClawPluginApi, logger: Logger, config: EigenFluxNotifierConfig) {
     this.api = api;
@@ -212,6 +223,10 @@ export class EigenFluxNotifier {
   }
 
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
+    if (this.stopping) {
+      this.logger.warn('Skipping EigenFlux delivery because notifier is stopping');
+      return false;
+    }
     const serializationKey =
       options?.persistentSessionKey ?? options?.targetSessionKey ?? this.config.sessionKey;
     return globalDeliveryCoordinator.run(serializationKey, () =>
@@ -224,9 +239,10 @@ export class EigenFluxNotifier {
     const persistentKey = options?.persistentSessionKey;
     const silent = options?.silent === true;
 
-    // Isolated deliveries never touch the user's main conversation. A target
-    // prefix creates a one-shot session; a persistent key (PM conv_id) retains
-    // its own conversation context across messages.
+    // Isolated deliveries never touch the user's main conversation. Every
+    // background delivery gets a fresh session, including legacy callers that
+    // still pass persistentSessionKey. This prevents context accumulation and
+    // makes interrupted runs safe to delete instead of restore on restart.
     if (targetKey || persistentKey) {
       // Sweep any pending cleanups from previous deliveries before starting a new one.
       // This prevents orphan sessions from accumulating if deleteSession was slow.
@@ -236,7 +252,8 @@ export class EigenFluxNotifier {
       // then override the sessionKey with a one-shot key to avoid context accumulation.
       const baseRoute = await this.resolveRoute();
 
-      const sessionKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const sessionPrefix = persistentKey ?? targetKey!;
+      const sessionKey = buildIsolatedSessionKey(baseRoute.route.agentId, sessionPrefix);
       const route: ResolvedNotificationRoute = {
         sessionKey,
         agentId: baseRoute.route.agentId,
@@ -245,7 +262,7 @@ export class EigenFluxNotifier {
         ...(baseRoute.route.replyAccountId && { replyAccountId: baseRoute.route.replyAccountId }),
       };
       this.logger.info(
-        `Delivery route resolved: source=${persistentKey ? 'targeted-persistent' : 'targeted-oneshot'}, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
+        `Delivery route resolved: source=targeted-oneshot, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
       );
 
       // Seed the isolated session's delivery context BEFORE the run. A deliver:true
@@ -260,24 +277,23 @@ export class EigenFluxNotifier {
       // Isolated delivery uses only runtime.subagent. Current command/heartbeat
       // fallbacks cannot preserve an arbitrary session key and would leak back
       // into the main DM session.
-      const result = await this.attemptDelivery(message, route, {
-        subagentOnly: true,
-        silent,
-        lane: options?.lane,
-      });
-      if (result.result.ok) {
-        this.logDispatch(result.result);
-      } else {
-        this.logger.error(`Failed to deliver notification to targeted session: ${result.errors.join(' | ')}`);
+      try {
+        const result = await this.attemptDelivery(message, route, {
+          subagentOnly: true,
+          silent,
+          lane: options?.lane,
+        });
+        if (result.result.ok) {
+          this.logDispatch(result.result);
+        } else {
+          this.logger.error(`Failed to deliver notification to targeted session: ${result.errors.join(' | ')}`);
+        }
+        return result.result.ok;
+      } finally {
+        // Deterministic cleanup: do not leave a transcript/session for startup
+        // recovery, even when delivery fails or the run is cancelled.
+        await this.tryDeleteSession(sessionKey);
       }
-
-      // Fire-and-forget: queue cleanup so it doesn't block the next delivery.
-      // Pending cleanups are drained at the start of the next delivery and on stop().
-      if (!persistentKey) {
-        this.enqueueCleanup(sessionKey);
-      }
-
-      return result.result.ok;
     }
 
     // Standard delivery: resolve route, attempt delivery, remember on success.
@@ -452,7 +468,11 @@ export class EigenFluxNotifier {
       return;
     }
     const session = this.runtime.agent?.session;
-    if (typeof session?.resolveStorePath !== 'function' || typeof session?.patchSessionEntry !== 'function') {
+    if (
+      typeof session?.resolveStorePath !== 'function' ||
+      (typeof session?.upsertSessionEntry !== 'function' &&
+        typeof session?.patchSessionEntry !== 'function')
+    ) {
       this.logger.warn(
         'runtime.agent.session store API unavailable; cannot seed deliveryContext for one-shot session'
       );
@@ -466,19 +486,32 @@ export class EigenFluxNotifier {
     try {
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
-      // Row-scoped write (patchSessionEntry) instead of the deprecated whole-store
-      // updateSessionStore: patch merges the returned partial into just this entry.
-      await session.patchSessionEntry({
-        agentId: route.agentId,
-        sessionKey,
-        storePath,
-        update: () => ({
-          deliveryContext,
-          lastChannel: route.replyChannel,
-          lastTo: route.replyTo,
-          ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
-        }),
-      });
+      const entry: SessionStoreEntryLike = {
+        sessionId: randomUUID(),
+        updatedAt: Date.now(),
+        deliveryContext,
+        lastChannel: route.replyChannel,
+        lastTo: route.replyTo,
+        ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+      };
+      if (typeof session.upsertSessionEntry === 'function') {
+        // New isolated keys have no row yet. upsert is required here: patch on
+        // a missing row may return null and silently drop the Feishu target.
+        await session.upsertSessionEntry({
+          agentId: route.agentId,
+          sessionKey,
+          storePath,
+          entry,
+        });
+      } else {
+        // Compatibility with older OpenClaw hosts that predate upsert.
+        await session.patchSessionEntry!({
+          agentId: route.agentId,
+          sessionKey,
+          storePath,
+          update: () => entry,
+        });
+      }
       this.logger.info(
         `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
       );
@@ -554,6 +587,7 @@ export class EigenFluxNotifier {
     lane = BACKGROUND_LANE
   ): Promise<NotifyAttemptResult> {
     const runtimeSubagent = this.runtime.subagent;
+    let activeRun: { runId: string; sessionKey: string } | undefined;
 
     if (!runtimeSubagent || typeof runtimeSubagent.run !== 'function') {
       return {
@@ -576,12 +610,16 @@ export class EigenFluxNotifier {
         deliver,
         idempotencyKey: randomUUID(),
         lane,
+        lightContext: true,
       });
+      activeRun = { runId, sessionKey: route.sessionKey };
+      this.activeRuns.set(runId, { sessionKey: route.sessionKey });
 
       // run() only enqueues; wait long enough for the full agent loop (LLM +
       // reply + channel send) to complete so we can surface real errors.
       if (typeof runtimeSubagent.waitForRun === 'function') {
         const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
+        this.activeRuns.delete(runId);
         if (waited.status === 'error') {
           return {
             ok: false,
@@ -603,6 +641,10 @@ export class EigenFluxNotifier {
               (cancelled ? '; run cancelled' : '; cancellation unavailable or failed'),
           };
         }
+      } else {
+        // Compatibility path for hosts predating waitForRun. Supported hosts
+        // expose waitForRun and stay tracked until the terminal result.
+        this.activeRuns.delete(runId);
       }
 
       return {
@@ -612,6 +654,10 @@ export class EigenFluxNotifier {
         runId,
       };
     } catch (error) {
+      if (activeRun) {
+        await this.tryCancelRun(activeRun.sessionKey, activeRun.runId);
+        this.activeRuns.delete(activeRun.runId);
+      }
       return {
         ok: false,
         mode: 'runtime.subagent',
@@ -1013,6 +1059,23 @@ export class EigenFluxNotifier {
     await Promise.allSettled([...this.pendingCleanups]);
   }
 
+  /** Stop accepting work, cancel active runs, and remove their contexts. */
+  async stop(): Promise<void> {
+    this.stopping = true;
+    const active = Array.from(this.activeRuns, ([runId, value]) => ({ runId, ...value }));
+    if (active.length > 0) {
+      this.logger.warn(`Cancelling ${active.length} active EigenFlux background run(s)`);
+      await Promise.allSettled(
+        active.map(async ({ runId, sessionKey }) => {
+          await this.tryCancelRun(sessionKey, runId);
+          await this.tryDeleteSession(sessionKey);
+          this.activeRuns.delete(runId);
+        })
+      );
+    }
+    await this.drainPendingCleanups();
+  }
+
   private logDispatch(result: Extract<NotifyAttemptResult, { ok: true }>): void {
     const details = [
       `mode=${result.mode}`,
@@ -1036,6 +1099,12 @@ function formatCommandFailure(result: {
     result.stdout?.trim() ||
     `command exited with ${result.code ?? 'unknown'}`
   );
+}
+
+function buildIsolatedSessionKey(agentId: string, prefix: string): string {
+  const normalizedAgentId = agentId.trim() || 'main';
+  const normalizedPrefix = prefix.trim().replace(/^agent:[^:]+:/iu, '');
+  return `agent:${normalizedAgentId}:${normalizedPrefix}:${Date.now()}-${randomUUID().slice(0, 8)}`;
 }
 
 function formatError(error: unknown): string {

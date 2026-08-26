@@ -79,6 +79,7 @@ describe('EigenFluxNotifier', () => {
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
+      lightContext: true,
     });
   });
 
@@ -109,6 +110,7 @@ describe('EigenFluxNotifier', () => {
       deliver: false,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
+      lightContext: true,
     });
     // Heartbeat fallback surfaces in the user's main session: must NOT fire.
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
@@ -172,6 +174,53 @@ describe('EigenFluxNotifier', () => {
     expect(cancel).toHaveBeenCalledWith({ taskId: 'task-stuck', cfg: expect.anything() });
     // Still no CLI fallback (would dup-deliver).
     expect(runCommandWithTimeout).not.toHaveBeenCalled();
+  });
+
+  test('stop cancels an active background run and deletes its isolated session', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-active' });
+    let resolveWait!: (value: { status: 'error'; error: string }) => void;
+    const waitForRun = jest.fn(
+      () =>
+        new Promise<{ status: 'error'; error: string }>((resolve) => {
+          resolveWait = resolve;
+        })
+    );
+    const cancel = jest.fn().mockResolvedValue({ found: true, cancelled: true });
+    const list = jest.fn().mockReturnValue([
+      { id: 'task-active', runId: 'run-active', startedAt: Date.now() },
+    ]);
+    const bindSession = jest.fn().mockReturnValue({ list, cancel });
+    const deleteSession = jest.fn().mockResolvedValue(undefined);
+
+    const notifier = new EigenFluxNotifier(
+      createApi({
+        runtime: {
+          subagent: { run, waitForRun, deleteSession },
+          tasks: { runs: { bindSession } },
+        } as unknown as OpenClawPluginApi['runtime'],
+      }),
+      createLogger(),
+      createConfig()
+    );
+
+    const delivery = notifier.deliver('[EIGENFLUX_MSG_PAYLOAD] active', {
+      targetSessionKey: 'eigenflux:pm:server:conversation',
+    });
+    for (let index = 0; index < 20 && run.mock.calls.length === 0; index += 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    expect(run).toHaveBeenCalledTimes(1);
+    await notifier.stop();
+
+    const isolatedKey = run.mock.calls[0][0].sessionKey;
+    expect(cancel).toHaveBeenCalledWith({ taskId: 'task-active', cfg: expect.anything() });
+    expect(deleteSession).toHaveBeenCalledWith({
+      sessionKey: isolatedKey,
+      deleteTranscript: true,
+    });
+    resolveWait({ status: 'error', error: 'cancelled' });
+    await expect(delivery).resolves.toBe(false);
+    await expect(notifier.deliver('after stop')).resolves.toBe(false);
   });
 
   test('starts the execution timeout only after a queued run actually starts', async () => {
@@ -466,6 +515,7 @@ describe('EigenFluxNotifier', () => {
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
+      lightContext: true,
     });
 
     fs.rmSync(stateDir, { recursive: true, force: true });
@@ -780,12 +830,12 @@ describe('EigenFluxNotifier', () => {
 
     // sessionKey should start with the prefix but have a random suffix
     const callArgs = run.mock.calls[0]?.[0];
-    expect(callArgs.sessionKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(callArgs.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(callArgs.message).toBe('[EIGENFLUX_FEED_PAYLOAD] test');
     expect(callArgs.deliver).toBe(true);
   });
 
-  test('uses a stable persistent PM session and conversation-specific lane without cleanup', async () => {
+  test('converts a legacy persistent PM key into a disposable isolated session', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-pm' });
     const deleteSession = jest.fn().mockResolvedValue(undefined);
 
@@ -807,13 +857,21 @@ describe('EigenFluxNotifier', () => {
     ).resolves.toBe(true);
 
     expect(run).toHaveBeenCalledWith({
-      sessionKey: 'eigenflux:pm:server:conversation',
+      sessionKey: expect.stringMatching(
+        /^agent:main:eigenflux:pm:server:conversation:\d+-[a-f0-9]{8}$/
+      ),
       message: '[EIGENFLUX_MSG_PAYLOAD] test',
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-pm:server:conversation',
+      lightContext: true,
     });
-    expect(deleteSession).not.toHaveBeenCalled();
+    expect(deleteSession).toHaveBeenCalledWith({
+      sessionKey: expect.stringMatching(
+        /^agent:main:eigenflux:pm:server:conversation:\d+-[a-f0-9]{8}$/
+      ),
+      deleteTranscript: true,
+    });
     expect(writeStoredNotificationRouteMock).not.toHaveBeenCalled();
   });
 
@@ -837,7 +895,7 @@ describe('EigenFluxNotifier', () => {
 
     expect(deleteSession).toHaveBeenCalledTimes(1);
     const deletedKey = deleteSession.mock.calls[0]?.[0]?.sessionKey;
-    expect(deletedKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(deletedKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(deleteSession.mock.calls[0]?.[0]?.deleteTranscript).toBe(true);
   });
 
@@ -964,9 +1022,8 @@ describe('EigenFluxNotifier', () => {
       const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
       // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
       const callOrder: string[] = [];
-      const patchSessionEntry = jest.fn(async (_params: any) => {
+      const upsertSessionEntry = jest.fn(async (_params: any) => {
         callOrder.push('seed');
-        return null;
       });
       const resolveStorePath = jest.fn(() => '/tmp/sessions/main.json');
 
@@ -980,7 +1037,7 @@ describe('EigenFluxNotifier', () => {
           config: { session: { store: 'sessions' } } as any,
           runtime: {
             subagent: { run },
-            agent: { session: { resolveStorePath, patchSessionEntry } },
+            agent: { session: { resolveStorePath, upsertSessionEntry } },
           } as unknown as OpenClawPluginApi['runtime'],
         }),
         createLogger(),
@@ -992,17 +1049,16 @@ describe('EigenFluxNotifier', () => {
       ).resolves.toBe(true);
 
       expect(resolveStorePath).toHaveBeenCalledWith('sessions', { agentId: 'main' });
-      expect(patchSessionEntry).toHaveBeenCalledTimes(1);
+      expect(upsertSessionEntry).toHaveBeenCalledTimes(1);
 
-      // Row-scoped patch targets the one-shot key and merges deliveryContext (+ last* mirror).
-      const params = patchSessionEntry.mock.calls[0][0];
+      // Row-scoped upsert creates the one-shot row before the run.
+      const params = upsertSessionEntry.mock.calls[0][0];
       const sessionKey = run.mock.calls[0][0].sessionKey;
-      expect(sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
+      expect(sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:/);
       expect(params.sessionKey).toBe(sessionKey);
       expect(params.agentId).toBe('main');
       expect(params.storePath).toBe('/tmp/sessions/main.json');
-      const patch = params.update({}, { existingEntry: undefined });
-      expect(patch).toMatchObject({
+      expect(params.entry).toMatchObject({
         deliveryContext: { channel: 'feishu', to: 'user:ou_123', accountId: 'default' },
         lastChannel: 'feishu',
         lastTo: 'user:ou_123',
