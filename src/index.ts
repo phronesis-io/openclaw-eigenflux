@@ -252,11 +252,11 @@ function registerPlugin(api: OpenClawPluginApi): void {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
         runtime.feedPushScheduler.stop();
-        await runtime.waitForPendingDelivery();
-        await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
         runtime.profileRefresher.stop();
         runtime.flushLoop.stop();
+        await runtime.notifier.stop();
+        await runtime.waitForPendingDelivery();
       }
       runtimes = [];
       notInstalledPromptDelivered = false;
@@ -573,20 +573,16 @@ function createServerRuntime(
     logger,
   });
 
-  // Backpressure state for the LEGACY one-shot feed path only
-  // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
-  // before touching any of these — they stay at their initial values there, so
-  // never read them outside the oneshot branch. Guard: notifier.deliver() may
-  // take longer than the poll interval, so we skip overlapping deliveries to
-  // avoid duplicate agent tasks.
+  // Backpressure state for isolated feed deliveries. Every feed run gets a
+  // disposable light-context session; no background task may resume or append
+  // to the user's main conversation.
   let feedDeliveryInFlight = false;
   let feedDeliveryStartedAt = 0;
   let feedDeliverySkipCount = 0;
   let activeFeedDelivery: Promise<boolean> | null = null;
   const FEED_DELIVERY_TIMEOUT_MS = 300_000;
 
-  /** Overlap-guarded notifier.deliver() — shared by the default main-session
-   *  push (via the scheduler) and the legacy one-shot path. */
+  /** Overlap-guarded notifier.deliver() for disposable feed sessions. */
   async function runGuardedFeedDelivery(
     prompt: string,
     options?: { targetSessionKey?: string },
@@ -632,13 +628,13 @@ function createServerRuntime(
     await activeFeedDelivery;
   }
 
-  // Busy-aware push for the default mode: pick a quiet moment on the main
-  // session instead of grabbing its lock while the user is mid-conversation.
-  // See FeedPushScheduler for the full policy.
+  // Busy-aware push for the default mode. The scheduler still avoids noisy
+  // delivery while the user is active, but the actual run is isolated.
   const feedPushScheduler = new FeedPushScheduler({
     isBusy: async () =>
       feedDeliveryInFlight || notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS),
-    pushNow: (prompt) => runGuardedFeedDelivery(prompt),
+    pushNow: (prompt) =>
+      runGuardedFeedDelivery(prompt, { targetSessionKey: buildFeedSessionKey(server.name) }),
     logger,
     serverName: server.name,
   });
@@ -659,40 +655,29 @@ function createServerRuntime(
       // The CLI caches every feed response itself, so `feed event record` reads
       // item_ids straight from that cache — the plugin no longer mirrors them.
 
-      // Delivery modes (EIGENFLUX_FEED_DELIVERY):
-      //
-      // (default)      — the original pre-oneshot path: notifier.deliver() runs
-      //                  the agent ON the user's real main session via
-      //                  runtime.subagent (deliver:true). The PLUGIN initiates
-      //                  the run, so feed is an ACTIVE push with full user
-      //                  context and no dependency on the host heartbeat
-      //                  scheduler (which has been observed to stall for hours).
-      // 'system-event' — mode 2a: enqueue into the main session + heartbeat
-      //                  wake. Fully non-blocking, but delivery timing depends
-      //                  on the host heartbeat actually firing; until that is
-      //                  reliable this mode is opt-in only.
-      // 'oneshot'      — legacy isolated one-shot session (no user context).
+      // All delivery modes use disposable light-context sessions. The old
+      // system-event mode is intentionally redirected so an existing setting
+      // cannot inject feed work into, or recover, the main conversation.
       const feedDeliveryMode = process.env.EIGENFLUX_FEED_DELIVERY;
       if (feedDeliveryMode === 'system-event') {
-        // Nothing worth surfacing → don't wake the heartbeat at all.
         if (items.length === 0 && notifications.length === 0) {
           return;
         }
-        // Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so
-        // the poll loop needs no backpressure guard and never stalls on delivery.
-        void notifier
-          .deliverToMainSession(buildFeedPayloadPromptTemplate(payload, getPromptContext()))
-          .catch((err) =>
-            logger.error(`Feed main-session delivery error for server=${server.name}: ${String(err)}`)
-          );
+        logger.warn(
+          'EIGENFLUX_FEED_DELIVERY=system-event is deprecated; using an isolated light-context session'
+        );
+        await runGuardedFeedDelivery(
+          buildFeedPayloadPromptTemplate(payload, getPromptContext()),
+          { targetSessionKey: buildFeedSessionKey(server.name) },
+          { items: items.length, notifications: notifications.length }
+        );
         return;
       }
 
       const prompt = buildFeedPayloadPromptTemplate(payload, getPromptContext());
 
       if (feedDeliveryMode === 'oneshot') {
-        // Legacy isolated path: unchanged semantics (immediate, awaited,
-        // overlap-guarded with skip logging).
+        // Immediate isolated delivery, overlap-guarded with skip logging.
         await runGuardedFeedDelivery(
           prompt,
           { targetSessionKey: buildFeedSessionKey(server.name) },
@@ -701,9 +686,7 @@ function createServerRuntime(
         return;
       }
 
-      // Default: busy-aware active push. Hold the payload while the user's
-      // conversation is active and deliver at the next quiet moment; a newer
-      // poll's payload supersedes the held one (latest batch wins).
+      // Default: busy-aware isolated push. A newer poll supersedes a held one.
       feedPushScheduler.schedule(prompt);
     },
     onPollSuccess: async () => {
@@ -740,7 +723,7 @@ function createServerRuntime(
             notifier.deliver(
               buildPmStreamEventPromptTemplate(conversationEvent, getPromptContext()),
               {
-                persistentSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey),
+                targetSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey),
                 lane: buildPmLane(server.name, peerKey, conversationKey),
               }
             )

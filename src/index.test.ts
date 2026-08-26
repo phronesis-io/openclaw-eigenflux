@@ -503,6 +503,7 @@ describe('register unit', () => {
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
+      lightContext: true,
     });
 
     await services[0].stop();

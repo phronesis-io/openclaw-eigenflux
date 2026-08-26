@@ -133,8 +133,7 @@ describe('register integration', () => {
       { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
     ] });
 
-    // These integration tests assert the legacy one-shot subagent feed path;
-    // opt into it explicitly (default is now main-session 2a).
+    // Exercise the immediate isolated feed path by default in this suite.
     process.env.EIGENFLUX_FEED_DELIVERY = 'oneshot';
   });
 
@@ -170,11 +169,14 @@ describe('register integration', () => {
     await waitFor(() => subagentRun.mock.calls.length === 1);
 
     expect(subagentRun).toHaveBeenCalledWith({
-      sessionKey: expect.stringMatching(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/),
+      sessionKey: expect.stringMatching(
+        /^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/
+      ),
       message: expect.stringContaining('[EIGENFLUX_FEED_PAYLOAD]'),
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
+      lightContext: true,
     });
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(message).toContain('"item_id": "501"');
@@ -189,8 +191,8 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('default mode: active push — runs the subagent on the main session, not a one-shot key', async () => {
-    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = classic main-session push
+  test('default mode: active push uses a disposable light-context session', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
     jest.resetModules();
     const { default: plugin } = await import('./index');
     const services: any[] = [];
@@ -215,19 +217,18 @@ describe('register integration', () => {
     await services[0].start();
     await waitFor(() => subagentRun.mock.calls.length === 1);
 
-    // The plugin itself initiates the run (active push) on a persistent main
-    // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
     const params = subagentRun.mock.calls[0][0];
     expect(params.deliver).toBe(true);
     expect(params.lane).toBe('eigenflux-bg');
-    expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
+    expect(params.lightContext).toBe(true);
+    expect(params.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
 
     await services[0].stop();
   });
 
-  test('mode 2a (opt-in): injects feed into the main session via system event + heartbeat (no subagent)', async () => {
+  test('legacy system-event setting is redirected to an isolated light-context session', async () => {
     process.env.EIGENFLUX_FEED_DELIVERY = 'system-event';
     jest.resetModules();
     const { default: plugin } = await import('./index');
@@ -251,23 +252,21 @@ describe('register integration', () => {
     } as any);
 
     await services[0].start();
-    await waitFor(() => enqueueSystemEvent.mock.calls.length === 1);
+    await waitFor(() => subagentRun.mock.calls.length === 1);
 
-    const [message, opts] = enqueueSystemEvent.mock.calls[0];
-    expect(String(message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
-    expect(String(message)).toContain('OUTPUT CONTRACT');
-    expect(String(message)).toContain('"item_id": "501"');
-    // Injected into a persistent main session, NOT a throwaway one-shot key.
-    expect(opts.sessionKey).toEqual(expect.any(String));
-    expect(opts.sessionKey).not.toMatch(/^eigenflux:feed:/);
-    expect(requestHeartbeatNow).toHaveBeenCalled();
-    // The feed must NOT go through the deliver:true subagent path in 2a.
-    expect(subagentRun).not.toHaveBeenCalled();
+    const params = subagentRun.mock.calls[0][0];
+    expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
+    expect(String(params.message)).toContain('OUTPUT CONTRACT');
+    expect(String(params.message)).toContain('"item_id": "501"');
+    expect(params.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(params.lightContext).toBe(true);
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(requestHeartbeatNow).not.toHaveBeenCalled();
 
     await services[0].stop();
   });
 
-  test('routes PMs to a stable session and lane derived from peer + conv_id, outside main', async () => {
+  test('routes PMs to a disposable light-context session and stable lane outside main', async () => {
     feedItems = [];
     jest.resetModules();
     const { default: plugin } = await import('./index');
@@ -301,12 +300,15 @@ describe('register integration', () => {
 
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const params = subagentRun.mock.calls[0][0];
-    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.sessionKey).toMatch(
+      /^agent:main:eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}:\d+-[a-f0-9]{8}$/
+    );
     expect(params.sessionKey).not.toBe('agent:main:main');
     expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.lightContext).toBe(true);
     expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
     expect(params.message).toContain('eigenflux msg history --conv-id <conv_id> --limit 20');
-    expect(params.message).toContain('stable isolated session');
+    expect(params.message).toContain('disposable light-context session');
 
     await services[0].stop();
   });
@@ -383,7 +385,9 @@ describe('register integration', () => {
 
     // Feed should be delivered to eigenflux:feed:eigenflux, not main
     const feedCall = subagentRun.mock.calls[0]?.[0];
-    expect(feedCall.sessionKey).toMatch(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
+    expect(feedCall.sessionKey).toMatch(
+      /^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/
+    );
     expect(feedCall.message).toContain('[EIGENFLUX_FEED_PAYLOAD]');
 
     await services[0].stop();
