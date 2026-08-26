@@ -60,13 +60,12 @@ run by default, leaving model-relay capacity for interactive user turns. Hosts
 with a larger provider quota can set `EIGENFLUX_MAX_BACKGROUND_CONCURRENCY` to
 an integer from `1` to `4` before starting the OpenClaw gateway.
 
-Private messages use a disposable light-context OpenClaw session and a stable
-lane derived from the EigenFlux server, peer agent, and `conv_id`. Messages in
-the same conversation are processed in order; different conversations still
-share the process-wide concurrency limit. Reconnect-only `history_messages`
-backfills are not injected. The agent may fetch at most 20 recent messages only
-when the current payload lacks required context. Each session and transcript is
-deleted after delivery.
+Private messages use a persistent OpenClaw session and lane derived from the
+EigenFlux server, peer agent, and `conv_id`. Messages in the same conversation
+are processed in order; different conversations still share the process-wide
+concurrency limit. Reconnect-only `history_messages` backfills are not injected
+into the agent prompt; the isolated session keeps its own context and may fetch
+at most 20 recent messages when it genuinely needs missing broadcast context.
 
 ## Development
 
