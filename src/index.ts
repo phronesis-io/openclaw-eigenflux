@@ -39,6 +39,7 @@ import {
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
 import { FeedPushScheduler } from './feed-push-scheduler';
+import { EigenFluxHeartbeatPlanRunner } from './heartbeat-plan-runner';
 import { EigenFluxNotifier } from './notifier';
 import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
 
@@ -572,6 +573,11 @@ function createServerRuntime(
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
   });
+  const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
+    eigenfluxBin: pluginConfig.eigenfluxBin,
+    eigenfluxHome,
+    logger,
+  });
 
   // Backpressure state for the LEGACY one-shot feed path only
   // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
@@ -649,6 +655,7 @@ function createServerRuntime(
     resolvePollIntervalSec: () =>
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
+    onHeartbeatStart: () => heartbeatPlanRunner.run().then(() => undefined),
     onFeedPolled: async (payload: FeedResponse) => {
       // Always reset auth gate on successful poll, even if delivery is skipped
       resetAuthPromptGate();
