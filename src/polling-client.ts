@@ -116,6 +116,8 @@ export interface PollingClientConfig {
   logger: Logger;
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
+  /** Runs the current thin Heartbeat contract before the feed poll. */
+  onHeartbeatStart?: () => Promise<void>;
   /**
    * Optional hook invoked once per successful poll (heartbeat), regardless of
    * whether the feed contained any items/notifications. Used for side-channel
@@ -237,6 +239,16 @@ export class EigenFluxPollingClient {
       const notifyAuthRequired = options.notifyAuthRequired ?? true;
 
       try {
+        if (this.config.onHeartbeatStart) {
+          try {
+            await this.config.onHeartbeatStart();
+          } catch (hookError) {
+            this.config.logger.warn(
+              `onHeartbeatStart hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
+            );
+          }
+        }
+
         this.config.logger.info(`Polling feed via CLI for server=${this.config.serverName}`);
 
         const result = await execEigenflux<FeedResponseData>(

@@ -114,6 +114,57 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
+  test('runs the Heartbeat plan hook before polling the feed', async () => {
+    const onHeartbeatStart = jest.fn().mockResolvedValue(undefined);
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: { items: [], has_more: false, notifications: [] },
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60),
+      logger: createLogger(),
+      onHeartbeatStart,
+      onFeedPolled: jest.fn().mockResolvedValue(undefined),
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(client.pollOnce()).resolves.toEqual(
+      expect.objectContaining({ kind: 'success' })
+    );
+    expect(onHeartbeatStart).toHaveBeenCalledTimes(1);
+    expect(onHeartbeatStart.mock.invocationCallOrder[0]).toBeLessThan(
+      execEigenfluxMock.mock.invocationCallOrder[0]
+    );
+  });
+
+  test('continues polling when the Heartbeat plan hook fails', async () => {
+    const loggerSpies = createLoggerSpies();
+    execEigenfluxMock.mockResolvedValue({
+      kind: 'success',
+      data: { items: [], has_more: false, notifications: [] },
+    } as CliResult<any>);
+
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux',
+      eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60),
+      logger: createLogger(loggerSpies),
+      onHeartbeatStart: jest.fn().mockRejectedValue(new Error('plan unavailable')),
+      onFeedPolled: jest.fn().mockResolvedValue(undefined),
+      onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    });
+
+    await expect(client.pollOnce()).resolves.toEqual(
+      expect.objectContaining({ kind: 'success' })
+    );
+    expect(loggerSpies.warn).toHaveBeenCalledWith(
+      expect.stringContaining('onHeartbeatStart hook failed')
+    );
+  });
+
   test('emits auth-required callback when CLI returns auth_required', async () => {
     const onFeedPolled = jest.fn().mockResolvedValue(undefined);
     const onAuthRequired = jest.fn().mockResolvedValue(undefined);
