@@ -24,7 +24,7 @@ import {
   resolveEigenfluxHome,
   discoverServers,
   getInstalledCliVersion,
-  isCliOutdated,
+  isCliCompatible,
   type ResolvedEigenFluxPluginConfig,
   type RoutingConfig,
   type DiscoveredServer,
@@ -159,7 +159,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
   const pluginConfig = resolvePluginConfig(api.pluginConfig, logger);
   const eigenfluxHome = resolveEigenfluxHome(api.rootDir);
   logger.info(
-    `EigenFlux home resolved: path=${eigenfluxHome}, source=${process.env.EIGENFLUX_HOME ? 'EIGENFLUX_HOME env' : api.rootDir ? 'api.rootDir' : 'os.homedir()'}, rootDir=${api.rootDir ?? 'undefined'}, homedir=${os.homedir()}`
+    `EigenFlux home resolved: path=${eigenfluxHome}, source=${process.env.EIGENFLUX_HOME ? 'EIGENFLUX_HOME env' : 'OpenClaw default'}, rootDir=${api.rootDir ?? 'undefined'}, homedir=${os.homedir()}`
   );
   // Set once at startup so all CLI child processes inherit it automatically.
   process.env.EIGENFLUX_HOME = eigenfluxHome;
@@ -185,6 +185,25 @@ function registerPlugin(api: OpenClawPluginApi): void {
         if (!notInstalledPromptDelivered) {
           notInstalledPromptDelivered = true;
           await deliverNotInstalledPrompt(api, logger, pluginConfig, eigenfluxHome, discovery.bin, store);
+        }
+        return;
+      }
+
+      const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
+      if (!isCliCompatible(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
+        logger.warn(
+          `EigenFlux CLI incompatible (installed=${installedVersion ?? 'unknown'}, required>=${PLUGIN_CONFIG.EXPECTED_CLI_VERSION}); background workflows are blocked`
+        );
+        if (!outdatedPromptDelivered) {
+          outdatedPromptDelivered = true;
+          await deliverOutdatedPrompt(
+            api,
+            logger,
+            pluginConfig,
+            installedVersion ?? 'unknown',
+            PLUGIN_CONFIG.EXPECTED_CLI_VERSION,
+            store
+          );
         }
         return;
       }
@@ -226,26 +245,6 @@ function registerPlugin(api: OpenClawPluginApi): void {
         runtime.flushLoop.start();
       }
 
-      // CLI is installed and running; if it's older than this plugin expects,
-      // nudge the agent to update it (informational — services keep running on
-      // the current version; the agent performs the update at runtime).
-      if (!outdatedPromptDelivered) {
-        const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
-        if (isCliOutdated(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
-          outdatedPromptDelivered = true;
-          logger.warn(
-            `EigenFlux CLI outdated (installed=${installedVersion}, expected>=${PLUGIN_CONFIG.EXPECTED_CLI_VERSION}); delivering upgrade prompt`
-          );
-          await deliverOutdatedPrompt(
-            api,
-            logger,
-            pluginConfig,
-            installedVersion as string,
-            PLUGIN_CONFIG.EXPECTED_CLI_VERSION,
-            store
-          );
-        }
-      }
     },
     stop: async () => {
       logger.info('Stopping EigenFlux discovery service...');
@@ -911,6 +910,16 @@ function registerCommand(
       if (parsed.command === 'version') {
         return {
           text: await buildVersionText(pluginConfig.eigenfluxBin),
+        };
+      }
+
+      const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
+      if (!isCliCompatible(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
+        return {
+          text: [
+            `EigenFlux CLI ${PLUGIN_CONFIG.EXPECTED_CLI_VERSION} or newer is required before Feed, Context, or Stream can continue`,
+            `(detected ${installedVersion ?? 'unknown'}). Upgrade with: ${INSTALL_COMMAND}`,
+          ].join(' '),
         };
       }
 

@@ -23,6 +23,7 @@ jest.mock('openclaw/plugin-sdk/plugin-entry', () => ({
 // Mock discoverServers and resolveEigenfluxHome
 const discoverServersMock = jest.fn();
 const resolveEigenfluxHomeMock = jest.fn();
+const getInstalledCliVersionMock = jest.fn();
 
 jest.mock('./config', () => {
   const actual = jest.requireActual('./config');
@@ -30,6 +31,7 @@ jest.mock('./config', () => {
     ...actual,
     discoverServers: (...args: any[]) => discoverServersMock(...args),
     resolveEigenfluxHome: () => resolveEigenfluxHomeMock(),
+    getInstalledCliVersion: (...args: any[]) => getInstalledCliVersionMock(...args),
   };
 });
 
@@ -92,6 +94,7 @@ describe('register integration', () => {
     eigenfluxHome = path.join(homeDir, '.eigenflux');
     __testHomeDir = homeDir;
     resolveEigenfluxHomeMock.mockReturnValue(eigenfluxHome);
+    getInstalledCliVersionMock.mockResolvedValue('0.0.35');
 
     // Create server credentials
     const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');

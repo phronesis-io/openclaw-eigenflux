@@ -12,7 +12,6 @@ const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 const BACKOFF_MULTIPLIER = 2;
 const STOP_GRACE_MS = 5_000;
-const MAX_CONSECUTIVE_FAILURES = 20;
 
 export interface PmStreamEvent {
   type: string;
@@ -235,14 +234,6 @@ export class EigenFluxStreamClient {
     }
 
     this.consecutiveFailures += 1;
-
-    if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      this.config.logger.error(
-        `Stream client giving up after ${MAX_CONSECUTIVE_FAILURES} consecutive failures for server=${this.config.serverName}`
-      );
-      this.running = false;
-      return;
-    }
 
     this.config.logger.info(
       `Stream reconnecting in ${this.backoffMs}ms (failure #${this.consecutiveFailures}) for server=${this.config.serverName}`

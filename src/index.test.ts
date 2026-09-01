@@ -23,6 +23,7 @@ jest.mock('openclaw/plugin-sdk/plugin-entry', () => ({
 // Mock discoverServers and resolveEigenfluxHome from config
 const discoverServersMock = jest.fn();
 const resolveEigenfluxHomeMock = jest.fn();
+const getInstalledCliVersionMock = jest.fn();
 
 jest.mock('./config', () => {
   const actual = jest.requireActual('./config');
@@ -30,6 +31,7 @@ jest.mock('./config', () => {
     ...actual,
     discoverServers: (...args: any[]) => discoverServersMock(...args),
     resolveEigenfluxHome: () => resolveEigenfluxHomeMock(),
+    getInstalledCliVersion: (...args: any[]) => getInstalledCliVersionMock(...args),
   };
 });
 
@@ -106,6 +108,7 @@ describe('register unit', () => {
     fs.mkdirSync(eigenfluxHome, { recursive: true });
     __testHomeDir = homeDir;
     resolveEigenfluxHomeMock.mockReturnValue(eigenfluxHome);
+    getInstalledCliVersionMock.mockResolvedValue('0.0.35');
 
     // Reset captured callbacks
     capturedPollOnFeedPolled = null;
@@ -127,6 +130,41 @@ describe('register unit', () => {
     __testHomeDir = undefined;
     delete process.env.EIGENFLUX_FEED_DELIVERY;
     fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  test('blocks background workflows on CLI 0.0.34 and requires 0.0.35', async () => {
+    getInstalledCliVersionMock.mockResolvedValue('0.0.34');
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const commands: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-upgrade' });
+    plugin.register({
+      registrationMode: 'full',
+      config: {},
+      pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: createLogger(),
+      registerService: (service: any) => services.push(service),
+      registerCommand: (command: any) => commands.push(command),
+      registerHook: jest.fn(),
+      on: jest.fn(),
+    } as any);
+
+    await services[0].start();
+
+    expect(pollingClientStartMock).not.toHaveBeenCalled();
+    expect(streamClientStartMock).not.toHaveBeenCalled();
+    expect(subagentRun).toHaveBeenCalledWith(expect.objectContaining({
+      message: expect.stringContaining('[EIGENFLUX_CLI_OUTDATED]'),
+    }));
+    expect(String(subagentRun.mock.calls[0]?.[0]?.message)).toContain('0.0.35');
+    const feedResult = await commands[0].handler({ args: 'feed' });
+    expect(feedResult.text).toContain('0.0.35 or newer is required');
+    expect(pollingClientPollOnceMock).not.toHaveBeenCalled();
   });
 
   test('sends auth prompt through runtime.subagent when service starts without token', async () => {

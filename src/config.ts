@@ -13,12 +13,10 @@ import { Logger } from './logger';
 import { normalizeReplyTarget } from './reply-target';
 import { execEigenflux } from './cli-executor';
 
-const PLUGIN_VERSION = '0.0.34';
-// Minimum eigenflux CLI version this plugin build expects. When the installed
-// CLI is older, the discovery service nudges the agent to update it (the agent
-// updates the CLI at runtime; nothing is auto-run at install time). Bump this
-// when the plugin starts relying on newer CLI behavior.
-const EXPECTED_CLI_VERSION = '0.0.34';
+const PLUGIN_VERSION = '0.0.35';
+// Hard minimum: 0.0.35 adopts the authoritative Agent ID returned after an
+// identity-recovery refresh. Older CLIs must not start background workflows.
+const EXPECTED_CLI_VERSION = '0.0.35';
 const DEFAULT_EIGENFLUX_BIN = 'eigenflux';
 const DEFAULT_SESSION_KEY = 'main';
 const DEFAULT_AGENT_ID = 'main';
@@ -226,7 +224,7 @@ export async function getInstalledCliVersion(
 export function isCliOutdated(installed: string | null, target: string): boolean {
   if (!installed) return false;
   const parse = (v: string): number[] =>
-    v.split('.').slice(0, 3).map((part) => parseInt(part, 10));
+    v.replace(/^v/u, '').split('.').slice(0, 3).map((part) => parseInt(part, 10));
   const a = parse(installed);
   const b = parse(target);
   for (let i = 0; i < 3; i++) {
@@ -238,21 +236,19 @@ export function isCliOutdated(installed: string | null, target: string): boolean
   return false;
 }
 
+export function isCliCompatible(installed: string | null, minimum: string): boolean {
+  return installed !== null && !isCliOutdated(installed, minimum) && /^v?\d+\.\d+\.\d+(?:[-+].*)?$/u.test(installed);
+}
+
 // ─── EigenFlux Home ─────────────────────────────────────────────────────────
 
-export function resolveEigenfluxHome(baseDir?: string): string {
+export function resolveEigenfluxHome(_baseDir?: string): string {
   const envHome = process.env.EIGENFLUX_HOME;
   if (envHome) {
     const expanded = expandHomeDir(envHome);
-    if (!expanded.endsWith('.eigenflux')) {
-      return path.join(expanded, '.eigenflux');
-    }
-    return expanded;
+    return expanded.endsWith('.eigenflux') ? expanded : path.join(expanded, '.eigenflux');
   }
-  if (baseDir) {
-    return path.join(baseDir, '.eigenflux');
-  }
-  return path.join(os.homedir(), '.eigenflux');
+  return path.join(os.homedir(), '.openclaw', '.eigenflux');
 }
 
 // ─── Config Resolution ──────────────────────────────────────────────────────

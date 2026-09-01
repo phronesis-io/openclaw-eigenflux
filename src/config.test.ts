@@ -12,6 +12,7 @@ import {
   discoverServers,
   getInstalledCliVersion,
   isCliOutdated,
+  isCliCompatible,
 } from './config';
 
 const packageManifest = require('../package.json') as { version: string };
@@ -104,14 +105,14 @@ describe('resolveEigenfluxHome', () => {
     }
   });
 
-  test('defaults to ~/.eigenflux when EIGENFLUX_HOME is not set', () => {
+  test('defaults to OpenClaw isolated home when EIGENFLUX_HOME is not set', () => {
     delete process.env.EIGENFLUX_HOME;
 
     const home = resolveEigenfluxHome();
-    expect(home).toBe(`${os.homedir()}/.eigenflux`);
+    expect(home).toBe(`${os.homedir()}/.openclaw/.eigenflux`);
   });
 
-  test('uses EIGENFLUX_HOME env var with .eigenflux suffix appended', () => {
+  test('uses EIGENFLUX_HOME with the CLI home suffix convention', () => {
     process.env.EIGENFLUX_HOME = '/custom/path';
 
     const home = resolveEigenfluxHome();
@@ -125,11 +126,11 @@ describe('resolveEigenfluxHome', () => {
     expect(home).toBe('/custom/path/.eigenflux');
   });
 
-  test('uses baseDir when EIGENFLUX_HOME is not set', () => {
+  test('does not mistake the plugin installation directory for Agent Home', () => {
     delete process.env.EIGENFLUX_HOME;
 
     const home = resolveEigenfluxHome('/opt/openclaw/plugins/eigenflux');
-    expect(home).toBe('/opt/openclaw/plugins/eigenflux/.eigenflux');
+    expect(home).toBe(`${os.homedir()}/.openclaw/.eigenflux`);
   });
 
   test('EIGENFLUX_HOME takes precedence over baseDir', () => {
@@ -214,6 +215,18 @@ describe('isCliOutdated', () => {
   test('tolerates suffixes on the patch segment', () => {
     expect(isCliOutdated('0.0.12-rc1', '0.0.13')).toBe(true);
     expect(isCliOutdated('0.0.13+abc', '0.0.13')).toBe(false);
+  });
+});
+
+describe('isCliCompatible', () => {
+  test('hard-blocks 0.0.34 and accepts 0.0.35', () => {
+    expect(isCliCompatible('0.0.34', '0.0.35')).toBe(false);
+    expect(isCliCompatible('0.0.35', '0.0.35')).toBe(true);
+  });
+
+  test('fails closed when the installed version is unknown', () => {
+    expect(isCliCompatible(null, '0.0.35')).toBe(false);
+    expect(isCliCompatible('garbage', '0.0.35')).toBe(false);
   });
 });
 
