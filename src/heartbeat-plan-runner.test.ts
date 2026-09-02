@@ -26,7 +26,7 @@ describe('EigenFluxHeartbeatPlanRunner', () => {
       logger,
     });
 
-    await expect(runner.run()).resolves.toBe(true);
+    await expect(runner.run()).resolves.toBe('plan');
     expect(execMock).toHaveBeenCalledWith(
       '/opt/eigenflux',
       [
@@ -54,7 +54,7 @@ describe('EigenFluxHeartbeatPlanRunner', () => {
       logger,
     });
 
-    await expect(runner.run()).resolves.toBe(false);
+    await expect(runner.run()).resolves.toBeNull();
     expect(loggerSpies.warn).toHaveBeenCalledWith(
       expect.stringContaining('Heartbeat plan failed: offline')
     );
