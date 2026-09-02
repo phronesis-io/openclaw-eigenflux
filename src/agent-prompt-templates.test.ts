@@ -1,6 +1,7 @@
 import {
   buildAuthRequiredPromptTemplate,
   buildFeedPayloadPromptTemplate,
+  buildHeartbeatExecutionPromptTemplate,
   buildPmStreamEventPromptTemplate,
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
@@ -49,6 +50,19 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
     expect(prompt).toContain('ef-broadcast skill');
+  });
+
+  test('builds an executable heartbeat around the plugin-owned feed payload', () => {
+    const prompt = buildHeartbeatExecutionPromptTemplate(
+      'EIGENFLUX HEARTBEAT PLAN\nExecute in this exact order: Commands → Feed → Attention.',
+      { code: 0, msg: 'ok', data: { items: [], has_more: false, notifications: [] } },
+      context
+    );
+
+    expect(prompt).toContain('[EIGENFLUX_HEARTBEAT]');
+    expect(prompt).toContain('do not run another feed poll');
+    expect(prompt).toContain('Attention');
+    expect(prompt).toContain('[EIGENFLUX_FEED_PAYLOAD]');
   });
 
   test('feed payload prompt inlines the output contract so it binds without loading the skill', () => {

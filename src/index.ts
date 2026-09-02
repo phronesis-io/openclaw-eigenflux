@@ -33,6 +33,7 @@ import { findSessionRouteForBinding } from './notification-route-resolver';
 import {
   buildAuthRequiredPromptTemplate,
   buildFeedPayloadPromptTemplate,
+  buildHeartbeatExecutionPromptTemplate,
   buildNotInstalledPromptTemplate,
   buildOutdatedPromptTemplate,
   buildPmStreamEventPromptTemplate,
@@ -578,6 +579,11 @@ function createServerRuntime(
     eigenfluxHome,
     logger,
   });
+  // A successful plan is Agent work, not merely a plugin health check. Keep
+  // the plan for exactly the poll that produced it; pollOnce is single-flight.
+  let currentHeartbeatPlan: string | null = null;
+  let lastHeartbeatExecutionAt = 0;
+  const IDLE_HEARTBEAT_EXECUTION_INTERVAL_MS = 60 * 60 * 1000;
 
   // Backpressure state for the LEGACY one-shot feed path only
   // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
@@ -649,13 +655,53 @@ function createServerRuntime(
     serverName: server.name,
   });
 
+  const scheduleHeartbeatExecution = async (payload: FeedResponse): Promise<void> => {
+    const now = Date.now();
+    const hasPayload =
+      (payload.data?.items?.length ?? 0) > 0 ||
+      (payload.data?.notifications?.length ?? 0) > 0;
+    if (!hasPayload && now - lastHeartbeatExecutionAt < IDLE_HEARTBEAT_EXECUTION_INTERVAL_MS) {
+      return;
+    }
+
+    const plan = currentHeartbeatPlan;
+    if (!plan) {
+      logger.warn(`Skipping Agent heartbeat for server=${server.name}: verified plan unavailable`);
+      return;
+    }
+
+    lastHeartbeatExecutionAt = now;
+    const prompt = buildHeartbeatExecutionPromptTemplate(plan, payload, getPromptContext());
+    switch (process.env.EIGENFLUX_FEED_DELIVERY) {
+      case 'system-event':
+        void notifier.deliverToMainSession(prompt).catch((err) =>
+          logger.error(`Heartbeat main-session delivery error for server=${server.name}: ${String(err)}`)
+        );
+        return;
+      case 'oneshot':
+        await runGuardedFeedDelivery(
+          prompt,
+          { targetSessionKey: buildFeedSessionKey(server.name) },
+          {
+            items: payload.data?.items?.length ?? 0,
+            notifications: payload.data?.notifications?.length ?? 0,
+          }
+        );
+        return;
+      default:
+        feedPushScheduler.schedule(prompt);
+    }
+  };
+
   const feedPoller = new EigenFluxPollingClient({
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     resolvePollIntervalSec: () =>
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
-    onHeartbeatStart: () => heartbeatPlanRunner.run().then(() => undefined),
+    onHeartbeatStart: async () => {
+      currentHeartbeatPlan = await heartbeatPlanRunner.run();
+    },
     onFeedPolled: async (payload: FeedResponse) => {
       // Always reset auth gate on successful poll, even if delivery is skipped
       resetAuthPromptGate();
@@ -679,6 +725,11 @@ function createServerRuntime(
       //                  on the host heartbeat actually firing; until that is
       //                  reliable this mode is opt-in only.
       // 'oneshot'      — legacy isolated one-shot session (no user context).
+      if (currentHeartbeatPlan) {
+        await scheduleHeartbeatExecution(payload);
+        return;
+      }
+
       const feedDeliveryMode = process.env.EIGENFLUX_FEED_DELIVERY;
       if (feedDeliveryMode === 'system-event') {
         // Nothing worth surfacing → don't wake the heartbeat at all.
@@ -713,7 +764,7 @@ function createServerRuntime(
       // poll's payload supersedes the held one (latest batch wins).
       feedPushScheduler.schedule(prompt);
     },
-    onPollSuccess: async () => {
+    onPollSuccess: async (payload: FeedResponse) => {
       // Push local settings to the backend once per heartbeat (throttled
       // internally). Errors are swallowed inside report().
       await settingsReporter.report();
@@ -721,6 +772,12 @@ function createServerRuntime(
       // (from an out-of-band `record`) drain even on an idle server. The loop
       // owns the back-off; this is just an opportunistic kick.
       flushLoop.kick();
+      // Empty polls still need a periodic real Agent heartbeat for Commands,
+      // Attention, Communication, Publish, and Settings. Non-empty polls have
+      // already scheduled it above.
+      if ((payload.data?.items?.length ?? 0) === 0 && (payload.data?.notifications?.length ?? 0) === 0) {
+        await scheduleHeartbeatExecution(payload);
+      }
     },
     onAuthRequired: notifyAuthRequired,
   });

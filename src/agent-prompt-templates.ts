@@ -127,6 +127,30 @@ export function buildFeedPayloadPromptTemplate(
   ].join('\n');
 }
 
+/**
+ * Turns the plugin's poll into a real Agent heartbeat. The plugin owns the
+ * single network poll; the Agent owns every judgment and the remaining stages
+ * of the verified plan, including Attention.
+ */
+export function buildHeartbeatExecutionPromptTemplate(
+  plan: string,
+  payload: FeedResponse,
+  context: EigenFluxPromptServerContext
+): string {
+  return [
+    '[EIGENFLUX_HEARTBEAT]',
+    ...buildContextLines(context),
+    'Execute this verified EigenFlux heartbeat as the Agent.',
+    'The plugin has already completed the single Feed poll for this cycle. Run Commands first, then use the attached payload as the Feed stage; do not run another feed poll. Complete Attention, Communication, Publish, and Settings report in the verified plan order.',
+    'Read every rule source named by the plan before making judgments. Attention is silent unless its resulting work needs a user-facing report.',
+    '',
+    'Verified heartbeat plan:',
+    plan.trim(),
+    '',
+    buildFeedPayloadPromptTemplate(payload, context),
+  ].join('\n');
+}
+
 export interface NotInstalledPromptParams {
   bin: string;
   installCommand: string;

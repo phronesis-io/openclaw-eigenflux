@@ -12,10 +12,16 @@ export class EigenFluxHeartbeatPlanRunner {
 
   constructor(private readonly config: HeartbeatPlanRunnerConfig) {}
 
-  async run(): Promise<boolean> {
+  /**
+   * Return the verified plan for delivery to the Agent. Running the command for
+   * its compatibility side effect alone is insufficient: the Agent must read
+   * the plan to execute Commands → Feed → Attention → Communication → Publish
+   * → Settings.
+   */
+  async run(): Promise<string | null> {
     if (this.inFlight) {
       this.config.logger.debug('Heartbeat plan skipped because a run is already in flight');
-      return false;
+      return null;
     }
 
     this.inFlight = true;
@@ -34,23 +40,27 @@ export class EigenFluxHeartbeatPlanRunner {
       );
 
       if (result.kind === 'success') {
-        return true;
+        if (typeof result.data === 'string' && result.data.trim()) {
+          return result.data;
+        }
+        this.config.logger.warn('Heartbeat plan returned no Agent instructions');
+        return null;
       }
       if (result.kind === 'auth_required') {
         this.config.logger.warn('Heartbeat plan requires EigenFlux authentication');
-        return false;
+        return null;
       }
       if (result.kind === 'not_installed') {
         this.config.logger.warn(`Heartbeat plan: eigenflux CLI not installed (bin=${result.bin})`);
-        return false;
+        return null;
       }
       this.config.logger.warn(`Heartbeat plan failed: ${result.error.message}`);
-      return false;
+      return null;
     } catch (error) {
       this.config.logger.warn(
         `Heartbeat plan crashed: ${error instanceof Error ? error.message : String(error)}`
       );
-      return false;
+      return null;
     } finally {
       this.inFlight = false;
     }

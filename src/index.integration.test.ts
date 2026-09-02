@@ -113,6 +113,9 @@ describe('register integration', () => {
 
     // Set up execEigenflux to return feed data
     execEigenfluxMock.mockImplementation(async (bin: string, args: string[]) => {
+      if (args[0] === '--homedir' && args[2] === 'heartbeat' && args[3] === 'plan') {
+        return { kind: 'success', data: 'EIGENFLUX HEARTBEAT PLAN\nCommands → Feed → Attention' };
+      }
       if (args[0] === 'feed' && args[1] === 'poll') {
         return {
           kind: 'success',
@@ -171,12 +174,13 @@ describe('register integration', () => {
 
     expect(subagentRun).toHaveBeenCalledWith({
       sessionKey: expect.stringMatching(/^eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/),
-      message: expect.stringContaining('[EIGENFLUX_FEED_PAYLOAD]'),
+      message: expect.stringContaining('[EIGENFLUX_HEARTBEAT]'),
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
     });
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
+    expect(message).toContain('Commands → Feed → Attention');
     expect(message).toContain('"item_id": "501"');
     expect(message).toContain('"group_id": "group-int-1"');
     expect(message).toContain('server=eigenflux');
@@ -284,6 +288,10 @@ describe('register integration', () => {
     } as any);
 
     await services[0].start();
+    await waitFor(() => subagentRun.mock.calls.length === 1);
+    // The idle heartbeat is intentionally delivered at startup. Isolate the
+    // PM assertion from that independent background task.
+    subagentRun.mockClear();
     await streamClientConfig.onPmEvent({
       type: 'pm_push',
       data: {
