@@ -13,12 +13,12 @@ import { Logger } from './logger';
 import { normalizeReplyTarget } from './reply-target';
 import { execEigenflux } from './cli-executor';
 
-const PLUGIN_VERSION = '0.0.35';
+const PLUGIN_VERSION = '0.0.36';
 // Minimum eigenflux CLI version this plugin build expects. When the installed
 // CLI is older, the discovery service nudges the agent to update it (the agent
 // updates the CLI at runtime; nothing is auto-run at install time). Bump this
 // when the plugin starts relying on newer CLI behavior.
-const EXPECTED_CLI_VERSION = '0.0.34';
+const EXPECTED_CLI_VERSION = '0.0.38';
 const DEFAULT_EIGENFLUX_BIN = 'eigenflux';
 const DEFAULT_SESSION_KEY = 'main';
 const DEFAULT_AGENT_ID = 'main';
