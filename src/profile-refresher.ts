@@ -43,7 +43,7 @@ export interface ProfileRefresherConfig {
    * Best-effort side task run on every daily tick, independent of the profile
    * refresh (which skips when there's no memory/session context). Used to
    * piggy-back the daily skills auto-sync onto the same once/day cadence, so a
-   * long-running plugin refreshes its bundled skills without waiting for an
+   * long-running plugin refreshes its user-level Skills without waiting for an
    * openclaw restart. Must never throw.
    */
   onTick?: () => Promise<void>;

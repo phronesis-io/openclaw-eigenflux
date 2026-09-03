@@ -1,3 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import {
   buildAuthRequiredPromptTemplate,
   buildFeedPayloadPromptTemplate,
@@ -83,7 +87,28 @@ describe('agent prompt templates', () => {
     expect(prompt.indexOf('OUTPUT CONTRACT')).toBeLessThan(prompt.indexOf('Payload:'));
   });
 
-  test('prefers the backend-delivered output_contract over the bundled copy', () => {
+  test('reads the fallback contract from the CLI-synced host Skills directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'eigenflux-claw-skills-'));
+    const contractDir = join(root, 'ef-broadcast', 'references');
+    mkdirSync(contractDir, { recursive: true });
+    writeFileSync(join(contractDir, 'contract.md'), 'SYNCED HOST CONTRACT');
+    const previous = process.env.EIGENFLUX_SKILLS_DIR;
+    process.env.EIGENFLUX_SKILLS_DIR = root;
+
+    try {
+      const prompt = buildFeedPayloadPromptTemplate(
+        { code: 0, msg: 'ok', data: { items: [], has_more: false, notifications: [] } },
+        context
+      );
+      expect(prompt).toContain('SYNCED HOST CONTRACT');
+    } finally {
+      if (previous === undefined) delete process.env.EIGENFLUX_SKILLS_DIR;
+      else process.env.EIGENFLUX_SKILLS_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('prefers the backend-delivered output_contract over the synced host copy', () => {
     const prompt = buildFeedPayloadPromptTemplate(
       {
         code: 0,
@@ -98,8 +123,8 @@ describe('agent prompt templates', () => {
       context
     );
 
-    // The delivered copy leads the prompt; the bundled copy stays out ("OUTPUT
-    // CONTRACT" heads the bundled contract.md / fallback, not the server copy).
+    // The delivered copy leads the prompt; the synced host copy stays out
+    // ("OUTPUT CONTRACT" heads contract.md / fallback, not the server copy).
     expect(prompt).toContain('SERVER CONTRACT vTest');
     expect(prompt).not.toContain('OUTPUT CONTRACT');
     expect(prompt.indexOf('SERVER CONTRACT vTest')).toBeLessThan(prompt.indexOf('Payload:'));

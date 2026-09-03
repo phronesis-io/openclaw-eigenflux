@@ -1,5 +1,4 @@
 import * as os from 'os';
-import { join } from 'node:path';
 
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { buildJsonPluginConfigSchema, definePluginEntry } from 'openclaw/plugin-sdk/plugin-entry';
@@ -121,33 +120,48 @@ const DEFAULT_ROUTING: RoutingConfig = {
 };
 
 /**
- * Best-effort skill auto-update for the OpenClaw host. Syncs the R2 skill
- * bundle into this plugin's own bundled `skills/` directory — the directory
- * OpenClaw loads our skills from — so a skill fix ships via a CLI/R2 release
- * instead of requiring a plugin republish. Never throws: a CDN/network failure
- * is swallowed and logged. Resolves once the sync attempt settles.
+ * Best-effort skill auto-update for the OpenClaw host. The CLI installs the
+ * signed R2 bundle into OpenClaw's user-level skill directory
+ * (`~/.agents/skills` by default). The package therefore carries no embedded
+ * Skills and future Skill releases do not require a plugin release.
  *
- * `--if-stale` makes it a zero-network no-op when the local revision already
- * matches remote. `--into` targets the bundle explicitly because OpenClaw does
- * NOT read the CLI's host skill-load dir (~/.agents/skills) for our skills.
+ * The small signed manifest is checked on each call; the bundle is downloaded
+ * only when its revision changes. Failures are swallowed and logged so startup
+ * and polling remain offline-safe.
  */
+type SkillsSnapshotRefresher = () => void | Promise<void>;
+
+async function refreshOpenClawSkillsSnapshot(logger: Logger): Promise<void> {
+  try {
+    // Keep compatibility with older OpenClaw releases that do not export this
+    // helper. Their built-in Skills watcher still refreshes the next turn.
+    const moduleName = 'openclaw/plugin-sdk/skills-runtime';
+    const runtime = await import(moduleName) as {
+      bumpSkillsSnapshotVersion?: (params: { reason: string }) => number;
+    };
+    runtime.bumpSkillsSnapshotVersion?.({ reason: 'eigenflux-skills-sync' });
+    logger.debug('OpenClaw Skills snapshot refreshed');
+  } catch (err) {
+    logger.debug(`OpenClaw Skills snapshot refresh unavailable: ${String(err)}`);
+  }
+}
+
 export async function syncPluginSkills(
   eigenfluxBin: string,
-  logger: Logger
+  logger: Logger,
+  refreshSnapshot: SkillsSnapshotRefresher = () => refreshOpenClawSkillsSnapshot(logger)
 ): Promise<void> {
-  // Bundle skills dir, relative to the compiled dist/index.js (cjs → __dirname
-  // is available). Same base agent-prompt-templates.ts reads its contract from.
-  const pluginSkillsDir = join(__dirname, '..', 'skills');
   try {
     const res = await execEigenflux(
       eigenfluxBin,
-      ['skills', 'sync', '--if-stale', '--quiet', '--into', pluginSkillsDir],
+      ['skills', 'sync', '--if-stale', '--quiet', '--host', 'openclaw'],
       { logger, parseJson: false }
     );
     if (res.kind === 'success') {
-      logger.info(`Skill auto-sync ok (into=${pluginSkillsDir})`);
+      await refreshSnapshot();
+      logger.info('Skill auto-sync ok (host=openclaw)');
     } else {
-      logger.warn(`Skill auto-sync skipped (kind=${res.kind}, into=${pluginSkillsDir})`);
+      logger.warn(`Skill auto-sync skipped (kind=${res.kind}, host=openclaw)`);
     }
   } catch (err) {
     logger.warn(`Skill auto-sync error: ${String(err)}`);
@@ -190,13 +204,9 @@ function registerPlugin(api: OpenClawPluginApi): void {
         return;
       }
 
-      // Best-effort skill auto-update. Pull the latest skill bundle from R2 into
-      // this plugin's OWN bundled skills dir — the only directory OpenClaw loads
-      // our skills from (it does not read ~/.agents/skills on our behalf). This
-      // lets a skill fix ride a CLI/R2 release instead of a plugin republish.
-      // Non-blocking and offline-safe: --if-stale is a no-op when the local
-      // revision already matches remote, and a CDN/network failure must never
-      // delay or break startup. Applies to the next session's skill load.
+      // Pull the latest signed bundle into OpenClaw's user-level Skills dir.
+      // Non-blocking and offline-safe; a successful sync refreshes the Skills
+      // snapshot for the next agent turn.
       void syncPluginSkills(pluginConfig.eigenfluxBin, logger);
 
       const servers = discovery.servers;
@@ -876,7 +886,7 @@ function createServerRuntime(
       await notifyAuthRequired({ reason: 'auth_required' });
     },
     // Piggy-back the daily skills auto-sync on the profile refresher's once/day
-    // dawn tick: syncPluginSkills refreshes our bundled skills from R2, so a
+    // dawn tick: syncPluginSkills refreshes the user-level Skills from R2, so a
     // long-running plugin picks up skill updates without an openclaw restart
     // (startup sync covers restarts; this covers the long-lived case). --if-stale
     // makes it a no-op when unchanged; the call never throws.
