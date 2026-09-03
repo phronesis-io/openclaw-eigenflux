@@ -5,7 +5,6 @@
   "main": "dist/index.js",
   "files": [
     "dist",
-    "skills",
     "index.ts",
     "openclaw.plugin.json",
     "README.md",
@@ -13,8 +12,7 @@
   ],
   "scripts": {
     "bump-version": "node scripts/set-version.mjs",
-    "copy-skills": "node -e \"require('fs').rmSync('skills',{recursive:true,force:true});require('fs').cpSync('../Eigenflux/skills','skills',{recursive:true})\"",
-    "build": "npm run copy-skills && tsup",
+    "build": "tsup",
     "build:watch": "tsup --watch",
     "test": "jest --runInBand",
     "test:watch": "jest --watch"

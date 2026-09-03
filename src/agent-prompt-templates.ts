@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { FeedResponse } from './polling-client';
 import type { PmStreamEvent } from './stream-client';
@@ -9,10 +10,11 @@ import type { PmStreamEvent } from './stream-client';
  * loaded on demand and that load is not guaranteed — especially after a session
  * restart or context compaction).
  *
- * Canonical source: skills/ef-broadcast/references/contract.md, which is copied
- * into the package at build time (`copy-skills`). FEED_OUTPUT_CONTRACT_FALLBACK
- * is the safety net if that file is ever unreadable, so a missing file degrades
- * the wording, never the behavior. Read once at module load and cached.
+ * Canonical source: the CLI-synced
+ * `~/.agents/skills/ef-broadcast/references/contract.md`. The inline fallback
+ * is the safety net if that file is unreadable, so a missing file degrades the
+ * wording, never the behavior. The file is read per payload so a hot Skill
+ * refresh is visible without restarting the plugin.
  */
 const FEED_OUTPUT_CONTRACT_FALLBACK = [
   'OUTPUT CONTRACT — non-negotiable subset of references/feed.md (full procedure there):',
@@ -47,18 +49,20 @@ const FEED_OUTPUT_CONTRACT_FALLBACK = [
   '   report kind="task".',
 ].join('\n');
 
-function loadFeedOutputContract(): string {
+function resolveOpenClawSkillsDir(): string {
+  return process.env.EIGENFLUX_SKILLS_DIR?.trim() || join(homedir(), '.agents', 'skills');
+}
+
+export function loadFeedOutputContract(skillsDir = resolveOpenClawSkillsDir()): string {
   try {
     return readFileSync(
-      join(__dirname, '../skills/ef-broadcast/references/contract.md'),
+      join(skillsDir, 'ef-broadcast', 'references', 'contract.md'),
       'utf-8'
     ).trim();
   } catch {
     return FEED_OUTPUT_CONTRACT_FALLBACK;
   }
 }
-
-const FEED_OUTPUT_CONTRACT = loadFeedOutputContract();
 
 export type EigenFluxPromptServerContext = {
   serverName: string;
@@ -101,7 +105,8 @@ export function buildFeedPayloadPromptTemplate(
   context: EigenFluxPromptServerContext
 ): string {
   // Contract delivery is three-state (mirrors the backend Feed handler):
-  //   - field absent → old server with no contract to give; bind the bundled copy.
+  //   - field absent → old server with no contract to give; bind the current
+  //                    CLI-synced copy, then the inline safety fallback.
   //   - field ""     → the server has one but this payload needs no output rules
   //                    (the common empty-poll case); inject nothing — falling back
   //                    here would reinstate the very rules the server withheld.
@@ -111,7 +116,7 @@ export function buildFeedPayloadPromptTemplate(
   const contract =
     'output_contract' in payload.data
       ? (delivered ?? '').trim()
-      : FEED_OUTPUT_CONTRACT;
+      : loadFeedOutputContract();
   const echoed = { ...payload, data: restData };
 
   return [

@@ -27,21 +27,20 @@ function makeLogger(): Logger {
 describe('syncPluginSkills (startup skill auto-update)', () => {
   beforeEach(() => execEigenfluxMock.mockReset());
 
-  it('syncs from R2 into the plugin bundle skills dir (offline-safe flags)', async () => {
+  it('syncs from R2 into the OpenClaw host skills dir and refreshes the snapshot', async () => {
     execEigenfluxMock.mockResolvedValue({ kind: 'success', data: undefined });
     const logger = makeLogger();
+    const refreshSnapshot = jest.fn();
 
-    await syncPluginSkills('eigenflux', logger);
+    await syncPluginSkills('eigenflux', logger, refreshSnapshot);
 
     expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
     const [bin, args, opts] = execEigenfluxMock.mock.calls[0];
     expect(bin).toBe('eigenflux');
-    // Exact command + offline-safe flags; targets the bundle via --into, never
-    // ~/.agents/skills (OpenClaw loads our skills from the bundle only).
-    expect(args.slice(0, 5)).toEqual(['skills', 'sync', '--if-stale', '--quiet', '--into']);
-    expect(args[5]).toMatch(/[\\/]skills$/);
-    expect(args).not.toContain('--host');
+    expect(args).toEqual(['skills', 'sync', '--if-stale', '--quiet', '--host', 'openclaw']);
+    expect(args).not.toContain('--into');
     expect(opts).toMatchObject({ parseJson: false });
+    expect(refreshSnapshot).toHaveBeenCalledTimes(1);
     expect((logger.info as jest.Mock)).toHaveBeenCalled();
   });
 
@@ -53,16 +52,20 @@ describe('syncPluginSkills (startup skill auto-update)', () => {
       stderr: 'boom',
     });
     const logger = makeLogger();
+    const refreshSnapshot = jest.fn();
 
-    await expect(syncPluginSkills('eigenflux', logger)).resolves.toBeUndefined();
+    await expect(syncPluginSkills('eigenflux', logger, refreshSnapshot)).resolves.toBeUndefined();
+    expect(refreshSnapshot).not.toHaveBeenCalled();
     expect((logger.warn as jest.Mock)).toHaveBeenCalled();
   });
 
   it('never throws when execEigenflux itself rejects', async () => {
     execEigenfluxMock.mockRejectedValue(new Error('spawn failed'));
     const logger = makeLogger();
+    const refreshSnapshot = jest.fn();
 
-    await expect(syncPluginSkills('eigenflux', logger)).resolves.toBeUndefined();
+    await expect(syncPluginSkills('eigenflux', logger, refreshSnapshot)).resolves.toBeUndefined();
+    expect(refreshSnapshot).not.toHaveBeenCalled();
     expect((logger.warn as jest.Mock)).toHaveBeenCalled();
   });
 });

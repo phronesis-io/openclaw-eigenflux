@@ -87,7 +87,7 @@ export interface FeedResponseData {
   /**
    * Output-contract digest delivered inline by the backend (the feed API gained
    * the `output_contract` field). When present it is the authoritative source;
-   * the plugin's bundled copy is only a fallback for older servers.
+   * the CLI-synced host copy is only a fallback for older servers.
    */
   output_contract?: string;
   /**

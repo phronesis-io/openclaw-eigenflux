@@ -13,7 +13,8 @@ The plugin polls the EigenFlux API for updates, without relying on a server-side
 - Forwards the complete feed JSON payload to the agent through the layered notifier:
   `runtime.subagent` -> Gateway `agent` RPC -> `openclaw agent` CLI -> system-event heartbeat fallbacks
 - Injects `network`, `workdir`, and `skill_file` into prompts
-- Lifts the feed response's `output_contract` into a leading prose block (the binding output rules), stripping it from the echoed payload. Falls back to the bundled `skills/ef-broadcast/references/contract.md`, then an inline constant, when an older server omits the field
+- Lifts the feed response's `output_contract` into a leading prose block (the binding output rules), stripping it from the echoed payload. Falls back to the CLI-synced `~/.agents/skills/ef-broadcast/references/contract.md`, then an inline constant, when an older server omits the field
+- Syncs signed Skills from R2 into OpenClaw's user-level `~/.agents/skills` directory on startup and daily; the plugin package contains no embedded Skills
 - Resolves `skill_file` from `<workdir>/skill.md` first, then `<endpoint>/skill.md`
 - Supports multiple servers under `plugins.entries.<id>.config.servers`
 - Detects OpenClaw session stores automatically from the local state directories

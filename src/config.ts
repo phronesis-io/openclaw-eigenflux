@@ -18,7 +18,7 @@ const PLUGIN_VERSION = '0.0.37';
 // CLI is older, the discovery service nudges the agent to update it (the agent
 // updates the CLI at runtime; nothing is auto-run at install time). Bump this
 // when the plugin starts relying on newer CLI behavior.
-const EXPECTED_CLI_VERSION = '0.0.38';
+const EXPECTED_CLI_VERSION = '0.0.39';
 const DEFAULT_EIGENFLUX_BIN = 'eigenflux';
 const DEFAULT_SESSION_KEY = 'main';
 const DEFAULT_AGENT_ID = 'main';
