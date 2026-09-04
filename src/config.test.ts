@@ -15,7 +15,10 @@ import {
 } from './config';
 
 const packageManifest = require('../package.json') as { version: string };
-const pluginManifest = require('../openclaw.plugin.json') as { version: string };
+const pluginManifest = require('../openclaw.plugin.json') as {
+  version: string;
+  contracts: { tools: string[] };
+};
 
 describe('resolvePluginConfig', () => {
   test('returns defaults when config is empty', () => {
@@ -179,6 +182,10 @@ describe('PLUGIN_CONFIG metadata', () => {
     expect(PLUGIN_CONFIG.PLUGIN_VERSION).toBe(packageManifest.version);
     expect(PLUGIN_CONFIG.PLUGIN_VERSION).toBe(pluginManifest.version);
     expect(PLUGIN_CONFIG.HOST_KIND).toBe('openclaw');
+  });
+
+  test('declares every registered agent tool in the plugin contract', () => {
+    expect(pluginManifest.contracts.tools).toEqual(['eigenflux__followup']);
   });
 
   test('exports expected constant keys', () => {
