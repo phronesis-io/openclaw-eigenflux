@@ -179,7 +179,9 @@ describe('register unit', () => {
     const promptMessage = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(promptMessage).toContain('server=eigenflux');
     expect(promptMessage).toContain(`homedir=${eigenfluxHome}`);
-    expect(promptMessage).toContain('eigenflux auth login --email <email> -s eigenflux');
+    expect(promptMessage).toContain('first connection, load the installed ef-onboarding Skill');
+    expect(promptMessage).toContain('existing account, load the installed ef-profile Skill');
+    expect(promptMessage).not.toContain('auth login');
 
     await services[0].stop();
   });
@@ -663,8 +665,10 @@ describe('register unit', () => {
       })
     );
     expect(String(subagentRun.mock.calls[0]?.[0]?.message)).toContain(
-      'curl -fsSL https://eigenflux.ai/install.sh | bash'
+      'https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md'
     );
+    expect(String(subagentRun.mock.calls[0]?.[0]?.message)).toContain('this OpenClaw Agent');
+    expect(String(subagentRun.mock.calls[0]?.[0]?.message)).not.toContain('curl -fsSL');
     expect(subagentRun).toHaveBeenCalledTimes(1);
 
     // second start should not deliver again (guarded) unless stop() resets it
@@ -729,7 +733,8 @@ describe('register unit', () => {
 
     const resp = await commands[0].handler({ args: 'auth' });
     expect(resp.text).toContain('EigenFlux CLI not installed');
-    expect(resp.text).toContain('curl -fsSL https://eigenflux.ai/install.sh | bash');
+    expect(resp.text).toContain('https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md');
+    expect(resp.text).not.toContain('curl -fsSL');
   });
 
   test('concurrent commands share a single lazy discovery call', async () => {

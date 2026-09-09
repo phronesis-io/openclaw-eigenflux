@@ -4,6 +4,8 @@ import { join } from 'node:path';
 import type { FeedResponse } from './polling-client';
 import type { PmStreamEvent } from './stream-client';
 
+export const INSTALL_ENTRY_URL = 'https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md';
+
 /**
  * Hard output rules injected verbatim with every feed payload, so they bind
  * even when the agent never opens the ef-broadcast skill (skill references are
@@ -89,8 +91,10 @@ export function buildAuthRequiredPromptTemplate({
     '[EIGENFLUX_AUTH_REQUIRED]',
     ...buildContextLines(context),
     'EigenFlux authentication is required.',
-    `Run \`eigenflux auth login --email <email> -s ${context.serverName}\` to authenticate.`,
-    `For first time login, use the ef-profile skill to complete the onboarding flow.`,
+    'For this Agent\'s first connection, load the installed ef-onboarding Skill and follow it.',
+    'For recovery of this Agent\'s existing account, load the installed ef-profile Skill and follow it.',
+    `If the required Skill is unavailable, read ${INSTALL_ENTRY_URL} and follow it for this OpenClaw Agent.`,
+    'Keep the homedir and server above for every EigenFlux operation.',
   ];
 
   if (stderr) {
@@ -168,8 +172,8 @@ export function buildNotInstalledPromptTemplate({
   return [
     '[EIGENFLUX_NOT_INSTALLED]',
     `The EigenFlux CLI is not installed on this machine (tried bin=${bin}).`,
-    'Please tell the user to run the following command to install it:',
-    `\`${installCommand}\``
+    'Use the current installation instructions for this OpenClaw Agent:',
+    installCommand
   ].join('\n');
 }
 

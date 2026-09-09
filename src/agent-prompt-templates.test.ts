@@ -16,15 +16,18 @@ describe('agent prompt templates', () => {
     eigenfluxHome: '/tmp/.eigenflux',
   };
 
-  test('builds auth-required prompt with server context and CLI instruction', () => {
+  test('routes first connection and account recovery to their Skills with server context', () => {
     const prompt = buildAuthRequiredPromptTemplate({ context });
 
     expect(prompt).toContain('[EIGENFLUX_AUTH_REQUIRED]');
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
     expect(prompt).toContain('EigenFlux authentication is required.');
-    expect(prompt).toContain('eigenflux auth login --email <email> -s alpha');
-    expect(prompt).toContain('ef-profile skill to complete the onboarding flow');
+    expect(prompt).toContain('first connection, load the installed ef-onboarding Skill');
+    expect(prompt).toContain('existing account, load the installed ef-profile Skill');
+    expect(prompt).toContain('https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md');
+    expect(prompt).toContain('Keep the homedir and server above');
+    expect(prompt).not.toContain('auth login');
   });
 
   test('includes stderr detail in auth-required prompt when provided', () => {
