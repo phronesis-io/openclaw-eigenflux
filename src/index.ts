@@ -34,6 +34,7 @@ import {
   buildFeedPayloadPromptTemplate,
   buildHeartbeatExecutionPromptTemplate,
   buildNotInstalledPromptTemplate,
+  INSTALL_ENTRY_URL,
   buildOutdatedPromptTemplate,
   buildPmStreamEventPromptTemplate,
   type EigenFluxPromptServerContext,
@@ -460,6 +461,7 @@ export default definePluginEntry({
 });
 
 const INSTALL_COMMAND = 'curl -fsSL https://eigenflux.ai/install.sh | bash';
+const INSTALL_GUIDANCE = `Read ${INSTALL_ENTRY_URL} and follow it to install EigenFlux for this OpenClaw Agent.`;
 
 async function deliverNotInstalledPrompt(
   api: OpenClawPluginApi,
@@ -482,7 +484,7 @@ async function deliverNotInstalledPrompt(
   });
 
   await notifier.deliver(
-    buildNotInstalledPromptTemplate({ bin, installCommand: INSTALL_COMMAND })
+    buildNotInstalledPromptTemplate({ bin, installCommand: INSTALL_GUIDANCE })
   );
 }
 
@@ -985,7 +987,7 @@ function registerCommand(
 
       if (notInstalledBin && runtimes.length === 0) {
         return {
-          text: `EigenFlux CLI not installed (bin=${notInstalledBin}). Install with: ${INSTALL_COMMAND}`,
+          text: `EigenFlux CLI not installed (bin=${notInstalledBin}). ${INSTALL_GUIDANCE}`,
         };
       }
 
@@ -1295,7 +1297,7 @@ async function buildProfileText(
     return buildAuthRequiredPromptTemplate({ context: runtime.getPromptContext() });
   }
   if (result.kind === 'not_installed') {
-    return `EigenFlux CLI not installed (bin=${result.bin}). Install with: ${INSTALL_COMMAND}`;
+    return `EigenFlux CLI not installed (bin=${result.bin}). ${INSTALL_GUIDANCE}`;
   }
   if (result.kind === 'error') {
     return `Failed to fetch profile for server ${runtime.server.name}: ${result.error.message}`;
@@ -1335,7 +1337,7 @@ async function buildVersionText(eigenfluxBin: string): Promise<string> {
   const result = await execEigenflux<unknown>(eigenfluxBin, ['version']);
 
   if (result.kind === 'not_installed') {
-    return `EigenFlux CLI not installed (bin=${result.bin}). Install with: ${INSTALL_COMMAND}`;
+    return `EigenFlux CLI not installed (bin=${result.bin}). ${INSTALL_GUIDANCE}`;
   }
   if (result.kind === 'auth_required') {
     return `EigenFlux CLI reported auth_required while fetching version (stderr: ${result.stderr || 'n/a'}).`;

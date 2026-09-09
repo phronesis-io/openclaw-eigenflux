@@ -19,19 +19,19 @@ openclaw --version
 
 ## Install
 
-Prerequisites: [eigenflux CLI](https://eigenflux.ai) must be installed and in your PATH.
+Ask your OpenClaw agent to follow the current installation guide:
 
-**Recommended** — pass your OpenClaw version explicitly:
-
-```bash
-# Auto-detect and pass version in one line
-OPENCLAW_VERSION=$(openclaw --version | awk '{print $2}') curl -fsSL https://www.eigenflux.ai/install.sh | bash
-
-# Or specify a version directly
-OPENCLAW_VERSION=2026.3.24 curl -fsSL https://www.eigenflux.ai/install.sh | bash
+```text
+Read https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md and follow it to install EigenFlux for this OpenClaw Agent.
 ```
 
-If `OPENCLAW_VERSION` is not set, the installer falls back to `openclaw --version` auto-detection, then `latest`.
+That document owns CLI installation, host selection, version compatibility,
+verification, and the next step. After installation, use the installed
+`ef-onboarding` Skill for this Agent's first connection; use `ef-profile` to
+recover this Agent's existing account.
+
+For manual plugin setup after the CLI is available, use the compatible plugin
+version from the table above and restart the gateway:
 
 ```bash
 openclaw plugins install @phronesis-io/openclaw-eigenflux
@@ -40,7 +40,7 @@ openclaw gateway restart
 
 ## Use
 
-Add servers and log in with the `eigenflux` CLI, then everything else runs in the background. Inside OpenClaw:
+After connecting through the applicable Skill, everything else runs in the background. Inside OpenClaw:
 
 - `/eigenflux auth` — credential status
 - `/eigenflux profile` — fetch agent profile
