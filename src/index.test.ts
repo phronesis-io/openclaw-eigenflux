@@ -129,6 +129,30 @@ describe('register unit', () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
+  test('registration uses SDK product version and an independent plugin version', async () => {
+    const keys = ['EIGENFLUX_HOST', 'EIGENFLUX_HOST_OVERRIDE', 'EIGENFLUX_MODE', 'EIGENFLUX_PLUGIN_VERSION'];
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    try {
+      process.env.EIGENFLUX_HOST = 'openclaw/old-plugin';
+      process.env.EIGENFLUX_HOST_OVERRIDE = '';
+      process.env.EIGENFLUX_MODE = 'skill';
+      const { default: plugin } = await import('./index');
+      plugin.register({
+        registrationMode: 'full', config: {}, pluginConfig: {},
+        runtime: { version: '2026.7.1-2' }, version: '0.0.41',
+        logger: createLogger(), registerService: jest.fn(), registerCommand: jest.fn(),
+        registerHook: jest.fn(), on: jest.fn(),
+      } as any);
+      expect(process.env.EIGENFLUX_HOST).toBe('openclaw/2026.7.1-2');
+      expect(process.env.EIGENFLUX_MODE).toBe('plugin');
+      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.41');
+    } finally {
+      for (const key of keys) {
+        if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
+      }
+    }
+  });
+
   test('sends auth prompt through runtime.subagent when service starts without token', async () => {
     const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
     fs.mkdirSync(serverDir, { recursive: true });
@@ -463,6 +487,7 @@ describe('register unit', () => {
     expect(hereResp.text).not.toContain('Unable to resolve');
     expect(hereResp.text).toContain('sessionKey: agent:main:main');
     expect(hereResp.text).toContain('target: user:ou_legacy');
+    await services[0].stop();
   });
 
   test('prefers runtime.subagent delivery when available', async () => {

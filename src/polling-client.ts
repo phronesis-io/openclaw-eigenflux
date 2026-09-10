@@ -289,19 +289,20 @@ export class EigenFluxPollingClient {
           `Polled feed: ${items.length} items, notifications=${notifications.length}, has_more=${feedResponse.data.has_more}`
         );
 
-        if (notifyFeed && (items.length > 0 || notifications.length > 0)) {
-          await this.config.onFeedPolled(feedResponse);
-        }
-
-        // Fire the per-heartbeat hook on every successful poll, independent of
-        // feed content. Best-effort: never let it break the poll loop.
-        if (this.config.onPollSuccess) {
-          try {
-            await this.config.onPollSuccess(feedResponse);
-          } catch (hookError) {
-            this.config.logger.warn(
-              `onPollSuccess hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
-            );
+        try {
+          if (notifyFeed && (items.length > 0 || notifications.length > 0)) {
+            await this.config.onFeedPolled(feedResponse);
+          }
+        } finally {
+          // Delivery starts immediately; its failure cannot skip identity reporting.
+          if (this.config.onPollSuccess) {
+            try {
+              await this.config.onPollSuccess(feedResponse);
+            } catch (hookError) {
+              this.config.logger.warn(
+                `onPollSuccess hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
+              );
+            }
           }
         }
 

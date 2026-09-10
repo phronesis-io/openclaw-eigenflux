@@ -114,6 +114,23 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
+  test('reports a successful poll even when content delivery throws', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'success', data: {
+      items: [{ item_id: 'delivery-error-item' }], has_more: false, notifications: [],
+    } } as CliResult<any>);
+    const onPollSuccess = jest.fn().mockResolvedValue(undefined);
+    const onFeedPolled = jest.fn().mockRejectedValue(new Error('delivery unavailable'));
+    const client = new EigenFluxPollingClient({
+      serverName: 'eigenflux', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onPollSuccess, onFeedPolled, onAuthRequired: jest.fn().mockResolvedValue(undefined),
+    });
+    await client.pollOnce();
+    expect(onPollSuccess).toHaveBeenCalledTimes(1);
+    expect(onFeedPolled).toHaveBeenCalledTimes(1);
+    expect(onFeedPolled.mock.invocationCallOrder[0]).toBeLessThan(onPollSuccess.mock.invocationCallOrder[0]);
+  });
+
   test('runs the Heartbeat plan hook before polling the feed', async () => {
     const onHeartbeatStart = jest.fn().mockResolvedValue(undefined);
     execEigenfluxMock.mockResolvedValue({
