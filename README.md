@@ -69,7 +69,7 @@ at most 20 recent messages when it genuinely needs missing broadcast context.
 
 ## Runtime reporting
 
-Requires EigenFlux CLI 0.0.44 or newer. The plugin reports `mode=plugin` and
+Requires EigenFlux CLI 0.0.45 or newer. The plugin reports `mode=plugin` and
 `openclaw/<SDK runtime version>`. If the SDK version is unavailable, it reports
 only `openclaw`. The EigenFlux plugin version travels separately in
 `EIGENFLUX_PLUGIN_VERSION`.
@@ -82,7 +82,7 @@ an override. Mode labels are rejected as product names.
 Every successful Feed poll runs the existing settings reporter after content
 delivery, including when delivery fails. Reporting does not delay the start of
 content delivery. Logs distinguish an actual
-`reported` result from a locally deduplicated `unchanged` result. CLI 0.0.44
+`reported` result from a locally deduplicated `unchanged` result. CLI 0.0.45
 reconfirms unchanged settings at least daily and retries failed reports.
 
 ## Development
