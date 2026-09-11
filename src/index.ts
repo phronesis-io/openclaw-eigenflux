@@ -14,6 +14,7 @@ import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
 import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
 import { EigenFluxSettingsReporter } from './settings-reporter';
+import { resolveRuntimeHost } from './runtime-identity';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
 import { CredentialsLoader } from './credentials-loader';
@@ -179,7 +180,9 @@ function registerPlugin(api: OpenClawPluginApi): void {
   );
   // Set once at startup so all CLI child processes inherit it automatically.
   process.env.EIGENFLUX_HOME = eigenfluxHome;
-  process.env.EIGENFLUX_HOST = `openclaw/${PLUGIN_CONFIG.PLUGIN_VERSION}`;
+  process.env.EIGENFLUX_HOST = resolveRuntimeHost(api.runtime?.version, process.env.EIGENFLUX_HOST_OVERRIDE);
+  process.env.EIGENFLUX_MODE = 'plugin';
+  process.env.EIGENFLUX_PLUGIN_VERSION = PLUGIN_CONFIG.PLUGIN_VERSION;
   logger.info(`Client env: EIGENFLUX_HOST=${process.env.EIGENFLUX_HOST}`);
   const store = createInMemoryPluginStore();
 

@@ -67,6 +67,24 @@ concurrency limit. Reconnect-only `history_messages` backfills are not injected
 into the agent prompt; the isolated session keeps its own context and may fetch
 at most 20 recent messages when it genuinely needs missing broadcast context.
 
+## Runtime reporting
+
+Requires EigenFlux CLI 0.0.45 or newer. The plugin reports `mode=plugin` and
+`openclaw/<SDK runtime version>`. If the SDK version is unavailable, it reports
+only `openclaw`. The EigenFlux plugin version travels separately in
+`EIGENFLUX_PLUGIN_VERSION`.
+
+CLI children receive the current product identity on startup. Integrators that
+need a deliberate product override must set `EIGENFLUX_HOST_OVERRIDE` to a
+product name with an optional `/version`; inherited `EIGENFLUX_HOST` is no longer
+an override. Mode labels are rejected as product names.
+
+Every successful Feed poll runs the existing settings reporter after content
+delivery, including when delivery fails. Reporting does not delay the start of
+content delivery. Logs distinguish an actual
+`reported` result from a locally deduplicated `unchanged` result. CLI 0.0.45
+reconfirms unchanged settings at least daily and retries failed reports.
+
 ## Development
 
 Requires Node.js 20+ and pnpm.

@@ -17,8 +17,8 @@ function createLogger(spies = createLoggerSpies()): Logger {
 }
 
 describe('resolveAgentMode', () => {
-  test('maps explicit EIGENFLUX_CHANNEL=skill to skill', () => {
-    expect(resolveAgentMode({ EIGENFLUX_CHANNEL: 'skill' })).toBe('skill');
+  test('ignores a stale skill channel for the native plugin loop', () => {
+    expect(resolveAgentMode({ EIGENFLUX_CHANNEL: 'skill' })).toBe('plugin');
   });
 
   test('maps explicit EIGENFLUX_CHANNEL=plugin to plugin', () => {
@@ -33,21 +33,35 @@ describe('resolveAgentMode', () => {
     expect(resolveAgentMode({ EIGENFLUX_CHANNEL: 'openclaw' })).toBe('plugin');
   });
 
-  test('channel takes precedence over host', () => {
+  test('routing channels do not override the actual loop owner', () => {
     expect(
       resolveAgentMode({ EIGENFLUX_CHANNEL: 'skill', EIGENFLUX_HOST: 'openclaw/1.0' })
-    ).toBe('skill');
+    ).toBe('plugin');
   });
 
-  test('returns undefined when no usable signal', () => {
-    expect(resolveAgentMode({})).toBeUndefined();
-    expect(resolveAgentMode({ EIGENFLUX_CHANNEL: 'discord' })).toBeUndefined();
+  test('the polling service reports plugin without environment hints', () => {
+    expect(resolveAgentMode({})).toBe('plugin');
+    expect(resolveAgentMode({ EIGENFLUX_CHANNEL: 'discord' })).toBe('plugin');
   });
 });
 
 describe('EigenFluxSettingsReporter', () => {
   beforeEach(() => {
     execMock.mockReset();
+  });
+
+  test.each([
+    ['settings unchanged; nothing to report', 'unchanged'],
+    ['settings reported', 'reported'],
+    ['', 'completed'],
+  ])('reports the CLI result without inventing a network write: %s', async (output, status) => {
+    const spies = createLoggerSpies();
+    execMock.mockResolvedValue({ kind: 'success', data: output });
+    const reporter = new EigenFluxSettingsReporter({
+      serverName: 'srv', eigenfluxBin: 'eigenflux', logger: createLogger(spies),
+    });
+    expect(await reporter.report()).toBe(true);
+    expect(spies.info).toHaveBeenCalledWith(expect.stringContaining(`Agent settings ${status}`));
   });
 
   test('invokes `settings push --mode <mode>` once on a successful poll', async () => {
