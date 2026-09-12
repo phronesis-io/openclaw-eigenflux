@@ -75,19 +75,22 @@ type EigenFluxRuntimeApi = {
   /** Task-run management. Used to truly cancel a run that outlived our wait budget
    *  ("stop waiting" != "stop the run"). Optional: older hosts may not expose it. */
   tasks?: {
+    async?: {
+      runs: {
+        bindSession: (params: { sessionKey: string }) => {
+          list: () => Promise<Array<{
+            id: string;
+            runId?: string;
+            status?: string;
+            createdAt?: number;
+            startedAt?: number;
+            endedAt?: number;
+          }>>;
+        };
+      };
+    };
     runs?: {
       bindSession?: (params: { sessionKey: string }) => {
-        /** Returns ALL task records related to the session — including
-         *  terminal ones (succeeded/failed/cancelled/timed_out). Callers that
-         *  care about "running right now" must filter, e.g. on `endedAt`. */
-        list: () => Array<{
-          id: string;
-          runId?: string;
-          status?: string;
-          createdAt?: number;
-          startedAt?: number;
-          endedAt?: number;
-        }>;
         cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
           found: boolean;
           cancelled: boolean;
@@ -643,22 +646,23 @@ export class EigenFluxNotifier {
   /** Best-effort true cancellation after either queue or execution timeout. */
   private async tryCancelRun(sessionKey: string, runId: string): Promise<boolean> {
     const runs = this.runtime.tasks?.runs;
-    if (!runs || typeof runs.bindSession !== 'function') {
+    const reads = this.runtime.tasks?.async?.runs;
+    if (!reads || !runs || typeof runs.bindSession !== 'function') {
       this.logger.debug(
-        `tryCancelRun: runtime.tasks.runs unavailable; cannot cancel run_id=${runId}`
+        `tryCancelRun: async task reads or cancellation unavailable; cannot cancel run_id=${runId}`
       );
       return false;
     }
     try {
-      const bound = runs.bindSession({ sessionKey });
-      const task = bound.list().find((t) => t.runId === runId);
+      const tasks = await reads.bindSession({ sessionKey }).list();
+      const task = tasks.find((t) => t.runId === runId);
       if (!task) {
         this.logger.warn(
           `tryCancelRun: no task found for run_id=${runId} on session=${sessionKey}; cannot cancel`
         );
         return false;
       }
-      const result = await bound.cancel({ taskId: task.id, cfg: this.api.config });
+      const result = await runs.bindSession({ sessionKey }).cancel({ taskId: task.id, cfg: this.api.config });
       this.logger.warn(
         `Cancelled stuck background run: run_id=${runId}, task_id=${task.id}, ` +
         `found=${result.found}, cancelled=${result.cancelled}`
@@ -880,15 +884,13 @@ export class EigenFluxNotifier {
       return false;
     }
 
-    const runs = this.runtime.tasks?.runs;
-    if (runs && typeof runs.bindSession === 'function') {
+    const runs = this.runtime.tasks?.async?.runs;
+    if (runs) {
       try {
         // list() returns the session's FULL task history, terminal records
         // included — only a task without endedAt is actually running.
-        const active = runs
-          .bindSession({ sessionKey: route.sessionKey })
-          .list()
-          .some((task) => task.endedAt === undefined);
+        const tasks = await runs.bindSession({ sessionKey: route.sessionKey }).list();
+        const active = tasks.some((task) => task.endedAt === undefined);
         if (active) {
           return true;
         }

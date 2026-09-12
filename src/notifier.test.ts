@@ -143,10 +143,20 @@ describe('EigenFluxNotifier', () => {
     const waitForRun = jest.fn().mockResolvedValue({ status: 'timeout' });
     const cancel = jest.fn().mockResolvedValue({ found: true, cancelled: true });
     // list() returns the run keyed by runId; its `id` is the taskId cancel needs.
-    const list = jest.fn().mockReturnValue([
+    const tasks = [
       { id: 'task-other', runId: 'run-unrelated', startedAt: Date.now() },
       { id: 'task-stuck', runId: 'run-stuck', startedAt: Date.now() - 20_000 },
-    ]);
+    ];
+    let releaseList!: () => void;
+    const pendingList = new Promise<typeof tasks>((resolve) => {
+      releaseList = () => resolve(tasks);
+    });
+    let markListStarted!: () => void;
+    const listStarted = new Promise<void>((resolve) => { markListStarted = resolve; });
+    const list = jest.fn().mockImplementation(() => {
+      markListStarted();
+      return pendingList;
+    });
     const bindSession = jest.fn().mockReturnValue({ list, cancel });
     const runCommandWithTimeout = jest.fn();
 
@@ -154,7 +164,7 @@ describe('EigenFluxNotifier', () => {
       createApi({
         runtime: {
           subagent: { run, waitForRun },
-          tasks: { runs: { bindSession } },
+          tasks: { async: { runs: { bindSession } }, runs: { bindSession } },
           system: { runCommandWithTimeout },
         } as unknown as OpenClawPluginApi['runtime'],
       }),
@@ -162,7 +172,11 @@ describe('EigenFluxNotifier', () => {
       createConfig()
     );
 
-    await expect(notifier.deliver('[EIGENFLUX_TEST] payload')).resolves.toBe(false);
+    const delivery = notifier.deliver('[EIGENFLUX_TEST] payload');
+    await listStarted;
+    expect(cancel).not.toHaveBeenCalled();
+    releaseList();
+    await expect(delivery).resolves.toBe(false);
     expect(bindSession).toHaveBeenCalledWith({ sessionKey: 'agent:main:feishu:direct:ou_123' });
     expect(waitForRun).toHaveBeenCalledWith({ runId: 'run-stuck', timeoutMs: 480_000 });
     // Cancels the matching run by its taskId — not the unrelated one.
@@ -175,14 +189,14 @@ describe('EigenFluxNotifier', () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-completed' });
     const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
     const cancel = jest.fn();
-    const list = jest.fn().mockReturnValue([]);
+    const list = jest.fn().mockResolvedValue([]);
     const bindSession = jest.fn().mockReturnValue({ list, cancel });
 
     const notifier = new EigenFluxNotifier(
       createApi({
         runtime: {
           subagent: { run, waitForRun },
-          tasks: { runs: { bindSession } },
+          tasks: { async: { runs: { bindSession } }, runs: { bindSession } },
         } as unknown as OpenClawPluginApi['runtime'],
       }),
       createLogger(),
@@ -362,23 +376,23 @@ describe('EigenFluxNotifier', () => {
     }
 
     test('terminal task history alone does NOT count as busy', async () => {
-      const list = jest.fn().mockReturnValue([
+      const list = jest.fn().mockResolvedValue([
         { id: 't1', runId: 'r1', status: 'succeeded', endedAt: 111 },
         { id: 't2', runId: 'r2', status: 'timed_out', endedAt: 222 },
       ]);
       const notifier = createBusyProbe({
-        tasks: { runs: { bindSession: () => ({ list, cancel: jest.fn() }) } },
+        tasks: { async: { runs: { bindSession: () => ({ list }) } } },
       });
       await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(false);
     });
 
     test('a task without endedAt counts as busy', async () => {
-      const list = jest.fn().mockReturnValue([
+      const list = jest.fn().mockResolvedValue([
         { id: 't1', runId: 'r1', status: 'succeeded', endedAt: 111 },
         { id: 't2', runId: 'r2', status: 'running' }, // no endedAt → live
       ]);
       const notifier = createBusyProbe({
-        tasks: { runs: { bindSession: () => ({ list, cancel: jest.fn() }) } },
+        tasks: { async: { runs: { bindSession: () => ({ list }) } } },
       });
       await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(true);
     });
@@ -398,6 +412,17 @@ describe('EigenFluxNotifier', () => {
     test('no busy APIs at all → idle (degrades to immediate push)', async () => {
       const notifier = createBusyProbe({});
       await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(false);
+    });
+
+    test('a rejected task lookup still checks recent session activity', async () => {
+      const list = jest.fn().mockRejectedValue(new Error('task storage unavailable'));
+      const getSessionEntry = jest.fn().mockReturnValue({ updatedAt: Date.now() });
+      const notifier = createBusyProbe({
+        tasks: { async: { runs: { bindSession: () => ({ list }) } } },
+        agent: { session: { getSessionEntry } },
+      });
+      await expect(notifier.isMainRouteBusy(90_000)).resolves.toBe(true);
+      expect(list).toHaveBeenCalledTimes(1);
     });
   });
 
