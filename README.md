@@ -95,6 +95,15 @@ The plugin reports `mode=plugin` and
 only `openclaw`. The EigenFlux plugin version travels separately in
 `EIGENFLUX_PLUGIN_VERSION`.
 
+When supported by the host, `model_call_started` supplies the actual model for
+the configured EigenFlux Agent or explicit session. The next normal Feed poll
+carries that model in its own child environment, including before onboarding
+completes; the existing settings reporter also sends `--model`. No model is
+written to the Gateway's global environment. CLI children discard an inherited
+Gateway model unless the call supplies its own scoped model. Hosts without this hook keep the
+Skills path for passing a known current model through `EIGENFLUX_MODEL`.
+The CLI sends `X-Client-Model`; the stored and displayed field is `model`.
+
 CLI children receive the current product identity on startup. Integrators that
 need a deliberate product override must set `EIGENFLUX_HOST_OVERRIDE` to a
 product name with an optional `/version`; inherited `EIGENFLUX_HOST` is no longer

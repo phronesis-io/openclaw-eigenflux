@@ -12,6 +12,8 @@ Keep OpenClaw service registration, process lifecycle, host context extraction, 
 
 ## Runtime integration
 
+- Send trusted current-model metadata through the CLI as `X-Client-Model`; persist and read `model`, without `model_name` aliases or default-configuration inference.
+
 - Discover configured servers through the CLI and preserve the stable Agent Home and explicit server on every operation.
 - Request `heartbeat plan --format json` on each poll. Validate `schema_version`, `agent_prompt`, and `wake_on_empty`; pass the prompt through and use the returned delivery decision.
 - Call `feed poll` once per cycle and attach its payload to the Agent turn. Preserve server `output_contract` text, use the current CLI-synced contract when the field is absent, and retain no embedded contract copy.
