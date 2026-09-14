@@ -15,6 +15,7 @@ export interface ProfileRefresherConfig {
 export class EigenFluxProfileRefresher {
   private running = false;
   private inFlight: Promise<void> | null = null;
+  private manualInFlight = false;
 
   constructor(private readonly config: ProfileRefresherConfig) {}
 
@@ -42,13 +43,20 @@ export class EigenFluxProfileRefresher {
   }
 
   private check(manual: boolean): Promise<void> {
-    if (this.inFlight) return this.inFlight;
+    if (this.inFlight) {
+      if (manual && !this.manualInFlight) {
+        return this.inFlight.then(() => this.check(true));
+      }
+      return this.inFlight;
+    }
+    this.manualInFlight = manual;
     this.inFlight = this.refresh(manual).catch((err) => {
       this.config.logger.warn(
         `Profile refresh adapter failed for server=${this.config.serverName}: ${String(err)}`
       );
     }).finally(() => {
       this.inFlight = null;
+      this.manualInFlight = false;
     });
     return this.inFlight;
   }
