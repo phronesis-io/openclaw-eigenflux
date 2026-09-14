@@ -82,6 +82,44 @@ test('concurrent heartbeats share one request and one delivery', async () => {
   expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
 });
 
+test.each(['skip', 'error'])('manual requests queue one force after an in-flight background %s', async (outcome) => {
+  let finishBackground!: (value: any) => void;
+  execMock.mockReturnValueOnce(new Promise((resolve) => { finishBackground = resolve; }));
+  execMock.mockResolvedValueOnce({ kind: 'success', data: 'FORCED TASK' });
+  const { config, adapter } = setup();
+  adapter.start();
+  const background = adapter.tick();
+  const firstManual = adapter.triggerNow();
+  const secondManual = adapter.triggerNow();
+  await Promise.resolve();
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(execMock.mock.calls[0][1]).not.toContain('--force');
+  finishBackground(outcome === 'skip'
+    ? { kind: 'success', data: '' }
+    : { kind: 'error', error: new Error('unavailable'), exitCode: 1, stderr: 'unavailable' });
+  await Promise.all([background, firstManual, secondManual]);
+  expect(execMock).toHaveBeenCalledTimes(2);
+  expect(execMock.mock.calls[1][1]).toContain('--force');
+  expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
+  expect(config.onRefreshPrompt).toHaveBeenCalledWith('FORCED TASK');
+});
+
+test('manual requests and heartbeats share an in-flight forced task', async () => {
+  let finishRequest!: (value: any) => void;
+  execMock.mockReturnValueOnce(new Promise((resolve) => { finishRequest = resolve; }));
+  const { config, adapter } = setup();
+  adapter.start();
+  const firstManual = adapter.triggerNow();
+  const background = adapter.tick();
+  const secondManual = adapter.triggerNow();
+  await Promise.resolve();
+  finishRequest({ kind: 'success', data: 'FORCED TASK' });
+  await Promise.all([firstManual, background, secondManual]);
+  expect(execMock).toHaveBeenCalledTimes(1);
+  expect(execMock.mock.calls[0][1]).toContain('--force');
+  expect(config.onRefreshPrompt).toHaveBeenCalledTimes(1);
+});
+
 test('stopping during a CLI request suppresses late background delivery', async () => {
   let resolveRequest!: (value: any) => void;
   execMock.mockReturnValue(new Promise((resolve) => { resolveRequest = resolve; }));
