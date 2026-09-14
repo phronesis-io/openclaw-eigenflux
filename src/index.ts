@@ -41,7 +41,7 @@ import {
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
 import { FeedPushScheduler } from './feed-push-scheduler';
-import { EigenFluxHeartbeatPlanRunner } from './heartbeat-plan-runner';
+import { EigenFluxHeartbeatPlanRunner, type HeartbeatExecutionPlan } from './heartbeat-plan-runner';
 import { EigenFluxNotifier } from './notifier';
 import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
 
@@ -235,9 +235,9 @@ function registerPlugin(api: OpenClawPluginApi): void {
 
       for (const runtime of runtimes) {
         logger.info(`Starting services for server=${runtime.server.name}`);
+        runtime.profileRefresher.start();
         await runtime.feedPoller.start();
         await runtime.streamClient.start();
-        runtime.profileRefresher.start();
         runtime.flushLoop.start();
       }
 
@@ -321,19 +321,19 @@ function registerFollowupTool(
       item_id: {
         type: 'string',
         description:
-          'A single item_id. Use this for one-at-a-time reports such as a single follow-up question. For multi-item batches (typical for surface in a delivery turn) prefer item_ids.',
+          'A single item_id passed to the CLI.',
       },
       item_ids: {
         type: 'array',
         items: { type: 'string' },
         description:
-          'Batch form of item_id. Use this when reporting many items at once, e.g. one call with all surfaced item_ids at the end of a delivery turn. Capped at 50 entries. When both item_id and item_ids are supplied, item_ids wins.',
+          'Batch form of item_id. When both item_id and item_ids are supplied, item_ids wins. The CLI validates the batch.',
       },
       kind: {
         type: 'string',
         enum: [...FOLLOWUP_KINDS],
         description:
-          'surface=item was shown; question=user asked about it; discussion=substantive conversation; task=scheduled work derived from it. One kind per call — split into separate calls if kinds differ.',
+          'Event kind passed to the CLI for every item in this call.',
       },
       brief: {
         type: 'string',
@@ -342,7 +342,7 @@ function registerFollowupTool(
       server_id: {
         type: 'string',
         description:
-          "Optional. Defaults to the CLI's active server; only set when multiple servers are configured.",
+          "Required when multiple servers are configured; otherwise uses the only discovered server.",
       },
     },
     required: ['kind'],
@@ -362,10 +362,8 @@ function registerFollowupTool(
       name: 'eigenflux__followup',
       label: 'EigenFlux feedback',
       description:
-        'Report per-item events for EigenFlux feed items (internal bookkeeping — never mention to the user). ' +
-        'For the surface case in a delivery turn (typically several items at once), call ONCE with item_ids=[...] and kind="surface". ' +
-        'For a single follow-up (question/discussion/task in a main session), call with item_id="..." and the appropriate kind. ' +
-        'item_id values must be exact — take them from the feed payload, the artifact metadata, or your ## FEED_INDEX block.',
+        'Adapter for eigenflux feed event record. Use according to the current EigenFlux Skills and CLI plan. ' +
+        'Pass item identifiers and event arguments through to the CLI.',
       parameters,
       execute: async (_toolCallId: string, params: unknown) => {
         const raw = (params ?? {}) as {
@@ -592,13 +590,12 @@ function createServerRuntime(
   const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
     eigenfluxBin: pluginConfig.eigenfluxBin,
     eigenfluxHome,
+    serverName: server.name,
     logger,
   });
   // A successful plan is Agent work, not merely a plugin health check. Keep
   // the plan for exactly the poll that produced it; pollOnce is single-flight.
-  let currentHeartbeatPlan: string | null = null;
-  let lastHeartbeatExecutionAt = 0;
-  const IDLE_HEARTBEAT_EXECUTION_INTERVAL_MS = 60 * 60 * 1000;
+  let currentHeartbeatPlan: HeartbeatExecutionPlan | null = null;
 
   // Backpressure state for the LEGACY one-shot feed path only
   // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
@@ -671,22 +668,17 @@ function createServerRuntime(
   });
 
   const scheduleHeartbeatExecution = async (payload: FeedResponse): Promise<void> => {
-    const now = Date.now();
     const hasPayload =
       (payload.data?.items?.length ?? 0) > 0 ||
       (payload.data?.notifications?.length ?? 0) > 0;
-    if (!hasPayload && now - lastHeartbeatExecutionAt < IDLE_HEARTBEAT_EXECUTION_INTERVAL_MS) {
-      return;
-    }
-
     const plan = currentHeartbeatPlan;
     if (!plan) {
       logger.warn(`Skipping Agent heartbeat for server=${server.name}: verified plan unavailable`);
       return;
     }
 
-    lastHeartbeatExecutionAt = now;
-    const prompt = buildHeartbeatExecutionPromptTemplate(plan, payload, getPromptContext());
+    if (!hasPayload && !plan.wake_on_empty) return;
+    const prompt = buildHeartbeatExecutionPromptTemplate(plan.agent_prompt, payload, getPromptContext());
     switch (process.env.EIGENFLUX_FEED_DELIVERY) {
       case 'system-event':
         void notifier.deliverToMainSession(prompt).catch((err) =>
@@ -716,6 +708,7 @@ function createServerRuntime(
     logger,
     onHeartbeatStart: async () => {
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
+      if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
     },
     onFeedPolled: async (payload: FeedResponse) => {
       // Always reset auth gate on successful poll, even if delivery is skipped
@@ -787,9 +780,8 @@ function createServerRuntime(
       // (from an out-of-band `record`) drain even on an idle server. The loop
       // owns the back-off; this is just an opportunistic kick.
       flushLoop.kick();
-      // Empty polls still need a periodic real Agent heartbeat for Commands,
-      // Attention, Communication, Publish, and Settings. Non-empty polls have
-      // already scheduled it above.
+      void profileRefresher.tick();
+      // The CLI plan decides whether an empty poll needs an Agent turn.
       if ((payload.data?.items?.length ?? 0) === 0 && (payload.data?.notifications?.length ?? 0) === 0) {
         await scheduleHeartbeatExecution(payload);
       }
@@ -832,70 +824,21 @@ function createServerRuntime(
     },
   });
 
-  // TODO: 未来将 feedPoller、streamClient、profileRefresher 统一为
-  // 单个 `eigenflux heartbeat` 守护进程，减少子进程管理开销。
   const profileRefresher = new EigenFluxProfileRefresher({
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
-    // OpenClaw adapter for the host-agnostic `eigenflux profile refresh-prompt`
-    // core: supply the host-specific inputs (memory dir + extracted session
-    // snippets); the CLI reads the memory markdown and assembles the prompt.
-    // The state dir is resolved via the SDK, NOT api.rootDir (which is the
-    // plugin's install directory). Best-effort; empty on error.
-    //
-    // TODO(multi-host): each host gets its own thin adapter that returns
-    // { memoryDirs, sessionSnippets } and delivers the CLI's prompt silently:
-    //   - Claude Code: memory from CLAUDE.md / ~/.claude memory; session from
-    //     ~/.claude/projects/**/*.jsonl; delivery via the claude/channel
-    //     (note: channel pushes are user-visible — true silence needs more work).
-    //   - Hermes: memory/session locations + silent-delivery mechanism TBD —
-    //     investigate the host before writing the adapter.
-    //   - Codex: memory likely AGENTS.md; session store + delivery TBD.
     collectContext: () => {
       const stateDir = resolveOpenClawStateDir(logger);
       return stateDir ? collectOpenClawContext(stateDir, logger) : EMPTY_CONTEXT;
     },
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
-      // Silent delivery: the agent runs its loop (reads its own memory/session,
-      // may call `eigenflux profile update`) but does NOT reply to the user, so
-      // the daily bio refresh stays imperceptible. Delivered to the main session
-      // (not a one-shot) so the agent retains recent-session context as a source.
-      await notifier.deliver(prompt, { silent: true });
-    },
-    // Gate for the daily status broadcast that chains after the bio refresh:
-    // recurring_publish is the user's "publish on my behalf" consent. Auto
-    // silently sends the user's status to the public network, so this is
-    // fail-closed: only an explicit "true" enables it. A missing/unset key, an
-    // empty value, a read failure, or any other value falls back to
-    // draft-and-confirm — an ambiguous state must never auto-publish. onboarding
-    // sets this explicitly, so normal users still get their chosen value.
-    readRecurringPublish: async () => {
-      const r = await execEigenflux<string>(
-        pluginConfig.eigenfluxBin,
-        ['config', 'get', '--key', 'recurring_publish', '-s', server.name],
-        { logger, parseJson: false }
-      );
-      if (r.kind !== 'success') return false;
-      return (r.data ?? '').trim().toLowerCase() === 'true';
-    },
-    // Deliver the status-broadcast prompt. silent=true (recurring_publish on):
-    // the agent publishes without user-facing chatter. silent=false (off): the
-    // agent drafts and must be able to send the user a confirmation message.
-    onStatusPrompt: async (prompt: string, { silent }: { silent: boolean }) => {
-      resetAuthPromptGate();
-      await notifier.deliver(prompt, { silent });
+      await notifier.deliver(prompt);
     },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
     },
-    // Piggy-back the daily skills auto-sync on the profile refresher's once/day
-    // dawn tick: syncPluginSkills refreshes the user-level Skills from R2, so a
-    // long-running plugin picks up skill updates without an openclaw restart
-    // (startup sync covers restarts; this covers the long-lived case). --if-stale
-    // makes it a no-op when unchanged; the call never throws.
-    onTick: () => syncPluginSkills(pluginConfig.eigenfluxBin, logger),
   });
 
   return {
@@ -1020,8 +963,8 @@ function registerCommand(
             text: await buildProfileText(runtime, pluginConfig.eigenfluxBin),
           };
         case 'refresh': {
-          // Manual trigger for verification: fire the daily bio refresh now,
-          // silently (no channel reply). Fire-and-forget — we do NOT await the
+          // Request an immediate profile review through the CLI,
+          // using the current Skills for output. Fire-and-forget — we do NOT await the
           // refresh, so the command always responds immediately even if the
           // background refresh is slow or stalls. Errors are logged, never a hang.
           //
@@ -1039,9 +982,9 @@ function registerCommand(
           });
           return {
             text: [
-              `Triggered a silent profile refresh for server=${runtime.server.name} (running in background).`,
+              `Triggered a profile refresh check for server=${runtime.server.name} (running in background).`,
               `context probe: memory_dirs=${probe.memoryDirs.length}, session=${probe.sessionSnippets.length} snippet(s), stateDir=${probeStateDir ?? 'undefined'}`,
-              'No channel reply. Verify via a new agent_bio_history row if the bio changed.',
+              'The current Skills control user-visible output. Verify via a new agent_bio_history row if the bio changed.',
             ].join('\n'),
           };
         }
@@ -1153,7 +1096,7 @@ function buildHelpText(runtimes: ServerRuntime[]): string {
     '',
     '/eigenflux auth — Show credential status',
     '/eigenflux profile — Fetch agent profile',
-    '/eigenflux refresh — Trigger a silent daily-style bio refresh now',
+    '/eigenflux refresh — Check for a due profile refresh task now',
     '/eigenflux servers — List discovered servers',
     '/eigenflux feed — Run one feed refresh',
     '/eigenflux pm — Show PM stream status',
