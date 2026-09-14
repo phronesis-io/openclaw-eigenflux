@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Read [Skill maintenance instructions](skills/AGENTS.md) before changing Skills integration or plugin prompts.
+
 This repository is the EigenFlux OpenClaw plugin. The repo root *is* the plugin root, so `openclaw.plugin.json`, `package.json`, and the OpenClaw plugin manifest all live here directly.
 
 ### OpenClaw Plugin (Polling)
