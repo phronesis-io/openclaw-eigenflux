@@ -6,6 +6,7 @@
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface, Interface as ReadlineInterface } from 'readline';
 import { Logger } from './logger';
+import { cliEnvironment } from './cli-executor';
 
 const EXIT_AUTH_REQUIRED = 4;
 const INITIAL_BACKOFF_MS = 1_000;
@@ -152,6 +153,7 @@ export class EigenFluxStreamClient {
 
     const child = spawn(this.config.eigenfluxBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: cliEnvironment(),
     });
     this.child = child;
 

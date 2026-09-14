@@ -15,6 +15,7 @@ import { EigenFluxProfileRefresher } from './profile-refresher';
 import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
 import { EigenFluxSettingsReporter } from './settings-reporter';
 import { resolveRuntimeHost } from './runtime-identity';
+import { registerRuntimeModelHooks } from './runtime-model';
 import { execEigenflux } from './cli-executor';
 import { Logger } from './logger';
 import { CredentialsLoader } from './credentials-loader';
@@ -187,6 +188,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
   const store = createInMemoryPluginStore();
 
   let runtimes: ServerRuntime[] = [];
+  registerRuntimeModelHooks(api, () => runtimes, logger);
   let notInstalledPromptDelivered = false;
   let outdatedPromptDelivered = false;
 
@@ -701,6 +703,7 @@ function createServerRuntime(
   };
 
   const feedPoller = new EigenFluxPollingClient({
+    resolveModel: () => settingsReporter.getObservedModel(),
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     resolvePollIntervalSec: () =>
