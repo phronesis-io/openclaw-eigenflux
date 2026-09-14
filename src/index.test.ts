@@ -139,13 +139,13 @@ describe('register unit', () => {
       const { default: plugin } = await import('./index');
       plugin.register({
         registrationMode: 'full', config: {}, pluginConfig: {},
-        runtime: { version: '2026.7.1-2' }, version: '0.0.41',
+        runtime: { version: '2026.7.1-2' }, version: '0.0.42',
         logger: createLogger(), registerService: jest.fn(), registerCommand: jest.fn(),
         registerHook: jest.fn(), on: jest.fn(),
       } as any);
       expect(process.env.EIGENFLUX_HOST).toBe('openclaw/2026.7.1-2');
       expect(process.env.EIGENFLUX_MODE).toBe('plugin');
-      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.41');
+      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.42');
     } finally {
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
