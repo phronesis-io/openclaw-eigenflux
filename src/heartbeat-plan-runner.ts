@@ -48,7 +48,8 @@ export class EigenFluxHeartbeatPlanRunner {
           '--format',
           'json',
         ],
-        { logger: this.config.logger }
+        // Allow two CLI update attempts plus Skills sync and rollback time.
+        { logger: this.config.logger, timeout: 300_000 }
       );
 
       if (result.kind === 'success') {

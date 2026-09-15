@@ -15,7 +15,7 @@ test('loads the structured plan for the stable Home and explicit server', async 
   await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(plan);
   expect(execMock).toHaveBeenCalledWith('/opt/eigenflux', [
     '--homedir', '/stable/home', '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
-  ], { logger });
+  ], { logger, timeout: 300_000 });
 });
 
 test.each([
