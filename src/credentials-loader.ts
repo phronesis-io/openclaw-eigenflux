@@ -83,6 +83,13 @@ export class CredentialsLoader {
     }
   }
 
+  loadAgentId(): string | null {
+    try {
+      const value = JSON.parse(fs.readFileSync(this.credentialsPath, 'utf8')) as EigenFluxCredentials;
+      return typeof value.agent_id === 'string' ? value.agent_id : null;
+    } catch { return null; }
+  }
+
   loadAccessToken(): string | null {
     const authState = this.loadAuthState();
     if (authState.status !== 'available') {

@@ -356,9 +356,9 @@ describe('register integration', () => {
 
     expect(subagentRun).toHaveBeenCalledTimes(1);
     const params = subagentRun.mock.calls[0][0];
-    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.sessionKey).toMatch(/^eigenflux:pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
     expect(params.sessionKey).not.toBe('agent:main:main');
-    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
+    expect(params.lane).toMatch(/^eigenflux-pm:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}:[a-f0-9]{16}$/);
     expect(params.message).toContain('"conv_id": "conv-341466745984253952"');
     expect(params.message).toContain('ef-communication skill');
     expect(params.message).not.toContain('eigenflux msg history');
@@ -444,4 +444,84 @@ describe('register integration', () => {
 
     await services[0].stop();
   });
+  test.each(['control_pending', 'maintenance_due'])('watch %s invokes the real Agent seam independently of Feed', async type => {
+    feedItems = [];
+    wakeOnEmpty = false;
+    profileTask = '';
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-watch' });
+    const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
+    plugin.register({ registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun, waitForRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    try {
+      await services[0].start();
+      // Feed is now unavailable; event maintenance must not depend on its result.
+      const implementation = execEigenfluxMock.getMockImplementation();
+      execEigenfluxMock.mockImplementation(async (...args: any[]) => {
+        if (args[1][0] === 'feed' && args[1][1] === 'poll') return {kind:'error',error:new Error('offline'),exitCode:1,stderr:''};
+        return implementation!(...args);
+      });
+      await streamClientConfig.onWatchEvent({schema_version:'eigenflux_watch.v1', type, event_id:'watch-1', state_scope:'owned-account', data:{}});
+      expect(subagentRun).toHaveBeenCalledTimes(1);
+      expect(waitForRun).toHaveBeenCalledWith(expect.objectContaining({runId:'run-watch'}));
+      const mode = type === 'control_pending' ? 'control-only' : 'maintenance-only';
+      expect(execEigenfluxMock.mock.calls.some(([,args]) => args.includes(`--${mode}`))).toBe(true);
+      expect(subagentRun.mock.calls[0][0].sessionKey).toContain(`owned-account:${mode}`);
+      expect(subagentRun.mock.calls[0][0].message).toContain('EIGENFLUX HEARTBEAT PLAN');
+    } finally { await services[0].stop(); }
+  });
+
+  test('PM reports failed Agent delivery and isolates the same conversation across account scopes', async () => {
+    feedItems = []; wakeOnEmpty = false; profileTask = '';
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({runId:'pm'});
+    const waitForRun = jest.fn().mockResolvedValue({status:'ok'});
+    plugin.register({registrationMode:'full', config:{}, pluginConfig:{},
+      runtime:{subagent:{run:subagentRun,waitForRun}},
+      logger:{info:jest.fn(),warn:jest.fn(),error:jest.fn(),debug:jest.fn()},
+      registerService:(service:any)=>services.push(service),
+    } as any);
+    const event = {type:'pm_push',data:{messages:[{msg_id:'one',conv_id:'same',sender_id:'peer',content:'hello',created_at:1}]}};
+    try {
+      await services[0].start();
+      await streamClientConfig.onPmEvent({...event,state_scope:'account-a'});
+      await streamClientConfig.onPmEvent({...event,state_scope:'account-b'});
+      expect(subagentRun.mock.calls[0][0].sessionKey).not.toEqual(subagentRun.mock.calls[1][0].sessionKey);
+      expect(subagentRun.mock.calls[0][0].lane).not.toEqual(subagentRun.mock.calls[1][0].lane);
+      waitForRun.mockResolvedValue({status:'error',error:'Agent failed'});
+      await expect(streamClientConfig.onPmEvent({...event,state_scope:'account-a'})).rejects.toThrow('PM Agent delivery failed');
+    } finally {await services[0].stop();}
+  });
+
+  test('watch takes over automatic Card ticks while retaining the existing context and Agent adapter', async () => {
+    feedItems = []; wakeOnEmpty = false; profileTask = 'CARD FROM CENTRAL CLI';
+    jest.resetModules();
+    const { EigenFluxWatchClient } = await import('./watch-client');
+    const enabled = jest.spyOn(EigenFluxWatchClient.prototype, 'isWatchEnabled').mockReturnValue(true);
+    const { default: plugin } = await import('./index');
+    const services:any[]=[];
+    const subagentRun=jest.fn().mockResolvedValue({runId:'card'});
+    const waitForRun=jest.fn().mockResolvedValue({status:'ok'});
+    plugin.register({registrationMode:'full',config:{},pluginConfig:{},runtime:{subagent:{run:subagentRun,waitForRun}},
+      logger:{info:jest.fn(),warn:jest.fn(),error:jest.fn(),debug:jest.fn()}, registerService:(s:any)=>services.push(s),
+    } as any);
+    try {
+      await services[0].start();
+      expect(execEigenfluxMock.mock.calls.some(([,args])=>args[0]==='profile')).toBe(false);
+      expect(execEigenfluxMock.mock.calls.some(([,args])=>args.includes('--watch-managed'))).toBe(true);
+      await streamClientConfig.onWatchEvent({type:'profile_review_due',state_scope:'account',data:{}});
+      const call=execEigenfluxMock.mock.calls.find(([,args])=>args[0]==='profile');
+      expect(call?.[1]).toEqual(expect.arrayContaining(['refresh-task','--homedir',eigenfluxHome,'-s','eigenflux']));
+      expect(subagentRun.mock.calls[0][0].message).toBe('CARD FROM CENTRAL CLI');
+      expect(waitForRun).toHaveBeenCalledWith(expect.objectContaining({runId:'card'}));
+    } finally {enabled.mockRestore();await services[0].stop();}
+  });
+
 });

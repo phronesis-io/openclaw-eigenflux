@@ -5,6 +5,7 @@ import { EMPTY_CONTEXT, type RefreshContext } from './openclaw-context';
 
 export interface ProfileRefresherConfig {
   serverName: string;
+  eigenfluxHome?: string;
   eigenfluxBin: string;
   logger: Logger;
   collectContext?: () => RefreshContext | Promise<RefreshContext>;
@@ -72,6 +73,7 @@ export class EigenFluxProfileRefresher {
 
     const result = await execEigenflux<string>(this.config.eigenfluxBin, [
       'profile', 'refresh-task', '-s', this.config.serverName, '--format', 'agent',
+      ...(this.config.eigenfluxHome ? ['--homedir', this.config.eigenfluxHome] : []),
       ...(manual ? ['--force'] : []),
       ...(context.memoryDirs ?? []).flatMap((dir) => ['--memory-dir', dir]),
       ...(context.sessionSnippets ?? []).flatMap((snippet) => ['--session-snippet', snippet]),

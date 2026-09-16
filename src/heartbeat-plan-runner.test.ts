@@ -40,3 +40,19 @@ test('plan failure returns no replacement business instructions', async () => {
   execMock.mockResolvedValue({ kind: 'error', error: new Error('offline'), exitCode: 2, stderr: 'offline' });
   await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toBeNull();
 });
+
+test.each(['control-only', 'maintenance-only'] as const)('passes %s through without adding business rules', async mode => {
+  execMock.mockResolvedValue({ kind: 'success', data: plan });
+  expect(await new EigenFluxHeartbeatPlanRunner(config).run(mode, true)).toEqual(plan);
+  expect(execMock.mock.calls[0][1]).toContain(`--${mode}`);
+  expect(execMock.mock.calls[0][1]).not.toContain('--watch-managed');
+});
+
+test('only full plans with watch enabled delegate host plugin maintenance to watch', async () => {
+  execMock.mockResolvedValue({ kind: 'success', data: plan });
+  const runner = new EigenFluxHeartbeatPlanRunner(config);
+  await runner.run(undefined, true);
+  expect(execMock.mock.calls[0][1]).toContain('--watch-managed');
+  await runner.run(undefined, false);
+  expect(execMock.mock.calls[1][1]).not.toContain('--watch-managed');
+});

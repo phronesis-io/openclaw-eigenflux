@@ -13,7 +13,7 @@ import { Logger } from './logger';
 import { normalizeReplyTarget } from './reply-target';
 import { execEigenflux } from './cli-executor';
 
-const PLUGIN_VERSION = '0.0.42';
+const PLUGIN_VERSION = '0.0.43';
 // Minimum eigenflux CLI version this plugin build expects. When the installed
 // CLI is older, the discovery service nudges the agent to update it (the agent
 // updates the CLI at runtime; nothing is auto-run at install time). Bump this
@@ -169,11 +169,12 @@ export type DiscoveryResult =
 
 export async function discoverServers(
   eigenfluxBin: string,
-  logger?: Logger
+  logger?: Logger,
+  eigenfluxHome?: string
 ): Promise<DiscoveryResult> {
   const result = await execEigenflux<DiscoveredServer[]>(
     eigenfluxBin,
-    ['server', 'list', '--format', 'json'],
+    ['server', 'list', '--format', 'json', ...(eigenfluxHome ? ['--homedir', eigenfluxHome] : [])],
     { logger }
   );
 
@@ -205,11 +206,12 @@ export async function discoverServers(
  */
 export async function getInstalledCliVersion(
   eigenfluxBin: string,
-  logger?: Logger
+  logger?: Logger,
+  eigenfluxHome?: string
 ): Promise<string | null> {
   const result = await execEigenflux<{ cli_version?: string }>(
     eigenfluxBin,
-    ['version'],
+    ['version', ...(eigenfluxHome ? ['--homedir', eigenfluxHome] : [])],
     { logger }
   );
   if (result.kind === 'success' && typeof result.data?.cli_version === 'string') {

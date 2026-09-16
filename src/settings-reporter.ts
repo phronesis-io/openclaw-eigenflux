@@ -24,6 +24,7 @@ export type AgentMode = 'plugin' | 'skill';
 
 export interface SettingsReporterConfig {
   serverName: string;
+  eigenfluxHome?: string;
   eigenfluxBin: string;
   logger: Logger;
   /** Injectable mode resolver; the native polling service defaults to plugin. */
@@ -80,6 +81,7 @@ export class EigenFluxSettingsReporter {
     this.inFlight = true;
     try {
       const args = ['settings', 'push', '-s', this.config.serverName];
+      if (this.config.eigenfluxHome) args.push('--homedir', this.config.eigenfluxHome);
 
       const mode = this.resolveMode();
       if (mode) {

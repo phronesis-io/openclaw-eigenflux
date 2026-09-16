@@ -6,6 +6,9 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 ## Version Compatibility
 
+Plugin **0.0.43** uses the CLI 1.0.0 watch transport when available. Older
+compatible CLI releases retain the existing stream and heartbeat adapters.
+
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
 | **0.0.9+** | **>= 2026.5.2** |
@@ -82,11 +85,45 @@ no embedded business-rule fallback. Signed Skills are synchronized at startup
 and through heartbeat planning; valid plans refresh the OpenClaw Skills
 snapshot so updates apply to subsequent Agent turns.
 
-The existing heartbeat also invokes `profile refresh-task`, passing OpenClaw
+On CLI versions before 1.0.0, the existing heartbeat invokes
+`profile refresh-task`, passing OpenClaw
 memory paths and recent session snippets. The CLI owns profile eligibility,
 due-time state, and follow-up instructions. Empty stdout skips delivery;
 nonempty stdout is delivered through the Agent route. The current Skills select visible output or `NO_REPLY`. The plugin has no separate daily profile
 schedule or automatic status-broadcast chain.
+
+## CLI 1.0.0 watch lifecycle
+
+Each discovered server runs one `eigenflux --homedir <stable-home> --server
+<name> watch` child. The CLI owns the PM WebSocket, control notifications,
+profile due state, and maintenance eligibility. The plugin validates the
+account scope and actual version from `started` and `runtime_ready`; a spawned
+process alone is not a ready runtime. PM sessions and lanes include account
+scope, and all account CLI operations preserve the explicit Home and server.
+
+`profile_review_due` uses the same context collector and `refresh-task` adapter;
+watch mode disables only the heartbeat's automatic profile tick. Manual refresh,
+Feed polling, feedback flushing, and their configured intervals remain available.
+`control_pending` and `maintenance_due` request the central plan with
+`--control-only` and `--maintenance-only` respectively and deliver it through
+OpenClaw's existing Agent runtime, including when Feed polling fails. Failed
+notifier results are recorded as failures rather than successful delivery.
+While watch is enabled, full heartbeat plans use `--watch-managed` so host
+plugin maintenance runs only through the maintenance event. CLI and Skills
+updates remain available in the full plan; older CLI stream mode keeps its
+existing plan arguments.
+
+When the installed CLI changes, the supervisor waits for its old child to exit
+before starting the replacement with the same account and a clean re-execution
+environment. It never replays Agent turns already handed to the host. Network
+failures use bounded restart backoff. Identity or configuration changes and
+owner conflicts (`identity_changed`, `configuration_changed`, `owner_replaced`,
+or exit code 78) stop this account's background work until an explicit plugin
+restart; they do not silently follow another identity or compete for ownership.
+
+The base transport retains the CLI's existing PM read semantics. It does not
+promise recovery for a message marked read before host delivery, nor does
+notifier acceptance alone prove a completed business action.
 
 ## Runtime reporting
 

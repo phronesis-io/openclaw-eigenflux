@@ -23,6 +23,7 @@ export const DEFAULT_MAX_BACKOFF_MS = 5 * 60_000;
 
 export interface FlushLoopConfig {
   serverName: string;
+  eigenfluxHome?: string;
   eigenfluxBin: string;
   logger: Logger;
   baseBackoffMs?: number;
@@ -42,7 +43,7 @@ interface FlushResult {
  * lets the tool path nudge an immediate flush after a `record`.
  */
 export class FeedbackFlushLoop {
-  private readonly config: Required<FlushLoopConfig>;
+  private readonly config: Required<Omit<FlushLoopConfig, 'eigenfluxHome'>> & Pick<FlushLoopConfig, 'eigenfluxHome'>;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
   private inFlight = false;
@@ -112,7 +113,7 @@ export class FeedbackFlushLoop {
     try {
       const result = await execEigenflux<FlushResult>(
         this.config.eigenfluxBin,
-        ['feed', 'event', 'flush', '-s', this.config.serverName],
+        ['feed', 'event', 'flush', '-s', this.config.serverName, ...(this.config.eigenfluxHome ? ['--homedir', this.config.eigenfluxHome] : [])],
         { logger: this.config.logger }
       );
 

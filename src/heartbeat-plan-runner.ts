@@ -28,7 +28,7 @@ export class EigenFluxHeartbeatPlanRunner {
   constructor(private readonly config: HeartbeatPlanRunnerConfig) {}
 
   /** Fetch the current CLI instructions and delivery decision for this server. */
-  async run(): Promise<HeartbeatExecutionPlan | null> {
+  async run(mode?: 'control-only' | 'maintenance-only', watchManaged = false): Promise<HeartbeatExecutionPlan | null> {
     if (this.inFlight) {
       this.config.logger.debug('Heartbeat plan skipped because a run is already in flight');
       return null;
@@ -47,6 +47,8 @@ export class EigenFluxHeartbeatPlanRunner {
           'plan',
           '--format',
           'json',
+          ...(mode ? [`--${mode}`] : []),
+          ...(!mode && watchManaged ? ['--watch-managed'] : []),
         ],
         // Allow two CLI update attempts plus Skills sync and rollback time.
         { logger: this.config.logger, timeout: 300_000 }

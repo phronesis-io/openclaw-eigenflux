@@ -21,11 +21,12 @@ export const MAX_POLL_INTERVAL_SEC = 24 * 60 * 60;
 export async function readPollIntervalSec(
   eigenfluxBin: string,
   serverName: string,
-  logger: Logger
+  logger: Logger,
+  eigenfluxHome?: string
 ): Promise<number> {
   const result = await execEigenflux<unknown>(
     eigenfluxBin,
-    ['config', 'get', '--key', POLL_INTERVAL_CONFIG_KEY, '--server', serverName, '--format', 'json'],
+    ['config', 'get', '--key', POLL_INTERVAL_CONFIG_KEY, '--server', serverName, '--format', 'json', ...(eigenfluxHome ? ['--homedir', eigenfluxHome] : [])],
     { logger }
   );
 
@@ -106,6 +107,7 @@ export interface FeedResponse {
 
 export interface PollingClientConfig {
   serverName: string;
+  eigenfluxHome?: string;
   eigenfluxBin: string;
   /** Actual model observed for this runtime; absent until ownership is verified. */
   resolveModel?: () => string | undefined;
@@ -255,7 +257,7 @@ export class EigenFluxPollingClient {
 
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
-          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json'],
+          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json', ...(this.config.eigenfluxHome ? ['--homedir', this.config.eigenfluxHome] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
 

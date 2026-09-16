@@ -52,6 +52,7 @@ export interface PmStreamEvent {
 
 export interface StreamClientConfig {
   serverName: string;
+  eigenfluxHome?: string;
   eigenfluxBin: string;
   logger: Logger;
   onPmEvent: (event: PmStreamEvent) => Promise<void>;
@@ -143,6 +144,7 @@ export class EigenFluxStreamClient {
     }
 
     const args = ['stream', '-s', this.config.serverName, '-f', 'json'];
+    if (this.config.eigenfluxHome) args.push('--homedir', this.config.eigenfluxHome);
     if (this.lastCursor) {
       args.push('--cursor', this.lastCursor);
     }
@@ -153,7 +155,7 @@ export class EigenFluxStreamClient {
 
     const child = spawn(this.config.eigenfluxBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cliEnvironment(),
+      env: cliEnvironment({ EIGENFLUX_HOME: this.config.eigenfluxHome ?? process.env.EIGENFLUX_HOME, EIGENFLUX_UPDATE_REEXEC: undefined }),
     });
     this.child = child;
 

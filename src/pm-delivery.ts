@@ -45,7 +45,7 @@ export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatc
   const hasRelationEvent =
     (data.friend_requests?.length ?? 0) > 0 ||
     (data.friend_responses?.length ?? 0) > 0 ||
-    event.type === 'friend_accepted';
+    (event.type === 'friend_accepted' || event.type === 'friend_rejected');
   if (hasRelationEvent) {
     batches.push({
       conversationKey: 'relations',
@@ -63,17 +63,19 @@ export function splitPmEventByConversation(event: PmStreamEvent): PmDeliveryBatc
 export function buildPmSessionKey(
   serverName: string,
   peerKey: string,
-  conversationKey: string
+  conversationKey: string,
+  stateScope?: string
 ): string {
-  return `eigenflux:pm:${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
+  return `eigenflux:pm:${stateScope ? `${stableKey(stateScope)}:` : ''}${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
 }
 
 export function buildPmLane(
   serverName: string,
   peerKey: string,
-  conversationKey: string
+  conversationKey: string,
+  stateScope?: string
 ): string {
-  return `eigenflux-pm:${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
+  return `eigenflux-pm:${stateScope ? `${stableKey(stateScope)}:` : ''}${stableKey(serverName)}:${stableKey(peerKey)}:${stableKey(conversationKey)}`;
 }
 
 function resolveMessagePeerKey(

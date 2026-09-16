@@ -11,6 +11,8 @@ import {
   type FeedResponse,
 } from './polling-client';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
+import { EigenFluxWatchClient, type WatchEvent } from './watch-client';
+import { createHash } from 'crypto';
 import { EigenFluxProfileRefresher } from './profile-refresher';
 import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
 import { EigenFluxSettingsReporter } from './settings-reporter';
@@ -88,7 +90,7 @@ type ServerRuntime = {
   credentialsLoader: CredentialsLoader;
   notifier: EigenFluxNotifier;
   feedPoller: EigenFluxPollingClient;
-  streamClient: EigenFluxStreamClient;
+  streamClient: EigenFluxWatchClient;
   profileRefresher: EigenFluxProfileRefresher;
   settingsReporter: EigenFluxSettingsReporter;
   flushLoop: FeedbackFlushLoop;
@@ -152,12 +154,13 @@ async function refreshOpenClawSkillsSnapshot(logger: Logger): Promise<void> {
 export async function syncPluginSkills(
   eigenfluxBin: string,
   logger: Logger,
-  refreshSnapshot: SkillsSnapshotRefresher = () => refreshOpenClawSkillsSnapshot(logger)
+  refreshSnapshot: SkillsSnapshotRefresher = () => refreshOpenClawSkillsSnapshot(logger),
+  eigenfluxHome?: string
 ): Promise<void> {
   try {
     const res = await execEigenflux(
       eigenfluxBin,
-      ['skills', 'sync', '--if-stale', '--quiet', '--host', 'openclaw'],
+      ['skills', 'sync', '--if-stale', '--quiet', '--host', 'openclaw', ...(eigenfluxHome ? ['--homedir', eigenfluxHome] : [])],
       { logger, parseJson: false }
     );
     if (res.kind === 'success') {
@@ -198,7 +201,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
     start: async () => {
       logger.info('Starting EigenFlux discovery service...');
 
-      const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
+      const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger, eigenfluxHome);
       if (discovery.kind === 'not_installed') {
         logger.warn(
           `EigenFlux CLI not installed (bin=${discovery.bin}); delivering install prompt to user`
@@ -213,7 +216,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       // Pull the latest signed bundle into OpenClaw's user-level Skills dir.
       // Non-blocking and offline-safe; a successful sync refreshes the Skills
       // snapshot for the next agent turn.
-      void syncPluginSkills(pluginConfig.eigenfluxBin, logger);
+      void syncPluginSkills(pluginConfig.eigenfluxBin, logger, undefined, eigenfluxHome);
 
       const servers = discovery.servers;
       if (servers.length === 0) {
@@ -238,8 +241,8 @@ function registerPlugin(api: OpenClawPluginApi): void {
       for (const runtime of runtimes) {
         logger.info(`Starting services for server=${runtime.server.name}`);
         runtime.profileRefresher.start();
-        await runtime.feedPoller.start();
         await runtime.streamClient.start();
+        await runtime.feedPoller.start();
         runtime.flushLoop.start();
       }
 
@@ -247,7 +250,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       // nudge the agent to update it (informational — services keep running on
       // the current version; the agent performs the update at runtime).
       if (!outdatedPromptDelivered) {
-        const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
+        const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger, eigenfluxHome);
         if (isCliOutdated(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
           outdatedPromptDelivered = true;
           logger.warn(
@@ -387,6 +390,7 @@ function registerFollowupTool(
           {
             eigenfluxBin,
             serverName: runtime.server.name,
+            eigenfluxHome: runtime.getPromptContext().eigenfluxHome,
             logger,
           },
           raw
@@ -538,6 +542,7 @@ function createServerRuntime(
   // and opportunistically flushes). The plugin's only resident piece is the
   // retry cadence below, which drives `feed event flush` with back-off.
   const flushLoop = new FeedbackFlushLoop({
+    eigenfluxHome,
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
@@ -575,9 +580,9 @@ function createServerRuntime(
     }
 
     lastAuthPromptKey = promptKey;
-    await notifier.deliver(
+    if (!await notifier.deliver(
       buildAuthRequiredPromptTemplate({ context: getPromptContext() })
-    );
+    )) { lastAuthPromptKey = null; logger.warn('EigenFlux auth prompt delivery failed'); }
   };
 
   // Pushes the agent's runtime mode to the backend once per heartbeat via the
@@ -585,6 +590,7 @@ function createServerRuntime(
   // and reading feed_delivery_preference from its own config. Best-effort:
   // never interrupts polling.
   const settingsReporter = new EigenFluxSettingsReporter({
+    eigenfluxHome,
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
@@ -646,7 +652,7 @@ function createServerRuntime(
     feedDeliveryStartedAt = startedAt;
     activeFeedDelivery = notifier.deliver(prompt, options).finally(() => {
       const duration = Date.now() - startedAt;
-      logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
+      logger.info(`Feed delivery settled for server=${server.name} in ${Math.round(duration / 1000)}s`);
       // Only clear flags if this delivery is still the current one.
       // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
       if (feedDeliveryStartedAt === startedAt) {
@@ -655,7 +661,7 @@ function createServerRuntime(
       }
     });
 
-    await activeFeedDelivery;
+    if (!await activeFeedDelivery) throw new Error('EigenFlux Feed Agent delivery failed');
   }
 
   // Busy-aware push for the default mode: pick a quiet moment on the main
@@ -683,7 +689,9 @@ function createServerRuntime(
     const prompt = buildHeartbeatExecutionPromptTemplate(plan.agent_prompt, payload, getPromptContext());
     switch (process.env.EIGENFLUX_FEED_DELIVERY) {
       case 'system-event':
-        void notifier.deliverToMainSession(prompt).catch((err) =>
+        void notifier.deliverToMainSession(prompt).then(delivered => {
+          if (!delivered) throw new Error('Heartbeat main-session delivery failed');
+        }).catch((err) =>
           logger.error(`Heartbeat main-session delivery error for server=${server.name}: ${String(err)}`)
         );
         return;
@@ -703,14 +711,16 @@ function createServerRuntime(
   };
 
   const feedPoller = new EigenFluxPollingClient({
+    eigenfluxHome,
     resolveModel: () => settingsReporter.getObservedModel(),
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     resolvePollIntervalSec: () =>
-      readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
+      readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger, eigenfluxHome),
     logger,
     onHeartbeatStart: async () => {
-      currentHeartbeatPlan = await heartbeatPlanRunner.run();
+      currentHeartbeatPlan = await heartbeatPlanRunner.run(undefined, streamClient.isWatchEnabled());
+      await streamClient.refreshVersion();
       if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
     },
     onFeedPolled: async (payload: FeedResponse) => {
@@ -751,6 +761,7 @@ function createServerRuntime(
         // the poll loop needs no backpressure guard and never stalls on delivery.
         void notifier
           .deliverToMainSession(buildFeedPayloadPromptTemplate(payload, getPromptContext()))
+          .then(delivered => { if (!delivered) throw new Error('Feed main-session delivery failed'); })
           .catch((err) =>
             logger.error(`Feed main-session delivery error for server=${server.name}: ${String(err)}`)
           );
@@ -783,7 +794,7 @@ function createServerRuntime(
       // (from an out-of-band `record`) drain even on an idle server. The loop
       // owns the back-off; this is just an opportunistic kick.
       flushLoop.kick();
-      void profileRefresher.tick();
+      if (!streamClient.isWatchEnabled()) void profileRefresher.tick();
       // The CLI plan decides whether an empty poll needs an Agent turn.
       if ((payload.data?.items?.length ?? 0) === 0 && (payload.data?.notifications?.length ?? 0) === 0) {
         await scheduleHeartbeatExecution(payload);
@@ -792,10 +803,32 @@ function createServerRuntime(
     onAuthRequired: notifyAuthRequired,
   });
 
-  const streamClient = new EigenFluxStreamClient({
+  const fallbackScope = createHash('sha256').update(JSON.stringify([eigenfluxHome, server.name, credentialsLoader.loadAgentId() ?? ''])).digest('hex');
+  const streamClient = new EigenFluxWatchClient({
+    eigenfluxHome,
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
+    onIdentityChanged: async () => {
+      feedPushScheduler.stop();
+      profileRefresher.stop();
+      flushLoop.stop();
+      await feedPoller.stop();
+      logger.error('EigenFlux account changed; restart the plugin explicitly before background processing resumes');
+    },
+    onWatchEvent: async (event: WatchEvent) => {
+      if (event.type === 'profile_review_due') { await profileRefresher.tick(); return; }
+      const mode = event.type === 'control_pending' ? 'control-only' : 'maintenance-only';
+      const plan = await heartbeatPlanRunner.run(mode);
+      if (!plan) throw new Error(`No compatible ${mode} plan`);
+      await refreshOpenClawSkillsSnapshot(logger);
+      const delivered = await notifier.deliver(plan.agent_prompt, {
+        persistentSessionKey: `eigenflux:${event.state_scope}:${mode}`,
+        lane: `eigenflux:${event.state_scope}:${mode}`,
+      });
+      if (!delivered) throw new Error(`${mode} Agent delivery failed`);
+      if (mode === 'maintenance-only') await streamClient.refreshVersion();
+    },
     onPmEvent: async (event: PmStreamEvent) => {
       resetAuthPromptGate();
       // Deliver when the event carries anything actionable. Friend events
@@ -806,20 +839,21 @@ function createServerRuntime(
         (data.messages?.length ?? 0) > 0 ||
         (data.friend_requests?.length ?? 0) > 0 ||
         (data.friend_responses?.length ?? 0) > 0 ||
-        event.type === 'friend_accepted';
+        (event.type === 'friend_accepted' || event.type === 'friend_rejected');
       if (actionable) {
         const batches = splitPmEventByConversation(event);
-        await Promise.all(
+        const results = await Promise.all(
           batches.map(({ conversationKey, peerKey, event: conversationEvent }) =>
             notifier.deliver(
               buildPmStreamEventPromptTemplate(conversationEvent, getPromptContext()),
               {
-                persistentSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey),
-                lane: buildPmLane(server.name, peerKey, conversationKey),
+                persistentSessionKey: buildPmSessionKey(server.name, peerKey, conversationKey, (event as Partial<WatchEvent>).state_scope ?? fallbackScope),
+                lane: buildPmLane(server.name, peerKey, conversationKey, (event as Partial<WatchEvent>).state_scope ?? fallbackScope),
               }
             )
           )
         );
+        if (results.some(result => !result)) throw new Error('EigenFlux PM Agent delivery failed');
       }
     },
     onAuthRequired: async () => {
@@ -828,6 +862,7 @@ function createServerRuntime(
   });
 
   const profileRefresher = new EigenFluxProfileRefresher({
+    eigenfluxHome,
     serverName: server.name,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
@@ -837,7 +872,7 @@ function createServerRuntime(
     },
     onRefreshPrompt: async (prompt: string) => {
       resetAuthPromptGate();
-      await notifier.deliver(prompt);
+      if (!await notifier.deliver(prompt)) throw new Error('EigenFlux Card Agent delivery failed');
     },
     onAuthRequired: async () => {
       await notifyAuthRequired({ reason: 'auth_required' });
@@ -892,7 +927,7 @@ function registerCommand(
   let inflightDiscovery: Promise<EnsureRuntimesResult> | null = null;
 
   const runDiscovery = async (): Promise<EnsureRuntimesResult> => {
-    const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
+    const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger, eigenfluxHome);
     if (discovery.kind === 'not_installed') {
       return { runtimes: getRuntimes(), notInstalledBin: discovery.bin };
     }
@@ -928,7 +963,7 @@ function registerCommand(
 
       if (parsed.command === 'version') {
         return {
-          text: await buildVersionText(pluginConfig.eigenfluxBin),
+          text: await buildVersionText(pluginConfig.eigenfluxBin, eigenfluxHome),
         };
       }
 
@@ -1239,7 +1274,7 @@ async function buildProfileText(
 ): Promise<string> {
   const result = await execEigenflux<JsonApiSuccess<ProfileResponseData>>(
     eigenfluxBin,
-    ['profile', 'show', '-s', runtime.server.name, '-f', 'json']
+    ['profile', 'show', '-s', runtime.server.name, '-f', 'json', '--homedir', runtime.getPromptContext().eigenfluxHome]
   );
 
   if (result.kind === 'auth_required') {
@@ -1282,8 +1317,8 @@ async function buildFeedText(runtime: ServerRuntime): Promise<string> {
   }
 }
 
-async function buildVersionText(eigenfluxBin: string): Promise<string> {
-  const result = await execEigenflux<unknown>(eigenfluxBin, ['version']);
+async function buildVersionText(eigenfluxBin: string, eigenfluxHome?: string): Promise<string> {
+  const result = await execEigenflux<unknown>(eigenfluxBin, ['version', ...(eigenfluxHome ? ['--homedir', eigenfluxHome] : [])]);
 
   if (result.kind === 'not_installed') {
     return `EigenFlux CLI not installed (bin=${result.bin}). ${INSTALL_GUIDANCE}`;

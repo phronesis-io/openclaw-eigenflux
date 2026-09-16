@@ -79,6 +79,7 @@ function collectItemIds(raw: FollowupInput): string[] {
 export interface FollowupDeps {
   eigenfluxBin: string;
   serverName: string;
+  eigenfluxHome?: string;
   logger: Logger;
 }
 
@@ -106,6 +107,7 @@ export async function handleFollowup(deps: FollowupDeps, raw: FollowupInput): Pr
     args.push('--brief', raw.brief.slice(0, 200));
   }
 
+  if (deps.eigenfluxHome) args.push('--homedir', deps.eigenfluxHome);
   const result = await execEigenflux<FollowupResult>(deps.eigenfluxBin, args, {
     logger: deps.logger,
   });
