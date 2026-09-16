@@ -70,6 +70,7 @@ export class EigenFluxStreamClient {
   private backoffMs = INITIAL_BACKOFF_MS;
   private consecutiveFailures = 0;
   private restartTimer: NodeJS.Timeout | null = null;
+  private stopPromise: Promise<void> | null = null;
 
   constructor(config: StreamClientConfig) {
     this.config = config;
@@ -96,6 +97,7 @@ export class EigenFluxStreamClient {
   }
 
   async stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     if (!this.running) {
       return;
     }
@@ -118,23 +120,34 @@ export class EigenFluxStreamClient {
       const child = this.child;
       this.child = null;
 
-      child.kill('SIGTERM');
-
-      await new Promise<void>((resolve) => {
+      this.stopPromise = new Promise<void>((resolve, reject) => {
+        if (child.exitCode != null || child.signalCode != null) { resolve(); return; }
+        const finish = () => {
+          clearTimeout(forceKillTimer);
+          clearTimeout(deadline);
+          child.removeListener('exit', finish);
+          child.removeListener('close', finish);
+          resolve();
+        };
         const forceKillTimer = setTimeout(() => {
           try {
             child.kill('SIGKILL');
           } catch {
-            // Process already exited
+            // Exit/close remains authoritative; the deadline bounds the wait.
           }
-          resolve();
         }, STOP_GRACE_MS);
-
-        child.once('exit', () => {
+        const deadline = setTimeout(() => {
           clearTimeout(forceKillTimer);
-          resolve();
-        });
+          child.removeListener('exit', finish);
+          child.removeListener('close', finish);
+          reject(new Error('stream child did not exit; replacement suppressed'));
+        }, STOP_GRACE_MS + 5000);
+        child.once('exit', finish);
+        child.once('close', finish);
+        child.kill('SIGTERM');
       });
+      await this.stopPromise;
+      this.stopPromise = null;
     }
   }
 

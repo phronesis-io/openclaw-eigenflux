@@ -16,6 +16,7 @@ export interface WatchClientConfig extends StreamClientConfig {
   eigenfluxHome: string;
   onWatchEvent: (event: WatchEvent) => Promise<void>;
   onIdentityChanged?: () => void | Promise<void>;
+  onFatal?: () => void | Promise<void>;
   version?: () => Promise<string | null>;
   stopGraceMs?: number;
   retryMs?: number;
@@ -43,7 +44,6 @@ export class EigenFluxWatchClient {
   private version: string | null = null;
   private ready = false;
   private active = new Map<string, Promise<void>>();
-  private pmQueue: Promise<void> = Promise.resolve();
   private queued = 0;
   private handoff: Promise<void> | null = null;
   private upgradeTo: string | null = null;
@@ -77,7 +77,8 @@ export class EigenFluxWatchClient {
     const version = await (this.config.version?.() ?? getInstalledCliVersion(this.config.eigenfluxBin, this.config.logger, this.config.eigenfluxHome));
     if (!this.running || !supportsWatch(version)) return;
     if (!this.watch) {
-      await this.legacy.stop();
+      try { await this.legacy.stop(); }
+      catch (error) { this.fail(error); return; }
       if (!this.running) return;
       this.watch = true;
       this.launch();
@@ -123,13 +124,13 @@ export class EigenFluxWatchClient {
         this.blockIdentity(); return;
       }
       if (this.upgradeTo) {
-        const installed = cli_version.replace(/^v/, '').split('.').map(Number);
-        const wanted = this.upgradeTo.replace(/^v/, '').split('.').map(Number);
+        const installed = cli_version.replace(/^v/, '').split('+')[0].split('.').map(Number);
+        const wanted = this.upgradeTo.replace(/^v/, '').split('+')[0].split('.').map(Number);
         const difference = installed.map((n, i) => n - wanted[i]).find(n => n !== 0) ?? 0;
         if (difference < 0) {
           this.rejecting = true;
           this.config.logger.error('watch replacement did not adopt installed version');
-          void this.terminate().catch(error => { this.blocked = true; this.config.logger.error(String(error)); });
+          void this.terminate().catch(error => this.fail(error));
           return;
         }
       }
@@ -159,11 +160,18 @@ export class EigenFluxWatchClient {
       return;
     }
     if (['pm_push', 'friend_accepted', 'friend_rejected'].includes(event.type)) {
-      if (this.queued >= 64) { this.config.logger.error('watch PM delivery queue full; stopping consumer'); void this.stop(); return; }
       this.queued++;
-      this.pmQueue = this.pmQueue.then(async () => { if (this.running && !this.blocked) await this.config.onPmEvent(event); }).catch(error => {
+      // The notifier serializes each conversation. Pause stdout, not other
+      // conversations, while the host drains its accepted deliveries.
+      if (this.queued >= 64) this.lines?.pause();
+      void Promise.resolve().then(async () => {
+        if (this.running && !this.blocked) await this.config.onPmEvent(event);
+      }).catch(error => {
         this.config.logger.error(`watch PM delivery failed: ${String(error)}`);
-      }).finally(() => { this.queued--; });
+      }).finally(() => {
+        this.queued--;
+        if (this.queued < 32 && this.running && !this.blocked && !this.handoff) this.lines?.resume();
+      });
       return;
     }
     if (['profile_review_due', 'control_pending', 'maintenance_due'].includes(event.type)) {
@@ -177,14 +185,27 @@ export class EigenFluxWatchClient {
   private blockIdentity(): void {
     if (this.blocked) return;
     this.blocked = true;
-    void Promise.resolve().then(() => this.config.onIdentityChanged?.()).catch(error => this.config.logger.error(String(error)));
+    try {
+      void Promise.resolve(this.config.onIdentityChanged?.()).catch(error => this.config.logger.error(String(error)));
+    } catch (error) { this.config.logger.error(String(error)); }
     this.config.logger.error('watch identity mismatch; explicit account restart required');
     void this.stop().catch(error => this.config.logger.error(String(error)));
   }
   private scheduleRestart(): void {
     if (!this.running || this.blocked || this.handoff || this.retry) return;
-    if (++this.failures > 20) { this.running = false; this.config.logger.error('watch restart budget exhausted'); return; }
+    if (++this.failures > 20) { this.fail(new Error('watch restart budget exhausted')); return; }
     this.retry = setTimeout(() => { this.retry = null; this.launch(); }, this.config.retryMs ?? Math.min(1000 * 2 ** (this.failures - 1), 60_000));
+  }
+  private fail(error: unknown): void {
+    if (this.blocked) return;
+    this.blocked = true;
+    this.running = false;
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = null;
+    this.config.logger.error(String(error));
+    try {
+      void Promise.resolve(this.config.onFatal?.()).catch(err => this.config.logger.error(String(err)));
+    } catch (err) { this.config.logger.error(String(err)); }
   }
   private async terminate(): Promise<void> {
     const child = this.child;
@@ -206,7 +227,7 @@ export class EigenFluxWatchClient {
       // Existing Agent turns remain owned by the host and are never replayed.
       await this.terminate();
       if (this.running) this.launch();
-    })().catch(error => { this.blocked = true; this.config.logger.error(String(error)); }).finally(() => { this.handoff = null; });
+    })().catch(error => this.fail(error)).finally(() => { this.handoff = null; });
     await this.handoff;
   }
 }

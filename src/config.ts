@@ -245,14 +245,14 @@ export function isCliOutdated(installed: string | null, target: string): boolean
 export function resolveEigenfluxHome(baseDir?: string): string {
   const envHome = process.env.EIGENFLUX_HOME;
   if (envHome) {
-    const expanded = expandHomeDir(envHome);
-    if (!expanded.endsWith('.eigenflux')) {
+    const expanded = path.resolve(expandHomeDir(envHome));
+    if (path.basename(expanded) !== '.eigenflux') {
       return path.join(expanded, '.eigenflux');
     }
     return expanded;
   }
   if (baseDir) {
-    return path.join(baseDir, '.eigenflux');
+    return path.resolve(expandHomeDir(baseDir), '.eigenflux');
   }
   return path.join(os.homedir(), '.eigenflux');
 }

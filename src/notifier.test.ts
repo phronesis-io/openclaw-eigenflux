@@ -1023,3 +1023,27 @@ describe('EigenFluxNotifier', () => {
     });
   });
 });
+
+test('a stopped runtime cannot dispatch after route resolution or from the conversation queue', async () => {
+  let active = true;
+  let release!: () => void;
+  const waiting = new Promise<void>(resolve => { release = resolve; });
+  const run = jest.fn().mockResolvedValue({ runId: 'must-not-run' });
+  const notifier = new EigenFluxNotifier(
+    createApi({ runtime: { subagent: { run } } as any }),
+    createLogger(), { ...createConfig(), isActive: () => active }
+  );
+  const route = jest.spyOn(notifier as any, 'resolveRoute').mockImplementation(async () => {
+    await waiting;
+    return { route: createConfig(), source: 'configured' };
+  });
+  const first = notifier.deliver('first', { persistentSessionKey: 'stopped-conversation' });
+  const second = notifier.deliver('second', { persistentSessionKey: 'stopped-conversation' });
+  await Promise.resolve();
+  await Promise.resolve();
+  active = false;
+  release();
+  expect(await Promise.all([first, second])).toEqual([false, false]);
+  expect(run).not.toHaveBeenCalled();
+  route.mockRestore();
+});

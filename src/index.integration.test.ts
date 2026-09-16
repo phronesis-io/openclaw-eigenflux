@@ -524,4 +524,61 @@ describe('register integration', () => {
     } finally {enabled.mockRestore();await services[0].stop();}
   });
 
+  test.each(['onIdentityChanged', 'onFatal'])('delayed watch plan cannot deliver after %s', async stopHook => {
+    feedItems = []; wakeOnEmpty = false; profileTask = '';
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'should-not-run' });
+    plugin.register({ registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    let release!: () => void;
+    const delayed = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await services[0].start();
+      const implementation = execEigenfluxMock.getMockImplementation();
+      execEigenfluxMock.mockImplementation(async (...args: any[]) => {
+        if (args[1].includes('--control-only')) await delayed;
+        return implementation!(...args);
+      });
+      const delivery = streamClientConfig.onWatchEvent({ type: 'control_pending', state_scope: 'old-account', data: {} });
+      await streamClientConfig[stopHook]();
+      release();
+      await delivery;
+      expect(subagentRun).not.toHaveBeenCalled();
+    } finally { release(); await services[0].stop(); }
+  });
+
+  test.each(['stream', 'plan', 'feed'])('identity stop during startup %s does not restart later services', async phase => {
+    feedItems = []; wakeOnEmpty = false; profileTask = '';
+    jest.resetModules();
+    const { FeedbackFlushLoop } = await import('./feedback-flush-loop');
+    const flushStart = jest.spyOn(FeedbackFlushLoop.prototype, 'start');
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const subagentRun = jest.fn().mockResolvedValue({ runId: 'should-not-run' });
+    plugin.register({ registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    const implementation = execEigenfluxMock.getMockImplementation();
+    if (phase === 'stream') streamClientStartMock.mockImplementationOnce(async () => { await streamClientConfig.onIdentityChanged(); });
+    execEigenfluxMock.mockImplementation(async (...args: any[]) => {
+      if ((phase === 'plan' && args[1].includes('plan')) || (phase === 'feed' && args[1][0] === 'feed')) {
+        await streamClientConfig.onIdentityChanged();
+      }
+      return implementation!(...args);
+    });
+    try {
+      await services[0].start();
+      expect(flushStart).not.toHaveBeenCalled();
+      expect(subagentRun).not.toHaveBeenCalled();
+      if (phase !== 'feed') expect(execEigenfluxMock.mock.calls.some(([, args]) => args[0] === 'feed')).toBe(false);
+    } finally { await services[0].stop(); flushStart.mockRestore(); }
+  });
+
 });

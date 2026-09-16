@@ -106,6 +106,7 @@ export interface FeedResponse {
 }
 
 export interface PollingClientConfig {
+  isActive?: () => boolean;
   serverName: string;
   eigenfluxHome?: string;
   eigenfluxBin: string;
@@ -243,6 +244,7 @@ export class EigenFluxPollingClient {
       const notifyAuthRequired = options.notifyAuthRequired ?? true;
 
       try {
+        if (this.config.isActive?.() === false) return { kind: 'error', error: new Error('Runtime stopped') };
         if (this.config.onHeartbeatStart) {
           try {
             await this.config.onHeartbeatStart();
@@ -253,6 +255,8 @@ export class EigenFluxPollingClient {
           }
         }
 
+        if (this.config.isActive?.() === false) return { kind: 'error', error: new Error('Runtime stopped') };
+
         this.config.logger.info(`Polling feed via CLI for server=${this.config.serverName}`);
 
         const result = await execEigenflux<FeedResponseData>(
@@ -260,6 +264,8 @@ export class EigenFluxPollingClient {
           ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json', ...(this.config.eigenfluxHome ? ['--homedir', this.config.eigenfluxHome] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
+
+        if (this.config.isActive?.() === false) return { kind: 'error', error: new Error('Runtime stopped') };
 
         if (result.kind === 'auth_required') {
           const authEvent: AuthRequiredEvent = { reason: 'auth_required' };

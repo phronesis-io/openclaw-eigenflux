@@ -134,6 +134,7 @@ const BACKGROUND_LANE = 'eigenflux-bg';
 const HEARTBEAT_REASON = 'plugin:eigenflux';
 
 export type EigenFluxNotifierConfig = {
+  isActive?: () => boolean;
   store?: PluginRuntimeStore;
   eigenfluxBin?: string;
   serverName?: string;
@@ -223,6 +224,7 @@ export class EigenFluxNotifier {
   }
 
   private async deliverCoordinated(message: string, options?: DeliverOptions): Promise<boolean> {
+    if (this.config.isActive?.() === false) return false;
     const targetKey = options?.targetSessionKey;
     const persistentKey = options?.persistentSessionKey;
     const silent = options?.silent === true;
@@ -524,6 +526,9 @@ export class EigenFluxNotifier {
 
     const errors: string[] = [];
     for (const attempt of attempts) {
+      if (this.config.isActive?.() === false) {
+        return { result: { ok: false, mode: 'stopped', error: 'Runtime stopped', terminal: true }, finalRoute: route, errors };
+      }
       const result = await attempt();
       if (result.ok) {
         const finalRoute: ResolvedNotificationRoute = {
@@ -686,6 +691,7 @@ export class EigenFluxNotifier {
     message: string,
     route: ResolvedNotificationRoute
   ): Promise<NotifyAttemptResult> {
+    if (this.config.isActive?.() === false) return { ok: false, mode: 'stopped', error: 'Runtime stopped', terminal: true };
     const runtimeSystem = this.runtime.system;
 
     if (
@@ -745,6 +751,7 @@ export class EigenFluxNotifier {
     argv: string[],
     route: ResolvedNotificationRoute
   ): Promise<NotifyAttemptResult> {
+    if (this.config.isActive?.() === false) return { ok: false, mode: 'stopped', error: 'Runtime stopped', terminal: true };
     const runtimeCommand = this.runtime.system?.runCommandWithTimeout;
 
     if (typeof runtimeCommand !== 'function') {

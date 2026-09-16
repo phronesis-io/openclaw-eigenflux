@@ -109,3 +109,79 @@ test('fatal exit 78 stops the whole account even when no diagnostic reaches stdo
   await client.start();
   expect(client.isRunning()).toBe(false);
 });
+
+test('a slow PM does not block another conversation and bursts drain without stopping watch', async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const onPmEvent = jest.fn(async () => blocked);
+  const { client } = make(prelude + `for(let i=0;i<65;i++)send('pm_push',{messages:[{conv_id:String(i)}]});setInterval(()=>{},1000);`, { onPmEvent });
+  await client.start();
+  await wait(() => onPmEvent.mock.calls.length >= 2);
+  expect(client.isRunning()).toBe(true);
+  release();
+  await wait(() => onPmEvent.mock.calls.length === 65);
+  expect(client.isRunning()).toBe(true);
+});
+
+test('build metadata cannot hide a replacement running an older patch', async () => {
+  const file = join(home, 'runs');
+  const { client } = make(`
+const file=home+'/runs';const runs=fs.existsSync(file)?Number(fs.readFileSync(file,'utf8'))+1:1;fs.writeFileSync(file,String(runs));
+let n=0;const send=(type,data)=>console.log(JSON.stringify({schema_version:'eigenflux_watch.v1',event_id:String(++n),state_scope:'a',type,data}));
+const identity={home,server:'alpha',agent_id:'agent-a',cli_version:'1.0.0+old'};
+send('started',identity);send('runtime_ready',identity);if(runs===1)send('restart_required',{cli_version:'1.0.1+new'});
+setInterval(()=>{},1000);
+`, { retryMs: 1000 });
+  await client.start();
+  await wait(() => existsSync(file) && readFileSync(file, 'utf8') === '2' && !client.isRunning());
+  expect(client.isReady()).toBe(false);
+});
+
+test('exhausted process retries notify the host instead of leaving a silent maintenance owner', async () => {
+  const onFatal = jest.fn();
+  const { client } = make(`process.exit(1);`, { onFatal, retryMs: 1 });
+  await client.start();
+  await wait(() => onFatal.mock.calls.length === 1);
+  expect(client.isRunning()).toBe(false);
+  await client.start();
+  expect(client.isRunning()).toBe(false);
+});
+
+test.each(['identity', 'fatal'])('PM microtasks cannot start after a same-chunk %s stop', async reason => {
+  const { client, pm } = make('');
+  Object.assign(client, { running: true, watch: true, started: true, scope: 'account-a' });
+  (client as any).receive(JSON.stringify({ schema_version: 'eigenflux_watch.v1', event_id: 'pm-1', state_scope: 'account-a', type: 'pm_push', data: { messages: [] } }));
+  if (reason === 'identity') {
+    (client as any).receive(JSON.stringify({ schema_version: 'eigenflux_watch.v1', event_id: 'identity-1', state_scope: 'account-a', type: 'diagnostic', data: { code: 'identity_changed' } }));
+  } else {
+    (client as any).fail(new Error('fatal'));
+  }
+  await Promise.resolve();
+  expect(pm).not.toHaveBeenCalled();
+});
+
+test.each(['identity', 'fatal'])('a resolved plan cannot outrun the synchronous %s host stop', async reason => {
+  let active = true;
+  let resolvePlan!: () => void;
+  const plan = new Promise<void>(resolve => { resolvePlan = resolve; });
+  const deliver = jest.fn();
+  const onWatchEvent = jest.fn(async () => {
+    await plan;
+    if (active) deliver();
+  });
+  const stopHost = () => { active = false; };
+  const { client } = make('', { onWatchEvent, onIdentityChanged: stopHost, onFatal: stopHost });
+  Object.assign(client, { running: true, watch: true, started: true, scope: 'account-a' });
+  (client as any).receive(JSON.stringify({ schema_version: 'eigenflux_watch.v1', event_id: 'control-1', state_scope: 'account-a', type: 'control_pending', data: {} }));
+  await Promise.resolve();
+  expect(onWatchEvent).toHaveBeenCalledTimes(1);
+  resolvePlan();
+  if (reason === 'identity') {
+    (client as any).receive(JSON.stringify({ schema_version: 'eigenflux_watch.v1', event_id: 'identity-1', state_scope: 'account-a', type: 'diagnostic', data: { code: 'identity_changed' } }));
+  } else {
+    (client as any).fail(new Error('fatal'));
+  }
+  expect(active).toBe(false);
+  await Promise.resolve();
+  expect(deliver).not.toHaveBeenCalled();
+});

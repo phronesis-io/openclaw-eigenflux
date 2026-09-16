@@ -240,3 +240,13 @@ describe('getInstalledCliVersion', () => {
     await expect(getInstalledCliVersion('eigenflux')).resolves.toBeNull();
   });
 });
+
+test.each([
+  ['/tmp/tenant.eigenflux', '/tmp/tenant.eigenflux/.eigenflux'],
+  ['/tmp/tenant/.eigenflux/', '/tmp/tenant/.eigenflux'],
+  ['relative-agent-home', require('path').resolve('relative-agent-home/.eigenflux')],
+])('normalizes Home %s using the same basename rule as the CLI', (input, expected) => {
+  const old = process.env.EIGENFLUX_HOME;
+  try { process.env.EIGENFLUX_HOME = input; expect(resolveEigenfluxHome()).toBe(expected); }
+  finally { if (old === undefined) delete process.env.EIGENFLUX_HOME; else process.env.EIGENFLUX_HOME = old; }
+});

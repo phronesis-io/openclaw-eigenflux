@@ -35,3 +35,42 @@ setInterval(() => {}, 1000);
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('legacy handoff waits for actual exit after SIGKILL', async () => {
+  jest.useFakeTimers();
+  const { EventEmitter } = await import('events');
+  const child = Object.assign(new EventEmitter(), { kill: jest.fn(), exitCode: null, signalCode: null });
+  const client = new EigenFluxStreamClient({
+    serverName: 'owned-server', eigenfluxBin: 'unused',
+    logger: new Logger({ info: jest.fn(), debug: jest.fn(), warn: jest.fn(), error: jest.fn() }),
+    onPmEvent: async () => {}, onAuthRequired: async () => {},
+  });
+  Object.assign(client, { running: true, child });
+  try {
+    let settled = false;
+    const stopping = client.stop().then(() => { settled = true; });
+    await jest.advanceTimersByTimeAsync(5000);
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(settled).toBe(false);
+    child.emit('exit', null, 'SIGKILL');
+    await stopping;
+    expect(settled).toBe(true);
+  } finally { jest.useRealTimers(); }
+});
+
+test('legacy stop rejects when the child never confirms exit', async () => {
+  jest.useFakeTimers();
+  const { EventEmitter } = await import('events');
+  const child = Object.assign(new EventEmitter(), { kill: jest.fn(), exitCode: null, signalCode: null });
+  const client = new EigenFluxStreamClient({
+    serverName: 'owned-server', eigenfluxBin: 'unused',
+    logger: new Logger({ info: jest.fn(), debug: jest.fn(), warn: jest.fn(), error: jest.fn() }),
+    onPmEvent: async () => {}, onAuthRequired: async () => {},
+  });
+  Object.assign(client, { running: true, child });
+  try {
+    const rejected = expect(client.stop()).rejects.toThrow('replacement suppressed');
+    await jest.advanceTimersByTimeAsync(10000);
+    await rejected;
+  } finally { jest.useRealTimers(); }
+});
