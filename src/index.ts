@@ -13,6 +13,7 @@ import {
   type FeedResponse,
 } from './polling-client';
 import { OrderNotifications } from './order-notifications';
+import { createOrderNotificationRequest } from './order-notification-api';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
 import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
@@ -712,25 +713,10 @@ function createServerRuntime(
   const orderAgentPath = path.join(eigenfluxHome, 'servers', server.name, 'agent-v2-credentials.json');
   const orderAgentID = fs.existsSync(orderAgentPath)
     ? String(JSON.parse(fs.readFileSync(orderAgentPath, 'utf8')).agent_id ?? '') : '';
-  const orderNotifications = new OrderNotifications(async (resource, body) => {
-    // Read afresh: the CLI owns credential refresh/rotation. Never cache tokens.
-    const credentialsPath = orderAgentPath;
-    if (!fs.existsSync(credentialsPath)) throw new Error('Agent V2 credentials required for Order notifications');
-    const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
-    if (String(credentials.agent_id ?? '') !== orderAgentID) throw new Error('Order notification identity changed; restart the plugin');
-    if (typeof credentials.access_token !== 'string' || !credentials.access_token) throw new Error('Missing Agent V2 access token');
-    const response = await fetch(server.endpoint.replace(/\/$/, '') + '/api/v2' + resource, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: { Authorization: `Bearer ${credentials.access_token}`, 'Content-Type': 'application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      signal: AbortSignal.timeout(15000),
-      redirect: 'error',
-    });
-    if (!response.ok) throw new Error(`Order notification API HTTP ${response.status}`);
-    const envelope = await response.json() as { code?: number; data: unknown };
-    if (envelope.code !== undefined && envelope.code !== 0) throw new Error(`Order notification API code ${envelope.code}`);
-    return envelope.data;
-  }, (notification, receipt, checkpoint) => notifier.deliverOrder(buildOrderNotificationPromptTemplate(notification, getPromptContext()), {
+  const orderNotifications = new OrderNotifications(createOrderNotificationRequest({
+    eigenfluxBin: pluginConfig.eigenfluxBin, eigenfluxHome, serverName: server.name,
+    endpoint: server.endpoint, agentID: orderAgentID, logger,
+  }), (notification, receipt, checkpoint) => notifier.deliverOrder(buildOrderNotificationPromptTemplate(notification, getPromptContext()), {
     key: `${server.name}:${orderAgentID}:${notification.notification_id}`, receipt, checkpoint,
   }), /^[1-9]\d*$/.test(orderAgentID)
     ? path.join(eigenfluxHome, 'servers', server.name, 'data', `order-notifications-${orderAgentID}.json`)
