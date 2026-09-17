@@ -145,7 +145,7 @@ describe('register unit', () => {
       } as any);
       expect(process.env.EIGENFLUX_HOST).toBe('openclaw/2026.7.1-2');
       expect(process.env.EIGENFLUX_MODE).toBe('plugin');
-      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.43');
+      expect(process.env.EIGENFLUX_PLUGIN_VERSION).toBe('0.0.44');
     } finally {
       for (const key of keys) {
         if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key];
