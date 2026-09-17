@@ -142,7 +142,12 @@ from being processed. Automatic transport recovery runs every 30 seconds.
 
 Credential rotation remains CLI-owned. The inbox transport reads the current
 Agent V2 credential per request and refuses a different identity until restart.
-This transport adapter issues only notification pending/ACK requests; Order
+On HTTP 401, it runs the CLI's read-only `profile show` with the same Agent Home
+and explicit server to exercise the shared authenticated client, then re-reads
+credentials and retries the notification request once. This works independently
+of Feed polling cadence and rechecks identity before retrying pending or ACK.
+The plugin never writes credentials or implements the refresh/signing protocol.
+This transport adapter issues notification pending/ACK requests; Order
 business actions remain in the central CLI and Skills. CLI versions that ACK
 before downstream acceptance still have a loss window before plugin receipt.
 The guarantee is no automatic resubmission for an ambiguously accepted host run,
