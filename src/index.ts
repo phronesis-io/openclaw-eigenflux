@@ -246,7 +246,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         runtime.profileRefresher.start();
         await runtime.feedPoller.start();
         await runtime.streamClient.start();
-        runtime.orderNotifications.start((err) => logger.warn(`Order notification retry failed for server=${runtime.server.name}: ${err instanceof Error ? err.message : String(err)}`));
+        runtime.orderNotifications.start();
         runtime.flushLoop.start();
       }
 

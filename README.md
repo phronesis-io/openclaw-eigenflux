@@ -138,7 +138,7 @@ The local Agent-scoped queue distinguishes queued, submitting, running, delivere
 and failed records. Ambiguous submissions without a run ID, terminal run errors,
 and legacy queues without delivery receipts are held for reconciliation, not
 blindly replayed or acknowledged. A held record does not prevent other notifications
-from being processed. Automatic transport recovery runs every 30 seconds.
+from being processed. Order notifications are driven by stream events; no periodic recovery polling runs. Pending deliveries resume on subsequent notification events or explicit reconciliation.
 
 Credential rotation remains CLI-owned. The inbox transport reads the current
 Agent V2 credential per request and refuses a different identity until restart.
