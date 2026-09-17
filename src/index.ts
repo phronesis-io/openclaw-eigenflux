@@ -1,3 +1,5 @@
+import * as path from 'node:path';
+import * as fs from 'node:fs';
 import * as os from 'os';
 
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
@@ -10,6 +12,7 @@ import {
   type AuthRequiredEvent,
   type FeedResponse,
 } from './polling-client';
+import { OrderNotifications } from './order-notifications';
 import { EigenFluxStreamClient, type PmStreamEvent } from './stream-client';
 import { EigenFluxProfileRefresher } from './profile-refresher';
 import { collectOpenClawContext, resolveOpenClawStateDir, EMPTY_CONTEXT } from './openclaw-context';
@@ -39,6 +42,7 @@ import {
   INSTALL_ENTRY_URL,
   buildOutdatedPromptTemplate,
   buildPmStreamEventPromptTemplate,
+  buildOrderNotificationPromptTemplate,
   type EigenFluxPromptServerContext,
 } from './agent-prompt-templates';
 import { FeedPushScheduler } from './feed-push-scheduler';
@@ -89,6 +93,7 @@ type ServerRuntime = {
   notifier: EigenFluxNotifier;
   feedPoller: EigenFluxPollingClient;
   streamClient: EigenFluxStreamClient;
+  orderNotifications: OrderNotifications;
   profileRefresher: EigenFluxProfileRefresher;
   settingsReporter: EigenFluxSettingsReporter;
   flushLoop: FeedbackFlushLoop;
@@ -240,6 +245,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         runtime.profileRefresher.start();
         await runtime.feedPoller.start();
         await runtime.streamClient.start();
+        runtime.orderNotifications.start((err) => logger.warn(`Order notification retry failed for server=${runtime.server.name}: ${err instanceof Error ? err.message : String(err)}`));
         runtime.flushLoop.start();
       }
 
@@ -269,6 +275,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       for (const runtime of runtimes) {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
+        runtime.orderNotifications.stop();
         runtime.feedPushScheduler.stop();
         await runtime.waitForPendingDelivery();
         await runtime.notifier.drainPendingCleanups();
@@ -702,6 +709,33 @@ function createServerRuntime(
     }
   };
 
+  const orderAgentPath = path.join(eigenfluxHome, 'servers', server.name, 'agent-v2-credentials.json');
+  const orderAgentID = fs.existsSync(orderAgentPath)
+    ? String(JSON.parse(fs.readFileSync(orderAgentPath, 'utf8')).agent_id ?? '') : '';
+  const orderNotifications = new OrderNotifications(async (resource, body) => {
+    // Read afresh: the CLI owns credential refresh/rotation. Never cache tokens.
+    const credentialsPath = orderAgentPath;
+    if (!fs.existsSync(credentialsPath)) throw new Error('Agent V2 credentials required for Order notifications');
+    const credentials = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
+    if (String(credentials.agent_id ?? '') !== orderAgentID) throw new Error('Order notification identity changed; restart the plugin');
+    if (typeof credentials.access_token !== 'string' || !credentials.access_token) throw new Error('Missing Agent V2 access token');
+    const response = await fetch(server.endpoint.replace(/\/$/, '') + '/api/v2' + resource, {
+      method: body === undefined ? 'GET' : 'POST',
+      headers: { Authorization: `Bearer ${credentials.access_token}`, 'Content-Type': 'application/json' },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal: AbortSignal.timeout(15000),
+      redirect: 'error',
+    });
+    if (!response.ok) throw new Error(`Order notification API HTTP ${response.status}`);
+    const envelope = await response.json() as { code?: number; data: unknown };
+    if (envelope.code !== undefined && envelope.code !== 0) throw new Error(`Order notification API code ${envelope.code}`);
+    return envelope.data;
+  }, (notification, receipt, checkpoint) => notifier.deliverOrder(buildOrderNotificationPromptTemplate(notification, getPromptContext()), {
+    key: `${server.name}:${orderAgentID}:${notification.notification_id}`, receipt, checkpoint,
+  }), /^[1-9]\d*$/.test(orderAgentID)
+    ? path.join(eigenfluxHome, 'servers', server.name, 'data', `order-notifications-${orderAgentID}.json`)
+    : undefined);
+
   const feedPoller = new EigenFluxPollingClient({
     resolveModel: () => settingsReporter.getObservedModel(),
     serverName: server.name,
@@ -798,6 +832,10 @@ function createServerRuntime(
     logger,
     onPmEvent: async (event: PmStreamEvent) => {
       resetAuthPromptGate();
+      if (event.type === 'notification_push' || event.type === 'commission_order_notification') {
+        await orderNotifications.handle(event);
+        return;
+      }
       // Deliver when the event carries anything actionable. Friend events
       // (friend_request / friend_accepted) arrive with empty `messages`, so a
       // `messages.length > 0` gate would silently drop them.
@@ -851,6 +889,7 @@ function createServerRuntime(
     notifier,
     feedPoller,
     streamClient,
+    orderNotifications,
     profileRefresher,
     settingsReporter,
     flushLoop,
