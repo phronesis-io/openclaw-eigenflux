@@ -48,20 +48,24 @@ test('ignores PM events and never acknowledges other notification sources', asyn
   expect(deliver).not.toHaveBeenCalled();
   expect(request).not.toHaveBeenCalled();
 });
-test('background recovery retries and stops with the runtime', async () => {
+test('idle runtime never polls; stream delivery remains active after restart', async () => {
   jest.useFakeTimers();
-  const { handler, request } = setup();
-  const error = jest.fn();
+  const { handler, request, deliver } = setup();
   try {
-    request.mockRejectedValueOnce(new Error('startup unavailable'));
-    handler.start(error);
-    await jest.advanceTimersByTimeAsync(30000);
-    expect(error).toHaveBeenCalledTimes(1);
-    await jest.advanceTimersByTimeAsync(30000);
-    expect(request).toHaveBeenCalledTimes(2);
+    handler.start();
+    await jest.advanceTimersByTimeAsync(300000);
+    expect(request).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
     handler.stop();
-    await jest.advanceTimersByTimeAsync(30000);
-    expect(request).toHaveBeenCalledTimes(2);
+    handler.start();
+    await handler.handle(event);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls[0][0]).toBe('/notifications/ack');
+    handler.stop();
+    await jest.advanceTimersByTimeAsync(300000);
+    expect(request).toHaveBeenCalledTimes(1);
   } finally { handler.stop(); jest.useRealTimers(); }
 });
 test('rejects a stalled recovery cursor without looping forever', async () => {

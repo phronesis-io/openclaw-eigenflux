@@ -1,7 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-/** Order delivery is serialized across stream wake-ups and heartbeat recovery.
+/** Order delivery is serialized across stream wake-ups and explicit recovery.
  * Pending records stay on the server until the notifier accepts them.
  */
 export interface OrderNotification {
@@ -18,21 +18,15 @@ export class OrderNotifications {
   private tail: Promise<void> = Promise.resolve();
   private pending = new Map<string, Entry>();
   private completed = new Map<string, number>();
-  private timer?: ReturnType<typeof setInterval>;
   private recovery?: Promise<void>;
   private stopped = false;
 
-  start(onError: (error: unknown) => void): void {
-    if (this.timer) return;
+  start(): void {
     this.stopped = false;
-    this.timer = setInterval(() => { void this.reconcile().catch(onError); }, 30000);
-    this.timer.unref();
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
   }
 
   constructor(private request: Request, private deliver: (notification: OrderNotification, receipt: OrderDeliveryReceipt, checkpoint: (receipt: OrderDeliveryReceipt) => void) => Promise<boolean>, private storageFile?: string) {
