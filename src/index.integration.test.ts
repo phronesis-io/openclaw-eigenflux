@@ -224,7 +224,7 @@ describe('register integration', () => {
       message: expect.stringContaining('[EIGENFLUX_HEARTBEAT]'),
       deliver: true,
       idempotencyKey: expect.any(String),
-      lane: 'eigenflux-bg',
+      lane: 'subagent',
     });
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(message).toContain('Commands → Feed → Attention');
@@ -270,7 +270,7 @@ describe('register integration', () => {
     // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
     const params = subagentRun.mock.calls[0][0];
     expect(params.deliver).toBe(true);
-    expect(params.lane).toBe('eigenflux-bg');
+    expect(params.lane).toBe('subagent');
     expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();

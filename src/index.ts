@@ -652,7 +652,9 @@ function createServerRuntime(
     feedDeliveryInFlight = true;
     const startedAt = Date.now();
     feedDeliveryStartedAt = startedAt;
-    activeFeedDelivery = notifier.deliver(prompt, options).finally(() => {
+    // OpenClaw grants optional terminal replies only to its standard subagent lane.
+    // Scope this to Feed/heartbeat runs; PM and order lanes retain their isolation.
+    activeFeedDelivery = notifier.deliver(prompt, { ...options, lane: 'subagent' }).finally(() => {
       const duration = Date.now() - startedAt;
       logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
       // Only clear flags if this delivery is still the current one.
