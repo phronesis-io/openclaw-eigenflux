@@ -35,3 +35,17 @@ setInterval(() => {}, 1000);
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('order notification pagination cannot overwrite the PM reconnect cursor', async () => {
+  const onPmEvent = jest.fn().mockResolvedValue(undefined);
+  const client = new EigenFluxStreamClient({ serverName: 'test', eigenfluxBin: 'unused',
+    logger: new Logger({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }),
+    onPmEvent, onAuthRequired: async () => {},
+  });
+  const line = (event: unknown) => (client as any).handleLine(JSON.stringify(event));
+  line({ type: 'pm_push', data: { next_cursor: '358859368915009536' } });
+  line({ type: 'notification_push', data: { next_cursor: 'opaque-notification-page', notifications: [] } });
+  line({ type: 'commission_order_notification', notification: { notification_id: '1' } });
+  expect(client.getLastCursor()).toBe('358859368915009536');
+  expect(onPmEvent).toHaveBeenCalledTimes(3);
+});

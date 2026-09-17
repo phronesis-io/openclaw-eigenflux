@@ -17,6 +17,7 @@ const MAX_CONSECUTIVE_FAILURES = 20;
 
 export interface PmStreamEvent {
   type: string;
+  notification?: unknown;
   data: {
     messages?: Array<{
       msg_id: string;
@@ -211,7 +212,7 @@ export class EigenFluxStreamClient {
       const event = JSON.parse(trimmed) as PmStreamEvent;
 
       // Update cursor for reconnect resume
-      if (event.data?.next_cursor) {
+      if (event.type !== 'notification_push' && event.type !== 'commission_order_notification' && event.data?.next_cursor) {
         this.lastCursor = event.data.next_cursor;
       }
 

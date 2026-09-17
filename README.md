@@ -125,3 +125,25 @@ pnpm build
 pnpm test
 pnpm bump-version <version>   # syncs package.json, openclaw.plugin.json, runtime constant
 ```
+
+### Commission Order notifications
+
+Order stream events use a separate delivery path with a stable notification key
+and session. Before host submission, the plugin durably records intent; after
+acceptance it records the host run ID. Wait errors and timeouts query the same run
+and never trigger CLI/heartbeat fallbacks or a replacement run. Completed delivery
+is persisted before ACK, and completed notification IDs survive restarts.
+
+The local Agent-scoped queue distinguishes queued, submitting, running, delivered,
+and failed records. Ambiguous submissions without a run ID, terminal run errors,
+and legacy queues without delivery receipts are held for reconciliation, not
+blindly replayed or acknowledged. A held record does not prevent other notifications
+from being processed. Automatic transport recovery runs every 30 seconds.
+
+Credential rotation remains CLI-owned. The inbox transport reads the current
+Agent V2 credential per request and refuses a different identity until restart.
+This transport adapter issues only notification pending/ACK requests; Order
+business actions remain in the central CLI and Skills. CLI versions that ACK
+before downstream acceptance still have a loss window before plugin receipt.
+The guarantee is no automatic resubmission for an ambiguously accepted host run,
+not exactly-once delivery by the external chat provider.
