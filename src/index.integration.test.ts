@@ -40,6 +40,7 @@ jest.mock('./cli-executor', () => ({
 }));
 
 // Mock EigenFluxStreamClient
+const streamClientAdoptMock = jest.fn().mockResolvedValue(undefined);
 const streamClientStartMock = jest.fn().mockResolvedValue(undefined);
 const streamClientStopMock = jest.fn().mockResolvedValue(undefined);
 const streamClientIsRunningMock = jest.fn().mockReturnValue(false);
@@ -51,6 +52,7 @@ jest.mock('./stream-client', () => ({
     streamClientConfig = config;
     return {
       start: streamClientStartMock,
+      adoptCLIVersion: streamClientAdoptMock,
       stop: streamClientStopMock,
       isRunning: streamClientIsRunningMock,
       getLastCursor: streamClientGetLastCursorMock,
@@ -118,7 +120,7 @@ describe('register integration', () => {
     // Set up execEigenflux to return feed data
     execEigenfluxMock.mockImplementation(async (bin: string, args: string[]) => {
       if (args[0] === '--homedir' && args[4] === 'heartbeat' && args[5] === 'plan') {
-        return { kind: 'success', data: { schema_version: 'eigenflux_heartbeat_plan.v1', agent_prompt: 'EIGENFLUX HEARTBEAT PLAN\nCommands → Feed → Attention', wake_on_empty: wakeOnEmpty } };
+        return { kind: 'success', data: { schema_version: 'eigenflux_heartbeat_plan.v1', cli_version: '0.6.7', agent_prompt: 'EIGENFLUX HEARTBEAT PLAN\nCommands → Feed → Attention', wake_on_empty: wakeOnEmpty } };
       }
       if (args[0] === 'feed' && args[1] === 'poll') {
         return {
@@ -226,6 +228,8 @@ describe('register integration', () => {
       idempotencyKey: expect.any(String),
       lane: 'subagent',
     });
+    expect(streamClientAdoptMock).toHaveBeenCalledWith('0.6.7');
+    expect(streamClientConfig.eigenfluxHome).toBe(eigenfluxHome);
     const message = String(subagentRun.mock.calls[0]?.[0]?.message);
     expect(message).toContain('Commands → Feed → Attention');
     expect(message).toContain('"item_id": "501"');

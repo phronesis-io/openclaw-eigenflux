@@ -733,7 +733,10 @@ function createServerRuntime(
     logger,
     onHeartbeatStart: async () => {
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
-      if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
+      if (currentHeartbeatPlan) {
+        await streamClient.adoptCLIVersion(currentHeartbeatPlan.cli_version);
+        await refreshOpenClawSkillsSnapshot(logger);
+      }
     },
     onFeedPolled: async (payload: FeedResponse) => {
       // Always reset auth gate on successful poll, even if delivery is skipped
@@ -816,6 +819,7 @@ function createServerRuntime(
 
   const streamClient = new EigenFluxStreamClient({
     serverName: server.name,
+    eigenfluxHome,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
     onPmEvent: async (event: PmStreamEvent) => {
