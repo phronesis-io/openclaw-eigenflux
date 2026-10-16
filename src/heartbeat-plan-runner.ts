@@ -10,6 +10,7 @@ export interface HeartbeatPlanRunnerConfig {
 
 export interface HeartbeatExecutionPlan {
   schema_version: 'eigenflux_heartbeat_plan.v1';
+  cli_version?: string;
   agent_prompt: string;
   wake_on_empty: boolean;
 }
@@ -48,7 +49,7 @@ export class EigenFluxHeartbeatPlanRunner {
           '--format',
           'json',
         ],
-        { logger: this.config.logger }
+        { logger: this.config.logger, timeout: 300_000 }
       );
 
       if (result.kind === 'success') {

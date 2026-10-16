@@ -13,6 +13,8 @@ const INITIAL_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 60_000;
 const BACKOFF_MULTIPLIER = 2;
 const STOP_GRACE_MS = 5_000;
+const DELIVERY_DRAIN_MS = 30_000;
+const CLOSE_AFTER_KILL_MS = 1_000;
 const MAX_CONSECUTIVE_FAILURES = 20;
 
 export interface PmStreamEvent {
@@ -54,6 +56,7 @@ export interface PmStreamEvent {
 export interface StreamClientConfig {
   serverName: string;
   eigenfluxBin: string;
+  eigenfluxHome?: string;
   logger: Logger;
   onPmEvent: (event: PmStreamEvent) => Promise<void>;
   onAuthRequired: () => Promise<void>;
@@ -70,6 +73,12 @@ export class EigenFluxStreamClient {
   private backoffMs = INITIAL_BACKOFF_MS;
   private consecutiveFailures = 0;
   private restartTimer: NodeJS.Timeout | null = null;
+  private childClosed: Promise<void> | null = null;
+  private pendingDeliveries = new Set<Promise<void>>();
+  private cliVersion: string | undefined;
+  private adoption: Promise<void> | null = null;
+  private adopting = false;
+  private generation = 0;
 
   constructor(config: StreamClientConfig) {
     this.config = config;
@@ -89,8 +98,14 @@ export class EigenFluxStreamClient {
       return;
     }
 
+    if (this.child) {
+      this.config.logger.warn('Previous stream has not closed; deferring start');
+      return;
+    }
+    this.generation += 1;
     this.running = true;
     this.stopping = false;
+    this.adopting = false;
     this.config.logger.info(`Starting stream client for server=${this.config.serverName}`);
     this.spawnStreamProcess();
   }
@@ -101,6 +116,7 @@ export class EigenFluxStreamClient {
     }
 
     this.config.logger.info(`Stopping stream client for server=${this.config.serverName}`);
+    this.generation += 1;
     this.stopping = true;
     this.running = false;
 
@@ -109,41 +125,93 @@ export class EigenFluxStreamClient {
       this.restartTimer = null;
     }
 
-    if (this.readline) {
-      this.readline.close();
-      this.readline = null;
+    await this.terminateStreamProcess();
+    await this.waitForDeliveries();
+    this.cliVersion = undefined;
+  }
+
+  /** Reconcile the existing stream after a successful heartbeat ran a newer CLI. */
+  async adoptCLIVersion(version?: string): Promise<void> {
+    if (!version || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version) || !this.running || this.stopping) return;
+    if (this.adoption) {
+      await this.adoption;
+      return this.adoptCLIVersion(version);
     }
+    if (version === this.cliVersion) return;
+    this.adopting = true;
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    const generation = this.generation;
+    this.adoption = (async () => {
+      // Finish deliveries already handed to the host before interrupting intake.
+      if (!await this.waitForDeliveries()) {
+        // Intake was not interrupted; preserve the old stream's reconnect path.
+        if (this.generation === generation && this.child) this.adopting = false;
+        return;
+      }
+      if (this.stopping || !this.running || this.generation !== generation) return;
+      if (!await this.terminateStreamProcess()) return;
+      // close means all trailing stdout was read; wait for those deliveries too.
+      if (!await this.waitForDeliveries()) return;
+      if (this.stopping || !this.running || this.generation !== generation) return;
+      this.config.logger.info(`Adopting CLI ${version} for stream server=${this.config.serverName}`);
+      this.cliVersion = version;
+      this.adopting = false;
+      this.spawnStreamProcess();
+    })();
+    try {
+      await this.adoption;
+    } catch (error) {
+      this.config.logger.warn(`CLI stream adoption deferred: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.adoption = null;
+    }
+  }
 
-    if (this.child) {
-      const child = this.child;
-      this.child = null;
+  private async waitFor(promise: Promise<unknown>, timeout: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        promise.then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeout); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  }
 
-      child.kill('SIGTERM');
+  private async waitForDeliveries(): Promise<boolean> {
+    const completed = await this.waitFor(Promise.all([...this.pendingDeliveries]), DELIVERY_DRAIN_MS);
+    if (!completed) this.config.logger.warn('Stream delivery is still pending; deferring CLI replacement');
+    return completed;
+  }
 
-      await new Promise<void>((resolve) => {
-        const forceKillTimer = setTimeout(() => {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            // Process already exited
-          }
-          resolve();
-        }, STOP_GRACE_MS);
-
-        child.once('exit', () => {
-          clearTimeout(forceKillTimer);
-          resolve();
-        });
-      });
+  private async terminateStreamProcess(): Promise<boolean> {
+    const child = this.child;
+    const closed = this.childClosed;
+    if (!child || !closed) return true;
+    child.kill('SIGTERM');
+    const forceKillTimer = setTimeout(() => {
+      this.config.logger.warn(`Stream did not stop within ${STOP_GRACE_MS}ms; killing it`);
+      child.kill('SIGKILL');
+    }, STOP_GRACE_MS);
+    try {
+      // Never overlap the replacement with a child whose stdio is still open.
+      const completed = await this.waitFor(closed, STOP_GRACE_MS + CLOSE_AFTER_KILL_MS);
+      if (!completed) this.config.logger.warn('Stream stdio has not closed; deferring CLI replacement');
+      return completed;
+    } finally {
+      clearTimeout(forceKillTimer);
     }
   }
 
   private spawnStreamProcess(): void {
-    if (this.stopping || !this.running) {
+    if (this.stopping || !this.running || this.child) {
       return;
     }
 
     const args = ['stream', '-s', this.config.serverName, '-f', 'json'];
+    if (this.config.eigenfluxHome) args.push('--homedir', this.config.eigenfluxHome);
     if (this.lastCursor) {
       args.push('--cursor', this.lastCursor);
     }
@@ -154,9 +222,10 @@ export class EigenFluxStreamClient {
 
     const child = spawn(this.config.eigenfluxBin, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: cliEnvironment(),
+      env: cliEnvironment(this.config.eigenfluxHome ? { EIGENFLUX_HOME: this.config.eigenfluxHome } : undefined),
     });
     this.child = child;
+    this.childClosed = new Promise(resolve => { child.once('close', () => resolve()); });
 
     const rl = createInterface({ input: child.stdout! });
     this.readline = rl;
@@ -175,17 +244,18 @@ export class EigenFluxStreamClient {
     child.on('error', (err) => {
       this.config.logger.error(`Stream process error: ${err.message}`);
       this.config.onStreamError?.(err);
-      this.scheduleRestart();
     });
 
-    child.on('exit', (code, signal) => {
+    child.on('close', (code, signal) => {
       this.config.logger.info(
-        `Stream process exited (code=${code}, signal=${signal})`
+        `Stream process closed (code=${code}, signal=${signal})`
       );
 
-      if (this.stopping) {
-        return;
-      }
+      if (this.child !== child) return;
+      this.child = null;
+      this.childClosed = null;
+      this.readline = null;
+      if (this.stopping || !this.running || this.adopting) return;
 
       if (code === EXIT_AUTH_REQUIRED) {
         this.config.logger.warn('Stream auth required');
@@ -220,11 +290,13 @@ export class EigenFluxStreamClient {
       this.backoffMs = INITIAL_BACKOFF_MS;
       this.consecutiveFailures = 0;
 
-      this.config.onPmEvent(event).catch((err) => {
+      const delivery = this.config.onPmEvent(event).catch((err) => {
         this.config.logger.error(
           `PM event handler error: ${err instanceof Error ? err.message : String(err)}`
         );
       });
+      this.pendingDeliveries.add(delivery);
+      void delivery.finally(() => this.pendingDeliveries.delete(delivery));
     } catch (err) {
       this.config.logger.warn(
         `Failed to parse stream line: ${(err as Error).message}`
@@ -233,7 +305,7 @@ export class EigenFluxStreamClient {
   }
 
   private scheduleRestart(): void {
-    if (this.stopping || !this.running) {
+    if (this.stopping || !this.running || this.adopting || this.child) {
       return;
     }
 
