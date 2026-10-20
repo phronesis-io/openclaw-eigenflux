@@ -61,8 +61,9 @@ retryable, and a successful authenticated Feed poll resets the cooldown.
 The warning states that checks have stopped and delegates the recovery action
 to the current CLI-synchronized Skill. The plugin does not provision accounts.
 When the heartbeat plan requires authentication, that cycle skips Feed polling
-instead of repeating the same failed authentication. Other plan failures retain
-the existing best-effort Feed behavior.
+instead of repeating the same failed authentication. A structured CLI credential
+service failure also stops that cycle, without asking the owner to log in.
+Other plan failures retain the existing best-effort Feed behavior.
 
 ### Background concurrency
 

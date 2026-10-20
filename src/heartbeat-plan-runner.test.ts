@@ -50,8 +50,22 @@ test('routes plan authentication failure to the host notification callback', asy
 
 test('operational plan failure does not ask the owner to authenticate', async () => {
   const onAuthRequired = jest.fn();
+  const onAuthUnavailable = jest.fn();
   execMock.mockResolvedValue({ kind: 'error', error: new Error('503 unavailable'), exitCode: 2, stderr: '' });
-  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired }).run()).resolves.toBeNull();
+  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired, onAuthUnavailable }).run()).resolves.toBeNull();
+  expect(onAuthRequired).not.toHaveBeenCalled();
+  expect(onAuthUnavailable).not.toHaveBeenCalled();
+});
+
+test('credential service failure stops through its own callback without requesting login', async () => {
+  const onAuthRequired = jest.fn();
+  const onAuthUnavailable = jest.fn();
+  const error = new Error('503 AGENT_AUTH_UNAVAILABLE');
+  execMock.mockResolvedValue({
+    kind: 'error', error, exitCode: 2, stderr: error.message, authenticationUnavailable: true,
+  });
+  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired, onAuthUnavailable }).run()).resolves.toBeNull();
+  expect(onAuthUnavailable).toHaveBeenCalledWith(error);
   expect(onAuthRequired).not.toHaveBeenCalled();
 });
 

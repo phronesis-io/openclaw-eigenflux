@@ -7,6 +7,7 @@ export interface HeartbeatPlanRunnerConfig {
   serverName: string;
   logger: Logger;
   onAuthRequired?: () => void | Promise<void>;
+  onAuthUnavailable?: (error: Error) => void | Promise<void>;
 }
 
 export interface HeartbeatExecutionPlan {
@@ -66,6 +67,11 @@ export class EigenFluxHeartbeatPlanRunner {
       }
       if (result.kind === 'not_installed') {
         this.config.logger.warn(`Heartbeat plan: eigenflux CLI not installed (bin=${result.bin})`);
+        return null;
+      }
+      if (result.authenticationUnavailable) {
+        this.config.logger.warn('Heartbeat plan authentication service is unavailable');
+        await this.config.onAuthUnavailable?.(result.error);
         return null;
       }
       this.config.logger.warn(`Heartbeat plan failed: ${result.error.message}`);

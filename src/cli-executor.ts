@@ -12,7 +12,10 @@ export type CliResult<T> =
   | { kind: 'success'; data: T }
   | { kind: 'auth_required'; stderr: string }
   | { kind: 'not_installed'; bin: string }
-  | { kind: 'error'; error: Error; exitCode: number | null; stderr: string };
+  | {
+      kind: 'error'; error: Error; exitCode: number | null; stderr: string;
+      authenticationUnavailable?: boolean;
+    };
 
 export interface ExecOptions {
   timeout?: number;
@@ -31,6 +34,22 @@ export interface ExecOptions {
 /** The Gateway serves multiple Agents; model identity must be scoped per call. */
 export function cliEnvironment(overrides?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...process.env, EIGENFLUX_MODEL: undefined, ...overrides };
+}
+
+/** Only the CLI's final structured notice can classify credential service failures. */
+function authenticationUnavailable(stderr: string): boolean {
+  try {
+    const notice = JSON.parse(stderr.trim().split(/\r?\n/).pop() ?? '') as unknown;
+    if (!notice || typeof notice !== 'object' || Array.isArray(notice)) return false;
+    const fields = notice as Record<string, unknown>;
+    return fields.schema_version === 'eigenflux_auth_unavailable.v1' &&
+      fields.status === 'auth_unavailable' && fields.checks_blocked === true &&
+      fields.login_required === false && fields.retryable === true &&
+      ['code', 'home', 'server'].every((key) =>
+        typeof fields[key] === 'string' && (fields[key] as string).trim().length > 0);
+  } catch {
+    return false;
+  }
 }
 
 export function execEigenflux<T>(
@@ -81,6 +100,8 @@ export function execEigenflux<T>(
             error: new Error(stderr.trim() || error.message),
             exitCode: numericExit,
             stderr: stderr.trim(),
+            ...(numericExit === 2 && authenticationUnavailable(stderr)
+              ? { authenticationUnavailable: true } : {}),
           });
           return;
         }

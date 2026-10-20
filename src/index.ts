@@ -592,12 +592,14 @@ function createServerRuntime(
     logger,
   });
   let heartbeatAuthRequired = false;
+  let heartbeatAuthUnavailable: Error | undefined;
   const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
     eigenfluxBin: pluginConfig.eigenfluxBin,
     eigenfluxHome,
     serverName: server.name,
     logger,
     onAuthRequired: () => { heartbeatAuthRequired = true; },
+    onAuthUnavailable: (error) => { heartbeatAuthUnavailable = error; },
   });
   // A successful plan is Agent work, not merely a plugin health check. Keep
   // the plan for exactly the poll that produced it; pollOnce is single-flight.
@@ -729,8 +731,12 @@ function createServerRuntime(
     logger,
     onHeartbeatStart: async () => {
       heartbeatAuthRequired = false;
+      heartbeatAuthUnavailable = undefined;
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
       if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
+      if (heartbeatAuthUnavailable) {
+        return { kind: 'auth_unavailable' as const, error: heartbeatAuthUnavailable };
+      }
       return !heartbeatAuthRequired;
     },
     onFeedPolled: async (payload: FeedResponse) => {

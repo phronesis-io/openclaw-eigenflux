@@ -210,6 +210,21 @@ describe('EigenFluxPollingClient', () => {
     expect(execEigenfluxMock).not.toHaveBeenCalled();
   });
 
+  test('unavailable credential service stops Feed without a login notification', async () => {
+    execEigenfluxMock.mockClear();
+    const error = new Error('503 AGENT_AUTH_UNAVAILABLE');
+    const onAuthRequired = jest.fn();
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue({ kind: 'auth_unavailable', error }),
+      onFeedPolled: jest.fn(), onAuthRequired,
+    });
+    await expect(client.pollOnce()).resolves.toEqual({ kind: 'error', error });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+    expect(onAuthRequired).not.toHaveBeenCalled();
+  });
+
   test('emits auth-required callback when CLI returns auth_required', async () => {
     const onFeedPolled = jest.fn().mockResolvedValue(undefined);
     const onAuthRequired = jest.fn().mockResolvedValue(undefined);

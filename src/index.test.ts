@@ -266,6 +266,62 @@ describe('register unit', () => {
     }
   });
 
+  test('credential service plan failures stop this poll while ordinary plan failures still fetch Feed', async () => {
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'alpha', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+    pollingClientStartMock.mockResolvedValue(undefined);
+    let planError: any = { kind: 'error', error: new Error('AGENT_AUTH_UNAVAILABLE'),
+      exitCode: 2, stderr: 'AGENT_AUTH_UNAVAILABLE', authenticationUnavailable: true };
+    execEigenfluxMock.mockImplementation(async (_bin: string, args: string[]) => {
+      if (args.includes('heartbeat')) return planError;
+      if (args.includes('poll')) {
+        return { kind: 'success', data: { items: [], notifications: [], has_more: false } };
+      }
+      return { kind: 'success', data: undefined };
+    });
+    const { EigenFluxNotifier } = await import('./notifier');
+    const deliver = jest.spyOn(EigenFluxNotifier.prototype, 'deliver').mockResolvedValue(true);
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {}, runtime: {}, logger: createLogger(),
+      registerService: (service: any) => services.push(service), registerCommand: jest.fn(),
+      registerHook: jest.fn(), on: jest.fn(),
+    } as any);
+    try {
+      await services[0].start();
+      const actual = jest.requireActual('./polling-client') as typeof import('./polling-client');
+      const poller = new actual.EigenFluxPollingClient({
+        ...capturedPollingConfig,
+        onPollSuccess: jest.fn(),
+      });
+      for (const code of ['AGENT_AUTH_UNAVAILABLE', 'AUTH_NETWORK_UNAVAILABLE']) {
+        planError = { kind: 'error', error: new Error(code), exitCode: 2, stderr: code,
+          authenticationUnavailable: true };
+        execEigenfluxMock.mockClear();
+        await expect(poller.pollOnce()).resolves.toEqual({ kind: 'error', error: planError.error });
+        expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
+        expect(execEigenfluxMock.mock.calls[0][1]).toEqual([
+          '--homedir', eigenfluxHome, '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
+        ]);
+        expect(deliver).not.toHaveBeenCalled();
+      }
+      // A previous credential failure must not poison later ordinary failures.
+      for (const message of ['HTTP 503 unavailable', 'settings PUT failed: HTTP 503']) {
+        planError = { kind: 'error', error: new Error(message), exitCode: 2, stderr: message };
+        execEigenfluxMock.mockClear();
+        await expect(poller.pollOnce()).resolves.toMatchObject({ kind: 'success' });
+        expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
+        expect(execEigenfluxMock.mock.calls[1][1]).toContain('poll');
+        expect(deliver).not.toHaveBeenCalled();
+      }
+    } finally {
+      await services[0].stop();
+      deliver.mockRestore();
+    }
+  });
+
   test('supports /eigenflux auth command with discovered servers', async () => {
     const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
     fs.mkdirSync(serverDir, { recursive: true });

@@ -118,9 +118,8 @@ export interface PollingClientConfig {
   logger: Logger;
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
-  /** Runs the current CLI plan. False means authentication is required, so
-   *  report it through onAuthRequired and skip this cycle's Feed request. */
-  onHeartbeatStart?: () => Promise<void | boolean>;
+  /** False requires login; auth_unavailable stops this cycle without a login prompt. */
+  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error }>;
   /**
    * Optional hook invoked once per successful poll (heartbeat), regardless of
    * whether the feed contained any items/notifications. Used for side-channel
@@ -244,13 +243,19 @@ export class EigenFluxPollingClient {
       try {
         if (this.config.onHeartbeatStart) {
           let authenticationRequired = false;
+          let authenticationError: Error | undefined;
           try {
-            authenticationRequired = await this.config.onHeartbeatStart() === false;
+            const start = await this.config.onHeartbeatStart();
+            authenticationRequired = start === false;
+            if (start && typeof start === 'object' && start.kind === 'auth_unavailable') {
+              authenticationError = start.error;
+            }
           } catch (hookError) {
             this.config.logger.warn(
               `onHeartbeatStart hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
             );
           }
+          if (authenticationError) return { kind: 'error', error: authenticationError };
           if (authenticationRequired) {
             const authEvent: AuthRequiredEvent = { reason: 'auth_required' };
             if (notifyAuthRequired) await this.config.onAuthRequired(authEvent);
