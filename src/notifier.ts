@@ -1,6 +1,6 @@
 import type { OrderDeliveryReceipt } from './order-notifications';
 import { createHash, randomUUID } from 'node:crypto';
-import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
+import type { OpenClawPluginApi } from 'openclaw/plugin-sdk/plugin-entry';
 import { type NotificationRouteOverrides } from './config';
 import { Logger } from './logger';
 import {
@@ -25,6 +25,21 @@ type SessionStoreEntryLike = {
   lastTo?: string;
   lastAccountId?: string;
   [key: string]: unknown;
+};
+
+type SessionStoreReadParams = {
+  agentId?: string;
+  sessionKey: string;
+  storePath?: string;
+};
+
+type TaskRunLike = {
+  id: string;
+  runId?: string;
+  status?: string;
+  createdAt?: number;
+  startedAt?: number;
+  endedAt?: number;
 };
 
 type EigenFluxRuntimeApi = {
@@ -55,11 +70,10 @@ type EigenFluxRuntimeApi = {
       resolveStorePath?: (store: string | undefined, opts?: { agentId?: string }) => string;
       /** Row-scoped read: one session entry by agent/session identity. Used by
        *  the busy check to see how recently the main conversation was active. */
-      getSessionEntry?: (params: {
-        agentId?: string;
-        sessionKey: string;
-        storePath?: string;
-      }) => SessionStoreEntryLike | undefined;
+      getSessionEntryAsync?: (
+        params: SessionStoreReadParams
+      ) => Promise<SessionStoreEntryLike | undefined>;
+      getSessionEntry?: (params: SessionStoreReadParams) => SessionStoreEntryLike | undefined;
       /** Row-scoped write: patch a single session entry by identity. Replaces the
        *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
        *  `sdk-session-store-write`). Merges the returned partial into the entry. */
@@ -77,19 +91,16 @@ type EigenFluxRuntimeApi = {
   /** Task-run management. Used to truly cancel a run that outlived our wait budget
    *  ("stop waiting" != "stop the run"). Optional: older hosts may not expose it. */
   tasks?: {
+    async?: {
+      runs: {
+        bindSession: (params: { sessionKey: string }) => {
+          list: () => Promise<TaskRunLike[]>;
+        };
+      };
+    };
     runs?: {
       bindSession?: (params: { sessionKey: string }) => {
-        /** Returns ALL task records related to the session — including
-         *  terminal ones (succeeded/failed/cancelled/timed_out). Callers that
-         *  care about "running right now" must filter, e.g. on `endedAt`. */
-        list: () => Array<{
-          id: string;
-          runId?: string;
-          status?: string;
-          createdAt?: number;
-          startedAt?: number;
-          endedAt?: number;
-        }>;
+        list: () => TaskRunLike[];
         cancel: (params: { taskId: string; cfg: unknown }) => Promise<{
           found: boolean;
           cancelled: boolean;
@@ -778,6 +789,7 @@ export class EigenFluxNotifier {
   /** Best-effort true cancellation after either queue or execution timeout. */
   private async tryCancelRun(sessionKey: string, runId: string): Promise<boolean> {
     const runs = this.runtime.tasks?.runs;
+    const asyncTasks = this.runtime.tasks?.async;
     if (!runs || typeof runs.bindSession !== 'function') {
       this.logger.debug(
         `tryCancelRun: runtime.tasks.runs unavailable; cannot cancel run_id=${runId}`
@@ -785,15 +797,17 @@ export class EigenFluxNotifier {
       return false;
     }
     try {
-      const bound = runs.bindSession({ sessionKey });
-      const task = bound.list().find((t) => t.runId === runId);
+      const tasks = asyncTasks
+        ? await asyncTasks.runs.bindSession({ sessionKey }).list()
+        : runs.bindSession({ sessionKey }).list();
+      const task = tasks.find((t) => t.runId === runId);
       if (!task) {
         this.logger.warn(
           `tryCancelRun: no task found for run_id=${runId} on session=${sessionKey}; cannot cancel`
         );
         return false;
       }
-      const result = await bound.cancel({ taskId: task.id, cfg: this.api.config });
+      const result = await runs.bindSession({ sessionKey }).cancel({ taskId: task.id, cfg: this.api.config });
       this.logger.warn(
         `Cancelled stuck background run: run_id=${runId}, task_id=${task.id}, ` +
         `found=${result.found}, cancelled=${result.cancelled}`
@@ -1015,15 +1029,14 @@ export class EigenFluxNotifier {
       return false;
     }
 
-    const runs = this.runtime.tasks?.runs;
+    const tasksRuntime = this.runtime.tasks;
+    const runs = tasksRuntime?.async ? tasksRuntime.async.runs : tasksRuntime?.runs;
     if (runs && typeof runs.bindSession === 'function') {
       try {
         // list() returns the session's FULL task history, terminal records
         // included — only a task without endedAt is actually running.
-        const active = runs
-          .bindSession({ sessionKey: route.sessionKey })
-          .list()
-          .some((task) => task.endedAt === undefined);
+        const tasks = await runs.bindSession({ sessionKey: route.sessionKey }).list();
+        const active = tasks.some((task) => task.endedAt === undefined);
         if (active) {
           return true;
         }
@@ -1033,12 +1046,15 @@ export class EigenFluxNotifier {
     }
 
     const session = this.runtime.agent?.session;
-    if (typeof session?.getSessionEntry === 'function') {
+    if (session) {
       try {
-        const entry = session.getSessionEntry({
+        const params = {
           agentId: route.agentId,
           sessionKey: route.sessionKey,
-        });
+        };
+        const entry = typeof session.getSessionEntryAsync === 'function'
+          ? await session.getSessionEntryAsync(params)
+          : session.getSessionEntry?.(params);
         const updatedAt = typeof entry?.updatedAt === 'number' ? entry.updatedAt : undefined;
         if (updatedAt !== undefined && Date.now() - updatedAt < recentActivityMs) {
           return true;
