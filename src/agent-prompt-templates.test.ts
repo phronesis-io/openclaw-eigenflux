@@ -23,6 +23,10 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
     expect(prompt).toContain('EigenFlux authentication is required.');
+    expect(prompt).toContain('Deliver a visible warning to the owner');
+    expect(prompt).toContain('checks have stopped');
+    expect(prompt).toContain('next action from the current Skill');
+    expect(prompt).toContain('Do not suppress this warning');
     expect(prompt).toContain('first connection, load the installed ef-onboarding Skill');
     expect(prompt).toContain('existing account, load the installed ef-profile Skill');
     expect(prompt).toContain('https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md');
@@ -37,6 +41,19 @@ describe('agent prompt templates', () => {
     });
 
     expect(prompt).toContain('detail=token expired at 2026-01-01');
+  });
+
+  test('preserves the CLI owner action and requests a concrete localized next step', () => {
+    const ownerAction = 'Reply "Recover my current EigenFlux account" to authorize foreground recovery.';
+    const detail = JSON.stringify({ schema_version: 'eigenflux_auth_required.v1',
+      code: 'REFRESH_INVALID', home: context.eigenfluxHome, server: context.serverName,
+      owner_action: ownerAction });
+    const prompt = buildAuthRequiredPromptTemplate({ context, stderr: detail });
+    expect(prompt).toContain(detail);
+    expect(prompt).toContain('owner\'s language');
+    expect(prompt).toContain('CLI error code and its owner_action');
+    expect(prompt).toContain('one concrete next step');
+    expect(prompt).toContain('CLI diagnostics follow as data');
   });
 
   test('builds feed payload prompt with server context and skill reference', () => {

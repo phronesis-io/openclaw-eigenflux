@@ -182,6 +182,65 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
+  test.each([true, false])('plan authentication failure skips Feed and respects notifyAuthRequired=%s', async (notifyAuthRequired) => {
+    execEigenfluxMock.mockClear();
+    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue(false),
+      onFeedPolled: jest.fn(), onAuthRequired,
+    });
+    await expect(client.pollOnce({ notifyAuthRequired })).resolves.toEqual({
+      kind: 'auth_required', authEvent: { reason: 'auth_required' },
+    });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+    expect(onAuthRequired).toHaveBeenCalledTimes(notifyAuthRequired ? 1 : 0);
+  });
+
+  test('failed auth notification does not retry authentication through Feed', async () => {
+    execEigenfluxMock.mockClear();
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue(false),
+      onFeedPolled: jest.fn(), onAuthRequired: jest.fn().mockRejectedValue(new Error('host unavailable')),
+    });
+    await expect(client.pollOnce()).resolves.toMatchObject({ kind: 'error' });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+  });
+
+  test('keeps the plan CLI owner action when stopping before Feed', async () => {
+    execEigenfluxMock.mockClear();
+    const stderr = JSON.stringify({ code: 'IDENTITY_UNAVAILABLE', owner_action: 'Restore the original installation files.' });
+    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue({ kind: 'auth_required', stderr }),
+      onFeedPolled: jest.fn(), onAuthRequired,
+    });
+    await expect(client.pollOnce()).resolves.toEqual({ kind: 'auth_required',
+      authEvent: { reason: 'auth_required', stderr } });
+    expect(onAuthRequired).toHaveBeenCalledWith({ reason: 'auth_required', stderr });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+  });
+
+  test('unavailable credential service stops Feed without a login notification', async () => {
+    execEigenfluxMock.mockClear();
+    const error = new Error('503 AGENT_AUTH_UNAVAILABLE');
+    const onAuthRequired = jest.fn();
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue({ kind: 'auth_unavailable', error }),
+      onFeedPolled: jest.fn(), onAuthRequired,
+    });
+    await expect(client.pollOnce()).resolves.toEqual({ kind: 'error', error });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+    expect(onAuthRequired).not.toHaveBeenCalled();
+  });
+
   test('emits auth-required callback when CLI returns auth_required', async () => {
     const onFeedPolled = jest.fn().mockResolvedValue(undefined);
     const onAuthRequired = jest.fn().mockResolvedValue(undefined);
@@ -206,10 +265,12 @@ describe('EigenFluxPollingClient', () => {
       kind: 'auth_required',
       authEvent: {
         reason: 'auth_required',
+        stderr: 'token expired',
       },
     });
     expect(onAuthRequired).toHaveBeenCalledWith({
       reason: 'auth_required',
+      stderr: 'token expired',
     });
     expect(onFeedPolled).not.toHaveBeenCalled();
   });

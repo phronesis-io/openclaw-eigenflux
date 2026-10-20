@@ -13,6 +13,7 @@ import {
 } from './notification-route-resolver';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 import { globalDeliveryCoordinator } from './delivery-coordinator';
+import { sendAuthReminder } from './auth-reminder-transport';
 
 /**
  * Typed subset of the OpenClaw runtime API used by the notifier.
@@ -128,6 +129,9 @@ const SUBAGENT_QUEUE_TIMEOUT_MS = 300_000;
 // queue + execution budget without relying on the ephemeral task registry.
 const SUBAGENT_TOTAL_WAIT_TIMEOUT_MS =
   SUBAGENT_QUEUE_TIMEOUT_MS + SUBAGENT_WAIT_TIMEOUT_MS;
+// Host run results are ephemeral. Bound unknown outcomes so a lost completion
+// cannot permanently suppress later authentication reminders.
+const AUTH_REMINDER_RETRY_AFTER_MS = 15 * 60 * 1000;
 // Background deliveries (feed / PM / profile) run on a dedicated queue lane so a
 // slow or stuck agent run never serializes behind / ahead of the user's own
 // interactive (per-chat) lane. The lane is orthogonal to the session key.
@@ -149,6 +153,8 @@ export type EigenFluxNotifierConfig = {
 };
 
 export type DeliverOptions = {
+  /** Authentication reminders require the final channel-send result. */
+  requireCompletion?: boolean;
   /**
    * When set, deliver to a one-shot session derived from this prefix
    * (a random suffix is appended to prevent context accumulation).
@@ -199,11 +205,20 @@ type NotifyAttemptResult =
       terminal?: boolean;
     };
 
+type PendingConfirmedDelivery = {
+  message: string;
+  route: ResolvedNotificationRoute;
+  source: NotificationRouteSource;
+  idempotencyKey: string;
+  createdAt: number;
+};
+
 export class EigenFluxNotifier {
   private readonly api: OpenClawPluginApi;
   private readonly logger: Logger;
   private readonly config: EigenFluxNotifierConfig;
   private readonly pendingCleanups: Promise<void>[] = [];
+  private pendingConfirmedDelivery?: PendingConfirmedDelivery;
 
   constructor(api: OpenClawPluginApi, logger: Logger, config: EigenFluxNotifierConfig) {
     this.api = api;
@@ -261,6 +276,7 @@ export class EigenFluxNotifier {
   }
 
   private async deliverCoordinated(message: string, options?: DeliverOptions): Promise<boolean> {
+    if (options?.requireCompletion) return this.deliverConfirmed(message);
     const targetKey = options?.targetSessionKey;
     const persistentKey = options?.persistentSessionKey;
     const silent = options?.silent === true;
@@ -371,6 +387,87 @@ export class EigenFluxNotifier {
 
     this.logger.error(`Failed to deliver notification: ${firstAttempt.errors.join(' | ')}`);
     return false;
+  }
+
+  /** Keep one observable run until its delivery outcome is known. */
+  private async deliverConfirmed(message: string): Promise<boolean> {
+    if (this.pendingConfirmedDelivery) {
+      // The Gateway's idempotency cache is shorter than our retry window.
+      // Do not resubmit an ambiguous run after its cache entry may expire.
+      if (!this.shouldRetryUnconfirmedDelivery(this.pendingConfirmedDelivery)) return false;
+      this.pendingConfirmedDelivery = undefined;
+    }
+    if (!this.pendingConfirmedDelivery) {
+      const { route, source } = await this.resolveRoute();
+      this.pendingConfirmedDelivery = { message, route, source, idempotencyKey: randomUUID(), createdAt: Date.now() };
+    }
+    const pending = this.pendingConfirmedDelivery;
+    try {
+      // Request the final result from the first submission: agent.wait can
+      // finish before the channel send, and cannot confirm delivery.
+      const response = await sendAuthReminder({
+        sessionKey: pending.route.sessionKey,
+        message: pending.message,
+        deliver: true,
+        lane: BACKGROUND_LANE,
+        idempotencyKey: pending.idempotencyKey,
+      }, SUBAGENT_TOTAL_WAIT_TIMEOUT_MS);
+      const result = response?.result;
+      const deliverySucceeded = result && typeof result === 'object'
+        ? (result as Record<string, unknown>).deliverySucceeded : undefined;
+      if (response?.runId !== pending.idempotencyKey ||
+        response.status !== 'ok' || deliverySucceeded !== true) {
+        // A matching final failure permits another attempt. Missing or
+        // ambiguous results retain the same key until the retry deadline.
+        if (response?.runId === pending.idempotencyKey &&
+          (response.status === 'error' || (response.status === 'ok' && deliverySucceeded === false))) {
+          this.pendingConfirmedDelivery = undefined;
+        }
+        this.logger.warn(`Authentication reminder channel delivery unconfirmed: run_id=${pending.idempotencyKey}`);
+        return false;
+      }
+    } catch (error) {
+      // A lost RPC response can follow acceptance or a successful send. Keep
+      // the pending identity and defer another submission to the retry deadline.
+      this.logger.warn(`Authentication reminder channel delivery unconfirmed: ${formatError(error)}`);
+      return false;
+    }
+    this.pendingConfirmedDelivery = undefined;
+    try {
+      await this.rememberRouteIfChanged(pending.route, pending.source);
+    } catch (error) {
+      // Route persistence cannot turn a completed delivery into another reminder.
+      this.logger.warn(`Authentication reminder route persistence failed: ${formatError(error)}`);
+    }
+    this.logDispatch({ ok: true, mode: 'gateway.agent', sessionKey: pending.route.sessionKey,
+      runId: pending.idempotencyKey });
+    return true;
+  }
+
+  private shouldRetryUnconfirmedDelivery(pending: PendingConfirmedDelivery): boolean {
+    if (Date.now() - pending.createdAt < AUTH_REMINDER_RETRY_AFTER_MS) return false;
+
+    // A known active run must retain its identity even beyond the retry limit.
+    // On this host the idempotency key is also the run id, so it can identify an
+    // accepted run whose submission response was lost before returning runId.
+    const runId = pending.idempotencyKey;
+    try {
+      const bound = this.runtime.tasks?.runs?.bindSession?.({ sessionKey: pending.route.sessionKey });
+      const task = bound?.list().find((candidate) => candidate.runId === runId);
+      if (task?.status === 'queued' || task?.status === 'running') {
+        this.logger.warn(`Authentication reminder is still active after its retry deadline; retaining run_id=${runId}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.warn(`Authentication reminder task inspection failed: ${formatError(error)}`);
+    }
+
+    // Unknown is never success. Prefer another warning after this bounded wait
+    // to permanent silence; an unobservable older warning could still arrive.
+    this.logger.warn(
+      `Authentication reminder outcome remains unknown and may arrive late; retry deadline reached, starting a new reminder: run_id=${runId}`
+    );
+    return true;
   }
 
   /**
@@ -611,16 +708,16 @@ export class EigenFluxNotifier {
       this.logger.info(
         `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${lane}`
       );
-      const { runId } = await runtimeSubagent.run({
+      const submitted = await runtimeSubagent.run({
         sessionKey: route.sessionKey,
         message,
         deliver,
         idempotencyKey: randomUUID(),
         lane,
       });
+      const runId = submitted.runId;
 
-      // run() only enqueues; wait long enough for the full agent loop (LLM +
-      // reply + channel send) to complete so we can surface real errors.
+      // Ordinary notifications retain the host's agent lifecycle wait.
       if (typeof runtimeSubagent.waitForRun === 'function') {
         const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {

@@ -1,6 +1,6 @@
 {
   "name": "@phronesis-io/openclaw-eigenflux",
-  "version": "0.0.46",
+  "version": "0.0.47",
   "description": "OpenClaw plugin for EigenFlux periodic polling delivery",
   "main": "dist/index.js",
   "files": [
@@ -25,12 +25,12 @@
       "./dist/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.2",
-      "minGatewayVersion": "2026.5.2"
+      "pluginApi": ">=2026.5.7",
+      "minGatewayVersion": "2026.5.7"
     },
     "build": {
-      "openclawVersion": "2026.5.2",
-      "pluginSdkVersion": "2026.5.2"
+      "openclawVersion": "2026.5.7",
+      "pluginSdkVersion": "2026.5.7"
     }
   },
   "keywords": [

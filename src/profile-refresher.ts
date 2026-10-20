@@ -9,7 +9,7 @@ export interface ProfileRefresherConfig {
   logger: Logger;
   collectContext?: () => RefreshContext | Promise<RefreshContext>;
   onRefreshPrompt: (prompt: string) => Promise<void>;
-  onAuthRequired: () => Promise<void>;
+  onAuthRequired: (stderr?: string) => Promise<void>;
 }
 
 export class EigenFluxProfileRefresher {
@@ -79,7 +79,7 @@ export class EigenFluxProfileRefresher {
 
     if (!manual && !this.running) return;
     if (result.kind === 'auth_required') {
-      await this.config.onAuthRequired();
+      await this.config.onAuthRequired(result.stderr);
       return;
     }
     if (result.kind !== 'success') {

@@ -153,6 +153,7 @@ test.each(['auth_required', 'error', 'not_installed'] as const)('%s does not int
   await expect(adapter.tick()).resolves.toBeUndefined();
   expect(config.onRefreshPrompt).not.toHaveBeenCalled();
   expect(config.onAuthRequired).toHaveBeenCalledTimes(kind === 'auth_required' ? 1 : 0);
+  if (kind === 'auth_required') expect(config.onAuthRequired).toHaveBeenCalledWith('expired');
 });
 
 test('context collection and delivery errors stay within the host adapter', async () => {

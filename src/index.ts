@@ -49,6 +49,7 @@ import {
 import { FeedPushScheduler } from './feed-push-scheduler';
 import { EigenFluxHeartbeatPlanRunner, type HeartbeatExecutionPlan } from './heartbeat-plan-runner';
 import { EigenFluxNotifier } from './notifier';
+import { AuthNotificationGate } from './auth-notification-gate';
 import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
 
 /** "Recently active" window for the busy-aware feed push: the main session
@@ -569,23 +570,17 @@ function createServerRuntime(
     eigenfluxHome,
   });
 
-  let lastAuthPromptKey: string | null = null;
+  const authNotificationGate = new AuthNotificationGate();
 
   const resetAuthPromptGate = (): void => {
-    lastAuthPromptKey = null;
+    authNotificationGate.reset();
   };
 
-  const notifyAuthRequired = async (_authEvent: AuthRequiredEvent): Promise<void> => {
-    const promptKey = `auth_required:${server.name}`;
-    if (lastAuthPromptKey === promptKey) {
-      logger.debug(`Skipping duplicate auth prompt for server=${server.name}`);
-      return;
-    }
-
-    lastAuthPromptKey = promptKey;
-    await notifier.deliver(
-      buildAuthRequiredPromptTemplate({ context: getPromptContext() })
-    );
+  const notifyAuthRequired = async (authEvent: AuthRequiredEvent): Promise<void> => {
+    await authNotificationGate.deliver(() => notifier.deliver(
+      buildAuthRequiredPromptTemplate({ context: getPromptContext(), stderr: authEvent.stderr }),
+      { requireCompletion: true }
+    ));
   };
 
   // Pushes the agent's runtime mode to the backend once per heartbeat via the
@@ -597,11 +592,16 @@ function createServerRuntime(
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
   });
+  let heartbeatAuthRequired = false;
+  let heartbeatAuthDetail: string | undefined;
+  let heartbeatAuthUnavailable: Error | undefined;
   const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
     eigenfluxBin: pluginConfig.eigenfluxBin,
     eigenfluxHome,
     serverName: server.name,
     logger,
+    onAuthRequired: (stderr) => { heartbeatAuthRequired = true; heartbeatAuthDetail = stderr; },
+    onAuthUnavailable: (error) => { heartbeatAuthUnavailable = error; },
   });
   // A successful plan is Agent work, not merely a plugin health check. Keep
   // the plan for exactly the poll that produced it; pollOnce is single-flight.
@@ -732,13 +732,18 @@ function createServerRuntime(
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
     onHeartbeatStart: async () => {
+      heartbeatAuthRequired = false;
+      heartbeatAuthDetail = undefined;
+      heartbeatAuthUnavailable = undefined;
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
       if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
+      if (heartbeatAuthUnavailable) {
+        return { kind: 'auth_unavailable' as const, error: heartbeatAuthUnavailable };
+      }
+      if (heartbeatAuthRequired) return { kind: 'auth_required' as const, stderr: heartbeatAuthDetail };
+      return true;
     },
     onFeedPolled: async (payload: FeedResponse) => {
-      // Always reset auth gate on successful poll, even if delivery is skipped
-      resetAuthPromptGate();
-
       const items = payload.data?.items ?? [];
       const notifications = payload.data?.notifications ?? [];
 
@@ -798,6 +803,8 @@ function createServerRuntime(
       feedPushScheduler.schedule(prompt);
     },
     onPollSuccess: async (payload: FeedResponse) => {
+      // Empty successful polls also prove authentication has recovered.
+      resetAuthPromptGate();
       // Push local settings to the backend once per heartbeat (throttled
       // internally). Errors are swallowed inside report().
       await settingsReporter.report();
@@ -848,8 +855,8 @@ function createServerRuntime(
         );
       }
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 
@@ -865,8 +872,8 @@ function createServerRuntime(
       resetAuthPromptGate();
       await notifier.deliver(prompt);
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 
