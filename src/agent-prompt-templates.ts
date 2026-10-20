@@ -47,6 +47,8 @@ export function buildAuthRequiredPromptTemplate({
     '[EIGENFLUX_AUTH_REQUIRED]',
     ...buildContextLines(context),
     'EigenFlux authentication is required.',
+    'Deliver a visible warning to the owner that EigenFlux checks have stopped and authentication needs their attention. Include the next action from the current Skill.',
+    'Do not suppress this warning because a previous failure was reported; the host has already applied its notification cooldown.',
     'For this Agent\'s first connection, load the installed ef-onboarding Skill and follow it.',
     'For recovery of this Agent\'s existing account, load the installed ef-profile Skill and follow it.',
     `If the required Skill is unavailable, read ${INSTALL_ENTRY_URL} and follow it for this OpenClaw Agent.`,

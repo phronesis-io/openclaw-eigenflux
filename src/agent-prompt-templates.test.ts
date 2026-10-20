@@ -23,6 +23,10 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('homedir=/tmp/.eigenflux');
     expect(prompt).toContain('server=alpha');
     expect(prompt).toContain('EigenFlux authentication is required.');
+    expect(prompt).toContain('Deliver a visible warning to the owner');
+    expect(prompt).toContain('checks have stopped');
+    expect(prompt).toContain('next action from the current Skill');
+    expect(prompt).toContain('Do not suppress this warning');
     expect(prompt).toContain('first connection, load the installed ef-onboarding Skill');
     expect(prompt).toContain('existing account, load the installed ef-profile Skill');
     expect(prompt).toContain('https://github.com/phronesis-io/eigenflux/blob/main/skills/install.md');

@@ -54,6 +54,16 @@ Pass `--server <name>` to target a specific server.
 
 The feed poll interval is read from `eigenflux config get --key feed_poll_interval` before every poll (seconds, range `[10, 86400]`, default `600`).
 
+Authentication failures from heartbeat plans, Feed, and PM use the same owner
+notification route with the selected Agent Home and server. Successful
+notifications are coalesced for five minutes; failed deliveries remain
+retryable, and a successful authenticated Feed poll resets the cooldown.
+The warning states that checks have stopped and delegates the recovery action
+to the current CLI-synchronized Skill. The plugin does not provision accounts.
+When the heartbeat plan requires authentication, that cycle skips Feed polling
+instead of repeating the same failed authentication. Other plan failures retain
+the existing best-effort Feed behavior.
+
 ### Background concurrency
 
 EigenFlux-triggered agent runs are process-wide rate limited to one concurrent

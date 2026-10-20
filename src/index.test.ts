@@ -69,6 +69,7 @@ jest.mock('./stream-client', () => ({
 // Mock EigenFluxPollingClient with inline feed polling behavior
 let capturedPollOnFeedPolled: ((payload: any) => Promise<void>) | null = null;
 let capturedPollOnAuthRequired: ((event: any) => Promise<void>) | null = null;
+let capturedPollingConfig: any = null;
 const pollingClientStartMock = jest.fn().mockResolvedValue(undefined);
 const pollingClientStopMock = jest.fn();
 const pollingClientPollOnceMock = jest.fn();
@@ -77,6 +78,7 @@ jest.mock('./polling-client', () => ({
   EigenFluxPollingClient: jest.fn().mockImplementation((config: any) => {
     capturedPollOnFeedPolled = config.onFeedPolled;
     capturedPollOnAuthRequired = config.onAuthRequired;
+    capturedPollingConfig = config;
     return {
       start: pollingClientStartMock,
       stop: pollingClientStopMock,
@@ -110,6 +112,7 @@ describe('register unit', () => {
     // Reset captured callbacks
     capturedPollOnFeedPolled = null;
     capturedPollOnAuthRequired = null;
+    capturedPollingConfig = null;
 
     // Reset session-route-memory mocks
     readStoredNotificationRouteMock.mockReset().mockResolvedValue(undefined);
@@ -208,6 +211,59 @@ describe('register unit', () => {
     expect(promptMessage).not.toContain('auth login');
 
     await services[0].stop();
+  });
+
+  test('heartbeat plan and Feed authentication failures share a retryable owner notification route', async () => {
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'alpha', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+    pollingClientStartMock.mockResolvedValue(undefined);
+    execEigenfluxMock.mockImplementation(async (_bin: string, args: string[]) => {
+      if (args.includes('heartbeat')) return { kind: 'auth_required', stderr: 'authentication required' };
+      return { kind: 'success', data: undefined };
+    });
+    const { EigenFluxNotifier } = await import('./notifier');
+    const deliver = jest.spyOn(EigenFluxNotifier.prototype, 'deliver')
+      .mockResolvedValueOnce(false).mockResolvedValue(true);
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {}, runtime: {}, logger: createLogger(),
+      registerService: (service: any) => services.push(service), registerCommand: jest.fn(),
+      registerHook: jest.fn(), on: jest.fn(),
+    } as any);
+    try {
+      await services[0].start();
+      const actual = jest.requireActual('./polling-client') as typeof import('./polling-client');
+      const poller = new actual.EigenFluxPollingClient(capturedPollingConfig);
+      execEigenfluxMock.mockClear();
+      await expect(poller.pollOnce()).resolves.toMatchObject({ kind: 'auth_required' });
+      // One plan command handles authentication; do not issue another Feed command.
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
+      expect(execEigenfluxMock.mock.calls[0][1]).toEqual([
+        '--homedir', eigenfluxHome, '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
+      ]);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      // Failed delivery must not suppress the next source's attempt.
+      await capturedPollOnAuthRequired!({ reason: 'auth_required' });
+      expect(deliver).toHaveBeenCalledTimes(2);
+      // Once delivered, plan and Feed share the same short cooldown.
+      await poller.pollOnce();
+      expect(deliver).toHaveBeenCalledTimes(2);
+      await capturedPollingConfig.onPollSuccess({
+        code: 0, msg: 'ok', data: { items: [], notifications: [], has_more: false },
+      });
+      await capturedPollOnAuthRequired!({ reason: 'auth_required' });
+      expect(deliver).toHaveBeenCalledTimes(3);
+      const prompt = String(deliver.mock.calls[0][0]);
+      expect(prompt).toContain('server=alpha');
+      expect(prompt).toContain(`homedir=${eigenfluxHome}`);
+      expect(prompt).toContain('Deliver a visible warning to the owner');
+      expect(prompt).not.toContain('agent provision');
+    } finally {
+      await services[0].stop();
+      deliver.mockRestore();
+    }
   });
 
   test('supports /eigenflux auth command with discovered servers', async () => {
