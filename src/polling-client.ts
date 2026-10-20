@@ -119,7 +119,7 @@ export interface PollingClientConfig {
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
   /** False requires login; auth_unavailable stops this cycle without a login prompt. */
-  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error }>;
+  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error } | { kind: 'auth_required'; stderr?: string }>;
   /**
    * Optional hook invoked once per successful poll (heartbeat), regardless of
    * whether the feed contained any items/notifications. Used for side-channel
@@ -132,6 +132,7 @@ export interface PollingClientConfig {
 
 export interface AuthRequiredEvent {
   reason: 'auth_required';
+  stderr?: string;
 }
 
 export type PollResult =
@@ -243,10 +244,15 @@ export class EigenFluxPollingClient {
       try {
         if (this.config.onHeartbeatStart) {
           let authenticationRequired = false;
+          let authenticationDetail: string | undefined;
           let authenticationError: Error | undefined;
           try {
             const start = await this.config.onHeartbeatStart();
             authenticationRequired = start === false;
+            if (start && typeof start === 'object' && start.kind === 'auth_required') {
+              authenticationRequired = true;
+              authenticationDetail = start.stderr;
+            }
             if (start && typeof start === 'object' && start.kind === 'auth_unavailable') {
               authenticationError = start.error;
             }
@@ -257,7 +263,8 @@ export class EigenFluxPollingClient {
           }
           if (authenticationError) return { kind: 'error', error: authenticationError };
           if (authenticationRequired) {
-            const authEvent: AuthRequiredEvent = { reason: 'auth_required' };
+            const authEvent: AuthRequiredEvent = { reason: 'auth_required',
+              ...(authenticationDetail ? { stderr: authenticationDetail } : {}) };
             if (notifyAuthRequired) await this.config.onAuthRequired(authEvent);
             return { kind: 'auth_required', authEvent };
           }
@@ -272,7 +279,8 @@ export class EigenFluxPollingClient {
         );
 
         if (result.kind === 'auth_required') {
-          const authEvent: AuthRequiredEvent = { reason: 'auth_required' };
+          const authEvent: AuthRequiredEvent = { reason: 'auth_required',
+            ...(result.stderr ? { stderr: result.stderr } : {}) };
           if (notifyAuthRequired) {
             await this.config.onAuthRequired(authEvent);
           }

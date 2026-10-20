@@ -56,7 +56,7 @@ export interface StreamClientConfig {
   eigenfluxBin: string;
   logger: Logger;
   onPmEvent: (event: PmStreamEvent) => Promise<void>;
-  onAuthRequired: () => Promise<void>;
+  onAuthRequired: (stderr?: string) => Promise<void>;
   onStreamError?: (error: Error) => void;
 }
 
@@ -165,7 +165,9 @@ export class EigenFluxStreamClient {
       this.handleLine(line);
     });
 
+    let stderrTail = '';
     child.stderr?.on('data', (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-16_384);
       const text = chunk.toString().trim();
       if (text) {
         this.config.logger.debug(`[stream stderr] ${text}`);
@@ -175,10 +177,12 @@ export class EigenFluxStreamClient {
     child.on('error', (err) => {
       this.config.logger.error(`Stream process error: ${err.message}`);
       this.config.onStreamError?.(err);
-      this.scheduleRestart();
     });
 
-    child.on('exit', (code, signal) => {
+    // close follows stderr drainage, including the CLI's final owner action.
+    child.on('close', (code, signal) => {
+      if (this.child === child) this.child = null;
+      if (this.readline === rl) this.readline = null;
       this.config.logger.info(
         `Stream process exited (code=${code}, signal=${signal})`
       );
@@ -189,7 +193,7 @@ export class EigenFluxStreamClient {
 
       if (code === EXIT_AUTH_REQUIRED) {
         this.config.logger.warn('Stream auth required');
-        this.config.onAuthRequired().then(() => {
+        this.config.onAuthRequired(stderrTail.trim()).then(() => {
           this.scheduleRestart();
         }).catch((err) => {
           this.config.logger.error(`Auth required handler error: ${err instanceof Error ? err.message : String(err)}`);

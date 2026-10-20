@@ -128,6 +128,9 @@ const SUBAGENT_QUEUE_TIMEOUT_MS = 300_000;
 // queue + execution budget without relying on the ephemeral task registry.
 const SUBAGENT_TOTAL_WAIT_TIMEOUT_MS =
   SUBAGENT_QUEUE_TIMEOUT_MS + SUBAGENT_WAIT_TIMEOUT_MS;
+// Host run results are ephemeral. Bound unknown outcomes so a lost completion
+// cannot permanently suppress later authentication reminders.
+const AUTH_REMINDER_RETRY_AFTER_MS = 15 * 60 * 1000;
 // Background deliveries (feed / PM / profile) run on a dedicated queue lane so a
 // slow or stuck agent run never serializes behind / ahead of the user's own
 // interactive (per-chat) lane. The lane is orthogonal to the session key.
@@ -206,6 +209,7 @@ type PendingConfirmedDelivery = {
   route: ResolvedNotificationRoute;
   source: NotificationRouteSource;
   idempotencyKey: string;
+  createdAt: number;
   runId?: string;
 };
 
@@ -392,9 +396,12 @@ export class EigenFluxNotifier {
       this.logger.warn('Authentication reminder remains retryable: runtime.subagent run/waitForRun unavailable');
       return false;
     }
+    if (this.pendingConfirmedDelivery && this.shouldRetryUnconfirmedDelivery(this.pendingConfirmedDelivery)) {
+      this.pendingConfirmedDelivery = undefined;
+    }
     if (!this.pendingConfirmedDelivery) {
       const { route, source } = await this.resolveRoute();
-      this.pendingConfirmedDelivery = { message, route, source, idempotencyKey: randomUUID() };
+      this.pendingConfirmedDelivery = { message, route, source, idempotencyKey: randomUUID(), createdAt: Date.now() };
     }
     const pending = this.pendingConfirmedDelivery;
     const result = await this.tryNotifyViaRuntimeSubagent(
@@ -412,6 +419,32 @@ export class EigenFluxNotifier {
       this.logger.warn(`Authentication reminder route persistence failed: ${formatError(error)}`);
     }
     this.logDispatch(result);
+    return true;
+  }
+
+  private shouldRetryUnconfirmedDelivery(pending: PendingConfirmedDelivery): boolean {
+    if (Date.now() - pending.createdAt < AUTH_REMINDER_RETRY_AFTER_MS) return false;
+
+    // A known active run must retain its identity even beyond the retry limit.
+    // On this host the idempotency key is also the run id, so it can identify an
+    // accepted run whose submission response was lost before returning runId.
+    const runId = pending.runId ?? pending.idempotencyKey;
+    try {
+      const bound = this.runtime.tasks?.runs?.bindSession?.({ sessionKey: pending.route.sessionKey });
+      const task = bound?.list().find((candidate) => candidate.runId === runId);
+      if (task?.status === 'queued' || task?.status === 'running') {
+        this.logger.warn(`Authentication reminder is still active after its retry deadline; retaining run_id=${runId}`);
+        return false;
+      }
+    } catch (error) {
+      this.logger.warn(`Authentication reminder task inspection failed: ${formatError(error)}`);
+    }
+
+    // Unknown is never success. Prefer another warning after this bounded wait
+    // to permanent silence; an unobservable older warning could still arrive.
+    this.logger.warn(
+      `Authentication reminder outcome remains unknown and may arrive late; retry deadline reached, starting a new reminder: run_id=${runId}`
+    );
     return true;
   }
 

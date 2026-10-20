@@ -46,6 +46,7 @@ test('routes plan authentication failure to the host notification callback', asy
   execMock.mockResolvedValue({ kind: 'auth_required', stderr: 'authentication required' });
   await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired }).run()).resolves.toBeNull();
   expect(onAuthRequired).toHaveBeenCalledTimes(1);
+  expect(onAuthRequired).toHaveBeenCalledWith('authentication required');
 });
 
 test('operational plan failure does not ask the owner to authenticate', async () => {

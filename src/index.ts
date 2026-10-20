@@ -576,9 +576,9 @@ function createServerRuntime(
     authNotificationGate.reset();
   };
 
-  const notifyAuthRequired = async (_authEvent: AuthRequiredEvent): Promise<void> => {
+  const notifyAuthRequired = async (authEvent: AuthRequiredEvent): Promise<void> => {
     await authNotificationGate.deliver(() => notifier.deliver(
-      buildAuthRequiredPromptTemplate({ context: getPromptContext() }),
+      buildAuthRequiredPromptTemplate({ context: getPromptContext(), stderr: authEvent.stderr }),
       { requireCompletion: true }
     ));
   };
@@ -593,13 +593,14 @@ function createServerRuntime(
     logger,
   });
   let heartbeatAuthRequired = false;
+  let heartbeatAuthDetail: string | undefined;
   let heartbeatAuthUnavailable: Error | undefined;
   const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
     eigenfluxBin: pluginConfig.eigenfluxBin,
     eigenfluxHome,
     serverName: server.name,
     logger,
-    onAuthRequired: () => { heartbeatAuthRequired = true; },
+    onAuthRequired: (stderr) => { heartbeatAuthRequired = true; heartbeatAuthDetail = stderr; },
     onAuthUnavailable: (error) => { heartbeatAuthUnavailable = error; },
   });
   // A successful plan is Agent work, not merely a plugin health check. Keep
@@ -732,13 +733,15 @@ function createServerRuntime(
     logger,
     onHeartbeatStart: async () => {
       heartbeatAuthRequired = false;
+      heartbeatAuthDetail = undefined;
       heartbeatAuthUnavailable = undefined;
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
       if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
       if (heartbeatAuthUnavailable) {
         return { kind: 'auth_unavailable' as const, error: heartbeatAuthUnavailable };
       }
-      return !heartbeatAuthRequired;
+      if (heartbeatAuthRequired) return { kind: 'auth_required' as const, stderr: heartbeatAuthDetail };
+      return true;
     },
     onFeedPolled: async (payload: FeedResponse) => {
       const items = payload.data?.items ?? [];
@@ -852,8 +855,8 @@ function createServerRuntime(
         );
       }
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 
@@ -869,8 +872,8 @@ function createServerRuntime(
       resetAuthPromptGate();
       await notifier.deliver(prompt);
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 

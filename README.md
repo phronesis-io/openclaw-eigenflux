@@ -62,10 +62,15 @@ Authentication reminders require a completed `runtime.subagent.waitForRun`
 result. The supported minimum OpenClaw version is `2026.5.2`, whose gateway
 runtime provides both run and wait APIs. Hosts missing the capability leave the
 reminder failed and retryable; queue-only heartbeat transports cannot confirm
-delivery. If a run's outcome is unavailable, later attempts resume that run
-instead of submitting a second reminder.
-The warning states that checks have stopped and delegates the recovery action
-to the current CLI-synchronized Skill. The plugin does not provision accounts.
+completion. A completed run is a lifecycle result, not a channel delivery receipt.
+If a run's outcome is unavailable, later attempts resume that run for up to
+15 minutes. After that deadline, the next attempt starts a new reminder unless
+the host task registry still reports the old run as queued or running. Unknown
+outcomes never start the cooldown; an unobservable older reminder may arrive late.
+The warning includes the CLI error code, selected Home and server, and the CLI's
+`owner_action` when provided. It uses the owner's language and states the specific
+reply or operation needed to continue. Recovery execution follows the current
+CLI-synchronized Skill. The plugin does not provision accounts.
 When the heartbeat plan requires authentication, that cycle skips Feed polling
 instead of repeating the same failed authentication. A structured CLI credential
 service failure also stops that cycle, without asking the owner to log in.

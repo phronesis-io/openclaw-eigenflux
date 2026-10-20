@@ -210,6 +210,22 @@ describe('EigenFluxPollingClient', () => {
     expect(execEigenfluxMock).not.toHaveBeenCalled();
   });
 
+  test('keeps the plan CLI owner action when stopping before Feed', async () => {
+    execEigenfluxMock.mockClear();
+    const stderr = JSON.stringify({ code: 'IDENTITY_UNAVAILABLE', owner_action: 'Restore the original installation files.' });
+    const onAuthRequired = jest.fn().mockResolvedValue(undefined);
+    const client = new EigenFluxPollingClient({
+      serverName: 'alpha', eigenfluxBin: 'eigenflux',
+      resolvePollIntervalSec: jest.fn().mockResolvedValue(60), logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue({ kind: 'auth_required', stderr }),
+      onFeedPolled: jest.fn(), onAuthRequired,
+    });
+    await expect(client.pollOnce()).resolves.toEqual({ kind: 'auth_required',
+      authEvent: { reason: 'auth_required', stderr } });
+    expect(onAuthRequired).toHaveBeenCalledWith({ reason: 'auth_required', stderr });
+    expect(execEigenfluxMock).not.toHaveBeenCalled();
+  });
+
   test('unavailable credential service stops Feed without a login notification', async () => {
     execEigenfluxMock.mockClear();
     const error = new Error('503 AGENT_AUTH_UNAVAILABLE');
@@ -249,10 +265,12 @@ describe('EigenFluxPollingClient', () => {
       kind: 'auth_required',
       authEvent: {
         reason: 'auth_required',
+        stderr: 'token expired',
       },
     });
     expect(onAuthRequired).toHaveBeenCalledWith({
       reason: 'auth_required',
+      stderr: 'token expired',
     });
     expect(onFeedPolled).not.toHaveBeenCalled();
   });

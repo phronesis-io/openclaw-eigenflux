@@ -214,12 +214,16 @@ describe('register unit', () => {
   });
 
   test('heartbeat plan and Feed authentication failures share a retryable owner notification route', async () => {
+    const authNotice = JSON.stringify({
+      schema_version: 'eigenflux_auth_required.v1', code: 'REFRESH_INVALID',
+      owner_action: 'Reply "Recover my current EigenFlux account" to authorize foreground recovery.',
+    });
     discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
       { name: 'alpha', endpoint: 'http://127.0.0.1:18080', current: true },
     ] });
     pollingClientStartMock.mockResolvedValue(undefined);
     execEigenfluxMock.mockImplementation(async (_bin: string, args: string[]) => {
-      if (args.includes('heartbeat')) return { kind: 'auth_required', stderr: 'authentication required' };
+      if (args.includes('heartbeat')) return { kind: 'auth_required', stderr: authNotice };
       return { kind: 'success', data: undefined };
     });
     const { EigenFluxNotifier } = await import('./notifier');
@@ -260,6 +264,8 @@ describe('register unit', () => {
       expect(prompt).toContain('server=alpha');
       expect(prompt).toContain(`homedir=${eigenfluxHome}`);
       expect(prompt).toContain('Deliver a visible warning to the owner');
+      expect(prompt).toContain(authNotice);
+      expect(prompt).toContain('Write in the owner\'s language');
       expect(prompt).not.toContain('agent provision');
     } finally {
       await services[0].stop();
