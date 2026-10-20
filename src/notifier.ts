@@ -13,6 +13,7 @@ import {
 } from './notification-route-resolver';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 import { globalDeliveryCoordinator } from './delivery-coordinator';
+import { sendAuthReminder } from './auth-reminder-transport';
 
 /**
  * Typed subset of the OpenClaw runtime API used by the notifier.
@@ -152,7 +153,7 @@ export type EigenFluxNotifierConfig = {
 };
 
 export type DeliverOptions = {
-  /** Authentication reminders require a completed host run, never an enqueue acknowledgement. */
+  /** Authentication reminders require the final channel-send result. */
   requireCompletion?: boolean;
   /**
    * When set, deliver to a one-shot session derived from this prefix
@@ -210,7 +211,6 @@ type PendingConfirmedDelivery = {
   source: NotificationRouteSource;
   idempotencyKey: string;
   createdAt: number;
-  runId?: string;
 };
 
 export class EigenFluxNotifier {
@@ -391,12 +391,10 @@ export class EigenFluxNotifier {
 
   /** Keep one observable run until its delivery outcome is known. */
   private async deliverConfirmed(message: string): Promise<boolean> {
-    if (typeof this.runtime.subagent?.run !== 'function' ||
-      typeof this.runtime.subagent.waitForRun !== 'function') {
-      this.logger.warn('Authentication reminder remains retryable: runtime.subagent run/waitForRun unavailable');
-      return false;
-    }
-    if (this.pendingConfirmedDelivery && this.shouldRetryUnconfirmedDelivery(this.pendingConfirmedDelivery)) {
+    if (this.pendingConfirmedDelivery) {
+      // The Gateway's idempotency cache is shorter than our retry window.
+      // Do not resubmit an ambiguous run after its cache entry may expire.
+      if (!this.shouldRetryUnconfirmedDelivery(this.pendingConfirmedDelivery)) return false;
       this.pendingConfirmedDelivery = undefined;
     }
     if (!this.pendingConfirmedDelivery) {
@@ -404,21 +402,45 @@ export class EigenFluxNotifier {
       this.pendingConfirmedDelivery = { message, route, source, idempotencyKey: randomUUID(), createdAt: Date.now() };
     }
     const pending = this.pendingConfirmedDelivery;
-    const result = await this.tryNotifyViaRuntimeSubagent(
-      pending.message, pending.route, false, BACKGROUND_LANE, pending
-    );
-    if (result.ok || !result.terminal) this.pendingConfirmedDelivery = undefined;
-    if (!result.ok) {
-      this.logger.warn(`Authentication reminder delivery unconfirmed: ${result.error}`);
+    try {
+      // Request the final result from the first submission: agent.wait can
+      // finish before the channel send, and cannot confirm delivery.
+      const response = await sendAuthReminder({
+        sessionKey: pending.route.sessionKey,
+        message: pending.message,
+        deliver: true,
+        lane: BACKGROUND_LANE,
+        idempotencyKey: pending.idempotencyKey,
+      }, SUBAGENT_TOTAL_WAIT_TIMEOUT_MS);
+      const result = response?.result;
+      const deliverySucceeded = result && typeof result === 'object'
+        ? (result as Record<string, unknown>).deliverySucceeded : undefined;
+      if (response?.runId !== pending.idempotencyKey ||
+        response.status !== 'ok' || deliverySucceeded !== true) {
+        // A matching final failure permits another attempt. Missing or
+        // ambiguous results retain the same key until the retry deadline.
+        if (response?.runId === pending.idempotencyKey &&
+          (response.status === 'error' || (response.status === 'ok' && deliverySucceeded === false))) {
+          this.pendingConfirmedDelivery = undefined;
+        }
+        this.logger.warn(`Authentication reminder channel delivery unconfirmed: run_id=${pending.idempotencyKey}`);
+        return false;
+      }
+    } catch (error) {
+      // A lost RPC response can follow acceptance or a successful send. Keep
+      // the pending identity and defer another submission to the retry deadline.
+      this.logger.warn(`Authentication reminder channel delivery unconfirmed: ${formatError(error)}`);
       return false;
     }
+    this.pendingConfirmedDelivery = undefined;
     try {
       await this.rememberRouteIfChanged(pending.route, pending.source);
     } catch (error) {
       // Route persistence cannot turn a completed delivery into another reminder.
       this.logger.warn(`Authentication reminder route persistence failed: ${formatError(error)}`);
     }
-    this.logDispatch(result);
+    this.logDispatch({ ok: true, mode: 'gateway.agent', sessionKey: pending.route.sessionKey,
+      runId: pending.idempotencyKey });
     return true;
   }
 
@@ -428,7 +450,7 @@ export class EigenFluxNotifier {
     // A known active run must retain its identity even beyond the retry limit.
     // On this host the idempotency key is also the run id, so it can identify an
     // accepted run whose submission response was lost before returning runId.
-    const runId = pending.runId ?? pending.idempotencyKey;
+    const runId = pending.idempotencyKey;
     try {
       const bound = this.runtime.tasks?.runs?.bindSession?.({ sessionKey: pending.route.sessionKey });
       const task = bound?.list().find((candidate) => candidate.runId === runId);
@@ -667,8 +689,7 @@ export class EigenFluxNotifier {
     message: string,
     route: ResolvedNotificationRoute,
     silent = false,
-    lane = BACKGROUND_LANE,
-    pending?: Pick<PendingConfirmedDelivery, 'idempotencyKey' | 'runId'>
+    lane = BACKGROUND_LANE
   ): Promise<NotifyAttemptResult> {
     const runtimeSubagent = this.runtime.subagent;
 
@@ -677,12 +698,7 @@ export class EigenFluxNotifier {
         ok: false,
         mode: 'runtime.subagent',
         error: 'runtime.subagent.run is unavailable',
-        ...(pending ? { terminal: true } : {}),
       };
-    }
-    if (pending && typeof runtimeSubagent.waitForRun !== 'function') {
-      return { ok: false, mode: 'runtime.subagent', terminal: true,
-        error: 'Authentication reminder completion API is unavailable' };
     }
 
     try {
@@ -692,27 +708,16 @@ export class EigenFluxNotifier {
       this.logger.info(
         `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${lane}`
       );
-      let runId = pending?.runId;
-      if (!runId) {
-        const submitted = await runtimeSubagent.run({
-          sessionKey: route.sessionKey,
-          message,
-          deliver,
-          idempotencyKey: pending?.idempotencyKey ?? randomUUID(),
-          lane,
-        });
-        runId = submitted.runId;
-        if (pending) {
-          if (!runId) throw new Error('Authentication reminder acceptance missing runId');
-          pending.runId = runId;
-        }
-      }
+      const submitted = await runtimeSubagent.run({
+        sessionKey: route.sessionKey,
+        message,
+        deliver,
+        idempotencyKey: randomUUID(),
+        lane,
+      });
+      const runId = submitted.runId;
 
-      // run() only enqueues; wait long enough for the full agent loop (LLM +
-      // reply + channel send) to complete so we can surface real errors.
-      if (pending && typeof runtimeSubagent.waitForRun !== 'function') {
-        throw new Error('Authentication reminder completion API is unavailable');
-      }
+      // Ordinary notifications retain the host's agent lifecycle wait.
       if (typeof runtimeSubagent.waitForRun === 'function') {
         const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {
@@ -729,16 +734,12 @@ export class EigenFluxNotifier {
           return {
             ok: false,
             mode: 'runtime.subagent',
-            terminal: pending ? !cancelled : true,
+            terminal: true,
             error:
               (waited.error ??
                 `subagent completion wait timed out after ${Math.round(SUBAGENT_TOTAL_WAIT_TIMEOUT_MS / 1000)}s`) +
               (cancelled ? '; run cancelled' : '; cancellation unavailable or failed'),
           };
-        }
-        if (pending && waited.status !== 'ok') {
-          return { ok: false, mode: 'runtime.subagent', terminal: true,
-            error: 'Authentication reminder completion status is unknown' };
         }
       }
 
@@ -753,7 +754,6 @@ export class EigenFluxNotifier {
         ok: false,
         mode: 'runtime.subagent',
         error: formatError(error),
-        ...(pending ? { terminal: true } : {}),
       };
     }
   }

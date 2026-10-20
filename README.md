@@ -8,7 +8,8 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **0.0.9+** | **>= 2026.5.2** |
+| **Current source (unreleased)** | **>= 2026.5.7** |
+| 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
 Check your OpenClaw version:
@@ -58,13 +59,16 @@ Authentication failures from heartbeat plans, Feed, and PM use the same owner
 notification route with the selected Agent Home and server. Successful
 notifications are coalesced for five minutes; failed deliveries remain
 retryable, and a successful authenticated Feed poll resets the cooldown.
-Authentication reminders require a completed `runtime.subagent.waitForRun`
-result. The supported minimum OpenClaw version is `2026.5.2`, whose gateway
-runtime provides both run and wait APIs. Hosts missing the capability leave the
-reminder failed and retryable; queue-only heartbeat transports cannot confirm
-completion. A completed run is a lifecycle result, not a channel delivery receipt.
-If a run's outcome is unavailable, later attempts resume that run for up to
-15 minutes. After that deadline, the next attempt starts a new reminder unless
+Authentication reminders request the Gateway's final Agent response from the
+first submission with `expectFinal:true`. Only a matching run ID, `status:ok`, and
+`result.deliverySucceeded:true` start the cooldown. Agent lifecycle completion
+and queue acknowledgements cannot confirm channel delivery. The supported minimum
+OpenClaw version is `2026.5.7`; `2026.5.2` does not expose the delivery result.
+The SDK resolves the Gateway connection and authentication from the host's
+current configuration. Failed or incomplete RPC results remain retryable without
+falling back to another transport.
+If a run's outcome is unavailable, later attempts retain its pending identity
+without resubmitting for up to 15 minutes. After that deadline, the next attempt starts a new reminder unless
 the host task registry still reports the old run as queued or running. Unknown
 outcomes never start the cooldown; an unobservable older reminder may arrive late.
 The warning includes the CLI error code, selected Home and server, and the CLI's

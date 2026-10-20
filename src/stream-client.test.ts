@@ -54,10 +54,14 @@ test('an auth exit forwards the final CLI owner action after stderr drainage wit
   const home = mkdtempSync(join(tmpdir(), 'eigenflux-stream-auth-'));
   const bin = join(home, 'eigenflux');
   const notice = JSON.stringify({ schema_version: 'eigenflux_auth_required.v1',
-    code: 'REFRESH_INVALID', owner_action: 'Reply "Recover my current EigenFlux account".' });
+    code: 'REFRESH_INVALID', owner_action: '请回复“恢复当前 EigenFlux 账号”。' });
   writeFileSync(bin, `#!${process.execPath}
 process.stderr.write('earlier-diagnostic:' + 'x'.repeat(20000), () => {
-  process.stderr.write('\\n' + ${JSON.stringify(notice)} + '\\n', () => { process.exitCode = 4; });
+  const notice = Buffer.from('\\n' + ${JSON.stringify(notice)} + '\\n');
+  const split = notice.indexOf(Buffer.from('恢复')) + 1;
+  process.stderr.write(notice.subarray(0, split), () => {
+    setTimeout(() => process.stderr.write(notice.subarray(split), () => { process.exitCode = 4; }), 20);
+  });
 });
 `, { mode: 0o700 });
   let receive!: (detail?: string) => void;
@@ -107,6 +111,62 @@ test('a spawn failure schedules one reconnect when error is followed by close', 
       .toEqual([['[EigenFlux] Stream reconnecting in 1000ms (failure #1) for server=owned-server']]);
   } finally {
     clearTimeout(timeout);
+    await client.stop();
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test.each(['resolve', 'reject'])('a stopped generation cannot reconnect after its auth warning %s', async outcome => {
+  const home = mkdtempSync(join(tmpdir(), 'eigenflux-stream-generation-'));
+  const bin = join(home, 'eigenflux');
+  const marker = join(home, 'started');
+  writeFileSync(bin, `#!${process.execPath}
+const fs = require('node:fs');
+const marker = ${JSON.stringify(marker)};
+if (!fs.existsSync(marker)) {
+  fs.writeFileSync(marker, '1');
+  process.stderr.write('authentication required', () => { process.exitCode = 4; });
+} else {
+  console.log(JSON.stringify({type:'ready',data:{}}));
+  setInterval(() => {}, 1000);
+}
+`, { mode: 0o700 });
+  let authStarted!: () => void;
+  const waiting = new Promise<void>(resolve => { authStarted = resolve; });
+  let finish!: () => void;
+  let fail!: (reason: Error) => void;
+  let ready!: () => void;
+  const restarted = new Promise<void>(resolve => { ready = resolve; });
+  const info = jest.fn();
+  const client = new EigenFluxStreamClient({
+    serverName: 'owned-server', eigenfluxBin: bin,
+    logger: new Logger({ info, debug: jest.fn(), warn: jest.fn(), error: jest.fn() }),
+    onPmEvent: async () => { ready(); },
+    onAuthRequired: async () => {
+      authStarted();
+      await new Promise<void>((resolve, reject) => { finish = resolve; fail = reject; });
+    },
+  });
+  let timeout: NodeJS.Timeout | undefined;
+  const bounded = (work: Promise<void>) => Promise.race([work, new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => reject(new Error('stream generation did not respond')), 3000);
+  })]);
+  try {
+    await client.start();
+    await bounded(waiting);
+    clearTimeout(timeout);
+    await client.stop();
+    await client.start();
+    await bounded(restarted);
+    if (outcome === 'resolve') finish(); else fail(new Error('old warning failed'));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(info.mock.calls.filter(([message]) => message.includes('Spawning:'))).toHaveLength(2);
+    expect(info.mock.calls.filter(([message]) => message.includes('Stream reconnecting'))).toHaveLength(0);
+    expect(client.isRunning()).toBe(true);
+  } finally {
+    clearTimeout(timeout);
+    finish?.();
     await client.stop();
     rmSync(home, { recursive: true, force: true });
   }

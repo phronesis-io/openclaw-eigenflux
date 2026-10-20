@@ -2,215 +2,196 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { AuthNotificationGate } from './auth-notification-gate';
 import { EigenFluxNotifier } from './notifier';
 import { Logger } from './logger';
+import { sendAuthReminder } from './auth-reminder-transport';
 import { resolveNotificationRoute } from './notification-route-resolver';
 import { writeStoredNotificationRoute } from './session-route-memory';
 
+jest.mock('./auth-reminder-transport', () => ({ sendAuthReminder: jest.fn() }));
 jest.mock('./notification-route-resolver', () => ({
   isInternalSessionKey: (key: string) => key === 'main',
   resolveNotificationRoute: jest.fn(),
 }));
 jest.mock('./session-route-memory', () => ({ writeStoredNotificationRoute: jest.fn() }));
 
+const send = sendAuthReminder as jest.MockedFunction<typeof sendAuthReminder>;
 const resolveRoute = resolveNotificationRoute as jest.MockedFunction<typeof resolveNotificationRoute>;
 const writeRoute = writeStoredNotificationRoute as jest.MockedFunction<typeof writeStoredNotificationRoute>;
+const sent = (params: { idempotencyKey: string }) => ({
+  runId: params.idempotencyKey, status: 'ok', result: { deliverySucceeded: true },
+});
 
 beforeEach(() => {
+  send.mockReset().mockImplementation(async params => sent(params));
   resolveRoute.mockReset().mockResolvedValue({ source: 'default', route: { sessionKey: 'main', agentId: 'main' } });
   writeRoute.mockReset().mockResolvedValue(true);
 });
-
 afterEach(() => jest.restoreAllMocks());
 
-function setup(subagent: Record<string, unknown>, tasks?: unknown) {
+function setup(tasks?: unknown) {
   const system = {
-    runCommandWithTimeout: jest.fn().mockResolvedValue({ code: 0 }),
-    enqueueSystemEvent: jest.fn().mockReturnValue(true), requestHeartbeatNow: jest.fn(),
+    runCommandWithTimeout: jest.fn(), enqueueSystemEvent: jest.fn(), requestHeartbeatNow: jest.fn(),
   };
+  const subagent = { run: jest.fn(), waitForRun: jest.fn().mockResolvedValue({ status: 'ok' }) };
   const logs = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const notifier = new EigenFluxNotifier({ config: {}, runtime: { subagent, system, tasks } } as unknown as OpenClawPluginApi,
-    new Logger(logs),
-    { sessionKey: 'main', agentId: 'main', openclawCliBin: 'openclaw' });
+    new Logger(logs), { sessionKey: 'main', agentId: 'main', openclawCliBin: 'openclaw' });
   const gate = new AuthNotificationGate();
   const notify = (message = 'AUTH_REQUIRED') => gate.deliver(() => notifier.deliver(message, { requireCompletion: true }));
-  return { notifier, notify, system, logs };
+  return { notifier, notify, system, subagent, logs };
 }
 
-function noQueuedFallback(system: ReturnType<typeof setup>['system']) {
+function noOtherTransport({ system, subagent }: ReturnType<typeof setup>) {
+  expect(subagent.run).not.toHaveBeenCalled();
+  expect(subagent.waitForRun).not.toHaveBeenCalled();
   expect(system.runCommandWithTimeout).not.toHaveBeenCalled();
   expect(system.enqueueSystemEvent).not.toHaveBeenCalled();
   expect(system.requestHeartbeatNow).not.toHaveBeenCalled();
 }
 
-test('missing completion capability remains retryable without submitting or enqueuing', async () => {
-  const run = jest.fn().mockResolvedValue({ runId: 'run-confirmed' });
-  const subagent: Record<string, unknown> = { run };
-  const { notify, system } = setup(subagent);
-  await expect(notify()).resolves.toBe(false);
-  await expect(notify()).resolves.toBe(false);
-  expect(run).not.toHaveBeenCalled();
-  noQueuedFallback(system);
-
-  subagent.waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
-  await expect(notify()).resolves.toBe(true);
-  await expect(notify()).resolves.toBe(false);
-  expect(run).toHaveBeenCalledTimes(1);
+test('only the final matching channel-send result starts cooldown', async () => {
+  const context = setup();
+  await expect(context.notify()).resolves.toBe(true);
+  await expect(context.notify()).resolves.toBe(false);
+  expect(send).toHaveBeenCalledTimes(1);
+  expect(send).toHaveBeenCalledWith({ sessionKey: 'main', message: 'AUTH_REQUIRED',
+    deliver: true, lane: 'eigenflux-bg', idempotencyKey: expect.any(String) }, 480_000);
+  noOtherTransport(context);
 });
 
-test('only confirmed completion starts the cooldown and coalesces concurrent sources', async () => {
-  let finish!: (result: { status: string }) => void;
-  let waiting!: () => void;
-  const started = new Promise<void>((resolve) => { waiting = resolve; });
-  const waitForRun = jest.fn().mockImplementation(() => {
-    waiting();
-    return new Promise((resolve) => { finish = resolve; });
-  });
-  const run = jest.fn().mockResolvedValue({ runId: 'run-pending' });
-  const { notify, system } = setup({ run, waitForRun });
-  const first = notify();
-  await started;
-  await expect(notify()).resolves.toBe(false);
-  finish({ status: 'ok' });
+test('an early lifecycle success cannot start cooldown before the final channel send', async () => {
+  let finish!: (response: Record<string, unknown>) => void;
+  let started!: () => void;
+  const waiting = new Promise<void>(resolve => { started = resolve; });
+  send.mockImplementation(() => { started(); return new Promise(resolve => { finish = resolve; }); });
+  const context = setup();
+  let settled = false;
+  const first = context.notify().then(result => { settled = true; return result; });
+  await waiting;
+  await Promise.resolve();
+  expect(settled).toBe(false);
+  await expect(context.notify()).resolves.toBe(false);
+  finish(sent(send.mock.calls[0][0]));
   await expect(first).resolves.toBe(true);
-  await expect(notify()).resolves.toBe(false);
-  expect(run).toHaveBeenCalledTimes(1);
-  expect(waitForRun).toHaveBeenCalledWith({ runId: 'run-pending', timeoutMs: 480_000 });
-  noQueuedFallback(system);
+  await expect(context.notify()).resolves.toBe(false);
+  expect(send).toHaveBeenCalledTimes(1);
+  noOtherTransport(context);
 });
 
-test.each(['wait error', 'timeout', 'unknown status'])('%s retains the same unconfirmed run for the next attempt', async (outcome) => {
-  const run = jest.fn().mockResolvedValue({ runId: 'run-pending' });
-  const waitForRun = jest.fn();
-  if (outcome === 'wait error') waitForRun.mockRejectedValueOnce(new Error('host unavailable'));
-  else waitForRun.mockResolvedValueOnce({ status: outcome === 'timeout' ? 'timeout' : 'pending' });
-  waitForRun.mockResolvedValueOnce({ status: 'ok' });
-  const { notify, system } = setup({ run, waitForRun });
-  await expect(notify()).resolves.toBe(false);
-  await expect(notify()).resolves.toBe(true);
-  await expect(notify()).resolves.toBe(false);
-  expect(run).toHaveBeenCalledTimes(1);
-  expect(waitForRun).toHaveBeenNthCalledWith(2, { runId: 'run-pending', timeoutMs: 480_000 });
-  noQueuedFallback(system);
+test.each([
+  ['accepted', { status: 'accepted' }],
+  ['lifecycle only', { status: 'ok' }],
+  ['empty result', { status: 'ok', result: {} }],
+  ['non-boolean receipt', { status: 'ok', result: { deliverySucceeded: 'true' } }],
+  ['timeout', { status: 'timeout' }],
+  ['missing status', { result: { deliverySucceeded: true } }],
+  ['unknown status', { status: 'pending', result: { deliverySucceeded: true } }],
+])('%s remains unknown without resubmission or cooldown before the deadline', async (_name, response) => {
+  const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+  send.mockImplementationOnce(async params => ({ runId: params.idempotencyKey, ...response }));
+  const context = setup();
+  await expect(context.notify()).resolves.toBe(false);
+  await expect(context.notify()).resolves.toBe(false);
+  expect(send).toHaveBeenCalledTimes(1);
+  clock.mockReturnValue(16 * 60 * 1_000);
+  await expect(context.notify()).resolves.toBe(true);
+  expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
+  noOtherTransport(context);
 });
 
-test('a completed failure permits a new attempt without a fallback run', async () => {
-  const run = jest.fn().mockResolvedValueOnce({ runId: 'run-failed' }).mockResolvedValueOnce({ runId: 'run-retry' });
-  const waitForRun = jest.fn().mockResolvedValueOnce({ status: 'error', error: 'delivery failed' })
-    .mockResolvedValueOnce({ status: 'ok' });
-  const { notify, system } = setup({ run, waitForRun });
-  await expect(notify()).resolves.toBe(false);
-  await expect(notify()).resolves.toBe(true);
-  expect(run).toHaveBeenCalledTimes(2);
-  expect(run.mock.calls[1][0].idempotencyKey).not.toBe(run.mock.calls[0][0].idempotencyKey);
-  noQueuedFallback(system);
+test('a success for another run is never accepted as this reminder', async () => {
+  const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+  send.mockResolvedValueOnce({ runId: 'unrelated-run', status: 'ok', result: { deliverySucceeded: true } });
+  const context = setup();
+  await expect(context.notify()).resolves.toBe(false);
+  await expect(context.notify()).resolves.toBe(false);
+  expect(send).toHaveBeenCalledTimes(1);
+  clock.mockReturnValue(16 * 60 * 1_000);
+  await expect(context.notify()).resolves.toBe(true);
+  expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
 });
 
-test('confirmed cancellation permits a later retry and cancels only the matching task', async () => {
-  const run = jest.fn().mockResolvedValueOnce({ runId: 'run-cancelled' }).mockResolvedValueOnce({ runId: 'run-retry' });
-  const waitForRun = jest.fn().mockResolvedValueOnce({ status: 'timeout' }).mockResolvedValueOnce({ status: 'ok' });
-  const cancel = jest.fn().mockResolvedValue({ found: true, cancelled: true });
-  const tasks = { runs: { bindSession: jest.fn().mockReturnValue({
-    list: () => [{ id: 'task-cancelled', runId: 'run-cancelled' }], cancel,
-  }) } };
-  const { notify, system } = setup({ run, waitForRun }, tasks);
-  await expect(notify()).resolves.toBe(false);
-  await expect(notify()).resolves.toBe(true);
-  expect(run).toHaveBeenCalledTimes(2);
-  expect(cancel).toHaveBeenCalledWith({ taskId: 'task-cancelled', cfg: expect.anything() });
-  noQueuedFallback(system);
+test.each([
+  { status: 'ok', result: { deliverySucceeded: false } },
+  { status: 'error' },
+])('a matching final failure permits a new reminder without cooldown: %j', async response => {
+  send.mockImplementationOnce(async params => ({ runId: params.idempotencyKey, ...response }));
+  const context = setup();
+  await expect(context.notify()).resolves.toBe(false);
+  await expect(context.notify()).resolves.toBe(true);
+  expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
+  noOtherTransport(context);
 });
 
-test('ambiguous acceptance reuses its idempotency key instead of creating a second run', async () => {
-  const run = jest.fn().mockRejectedValueOnce(new Error('acceptance response lost'))
-    .mockResolvedValueOnce({ runId: 'run-accepted' });
-  const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
-  const { notify, system } = setup({ run, waitForRun });
-  await expect(notify()).resolves.toBe(false);
-  await expect(notify()).resolves.toBe(true);
-  expect(run).toHaveBeenCalledTimes(2);
-  expect(run.mock.calls[1][0]).toEqual(run.mock.calls[0][0]);
-  noQueuedFallback(system);
-});
+test.each(['response lost', 'gateway unavailable', 'completion timeout'])(
+  '%s preserves pending state without resubmitting through any transport', async message => {
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    send.mockRejectedValueOnce(new Error(message));
+    const context = setup();
+    await expect(context.notify()).resolves.toBe(false);
+    clock.mockReturnValue(6 * 60 * 1_000);
+    await expect(context.notify()).resolves.toBe(false);
+    expect(send).toHaveBeenCalledTimes(1);
+    clock.mockReturnValue(16 * 60 * 1_000);
+    await expect(context.notify()).resolves.toBe(true);
+    expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
+    noOtherTransport(context);
+  }
+);
 
-test('route persistence failure cannot discard a confirmed completion', async () => {
+test('route persistence failure does not discard a confirmed channel send', async () => {
   resolveRoute.mockResolvedValue({ source: 'config', route: {
     sessionKey: 'agent:main:feishu:direct:ou_123', agentId: 'main', replyChannel: 'feishu', replyTo: 'user:ou_123',
   } });
   writeRoute.mockRejectedValue(new Error('local route store unavailable'));
-  const run = jest.fn().mockResolvedValue({ runId: 'run-delivered' });
-  const { notify } = setup({ run, waitForRun: jest.fn().mockResolvedValue({ status: 'ok' }) });
-  await expect(notify()).resolves.toBe(true);
-  await expect(notify()).resolves.toBe(false);
+  const context = setup();
+  await expect(context.notify()).resolves.toBe(true);
+  await expect(context.notify()).resolves.toBe(false);
   expect(writeRoute).toHaveBeenCalledTimes(1);
-  expect(run).toHaveBeenCalledTimes(1);
+  expect(send).toHaveBeenCalledWith({ sessionKey: 'agent:main:feishu:direct:ou_123',
+    message: 'AUTH_REQUIRED', deliver: true, lane: 'eigenflux-bg', idempotencyKey: expect.any(String) }, 480_000);
 });
 
 test.each(['missing API', 'missing record', 'succeeded', 'failed', 'query failure'])(
-  'an expired unknown outcome permits another reminder when task inspection has %s', async (taskState) => {
+  'an expired unknown result permits another reminder when task inspection has %s', async taskState => {
     const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
-    const run = jest.fn().mockResolvedValueOnce({ runId: 'run-expired' }).mockResolvedValueOnce({ runId: 'run-current' });
-    const waitForRun = jest.fn().mockRejectedValueOnce(new Error('completion response lost'))
-      .mockResolvedValueOnce({ status: 'pending' }).mockResolvedValueOnce({ status: 'ok' });
+    send.mockRejectedValueOnce(new Error('completion response lost'))
+      .mockImplementationOnce(async params => ({ runId: params.idempotencyKey, status: 'accepted' }));
     const list = jest.fn().mockImplementation(() => {
       if (taskState === 'query failure') throw new Error('task registry unavailable');
-      return taskState === 'missing record' ? [] : [{ id: 'old-task', runId: 'run-expired', status: taskState }];
+      return taskState === 'missing record' ? [] : [{
+        id: 'old-task', runId: send.mock.calls[0][0].idempotencyKey, status: taskState,
+      }];
     });
     const tasks = taskState === 'missing API' ? undefined : { runs: { bindSession: jest.fn().mockReturnValue({ list }) } };
-    const { notify, system, logs } = setup({ run, waitForRun }, tasks);
-
-    await expect(notify('old instruction')).resolves.toBe(false);
+    const context = setup(tasks);
+    await expect(context.notify('old instruction')).resolves.toBe(false);
     clock.mockReturnValue(16 * 60 * 1_000);
-    await expect(notify('current instruction')).resolves.toBe(false);
-    expect(run).toHaveBeenCalledTimes(2);
-    expect(run.mock.calls[1][0].message).toBe('current instruction');
-    expect(run.mock.calls[1][0].idempotencyKey).not.toBe(run.mock.calls[0][0].idempotencyKey);
-    expect(waitForRun).toHaveBeenNthCalledWith(2, { runId: 'run-current', timeoutMs: 480_000 });
-    expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining('outcome remains unknown and may arrive late'));
-
-    // Abandoning the unknown result is not a delivery and cannot start cooldown.
-    await expect(notify('current instruction')).resolves.toBe(true);
-    await expect(notify('current instruction')).resolves.toBe(false);
-    expect(run).toHaveBeenCalledTimes(2);
-    expect(waitForRun).toHaveBeenNthCalledWith(3, { runId: 'run-current', timeoutMs: 480_000 });
-    noQueuedFallback(system);
+    await expect(context.notify('current instruction')).resolves.toBe(false);
+    expect(send.mock.calls[1][0].message).toBe('current instruction');
+    expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
+    expect(context.logs.warn).toHaveBeenCalledWith(expect.stringContaining('outcome remains unknown and may arrive late'));
+    await expect(context.notify('current instruction')).resolves.toBe(false);
+    expect(send).toHaveBeenCalledTimes(2);
+    clock.mockReturnValue(32 * 60 * 1_000);
+    await expect(context.notify('current instruction')).resolves.toBe(true);
+    expect(send.mock.calls[2][0].idempotencyKey).not.toBe(send.mock.calls[1][0].idempotencyKey);
+    await expect(context.notify()).resolves.toBe(false);
+    noOtherTransport(context);
   }
 );
 
-test.each(['queued', 'running'])('a known %s run is not replaced after the retry deadline', async (status) => {
+test.each(['queued', 'running'])('a known %s run retains its key after the retry deadline', async status => {
   const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
-  const run = jest.fn().mockResolvedValueOnce({ runId: 'run-active' }).mockResolvedValueOnce({ runId: 'run-retry' });
-  const waitForRun = jest.fn().mockRejectedValueOnce(new Error('host unavailable'))
-    .mockRejectedValueOnce(new Error('host still unavailable')).mockResolvedValueOnce({ status: 'ok' });
-  const task = { id: 'active-task', runId: 'run-active', status };
-  const list = jest.fn().mockReturnValue([task]);
-  const { notify, system } = setup({ run, waitForRun }, { runs: { bindSession: jest.fn().mockReturnValue({ list }) } });
-
-  await expect(notify()).resolves.toBe(false);
+  send.mockRejectedValueOnce(new Error('response lost'));
+  const task = { id: 'active-task', runId: '', status };
+  const list = jest.fn().mockImplementation(() => [{ ...task, runId: send.mock.calls[0][0].idempotencyKey }]);
+  const context = setup({ runs: { bindSession: jest.fn().mockReturnValue({ list }) } });
+  await expect(context.notify()).resolves.toBe(false);
   clock.mockReturnValue(16 * 60 * 1_000);
-  await expect(notify()).resolves.toBe(false);
-  expect(run).toHaveBeenCalledTimes(1);
-  expect(waitForRun).toHaveBeenNthCalledWith(2, { runId: 'run-active', timeoutMs: 480_000 });
-
+  await expect(context.notify()).resolves.toBe(false);
+  expect(send).toHaveBeenCalledTimes(1);
   task.status = 'failed';
-  await expect(notify()).resolves.toBe(true);
-  expect(run).toHaveBeenCalledTimes(2);
-  expect(waitForRun).toHaveBeenNthCalledWith(3, { runId: 'run-retry', timeoutMs: 480_000 });
-  noQueuedFallback(system);
-});
-
-test('an active submission with a lost acceptance response keeps its idempotency key after the deadline', async () => {
-  const clock = jest.spyOn(Date, 'now').mockReturnValue(1_000);
-  const run = jest.fn().mockRejectedValueOnce(new Error('acceptance response lost'))
-    .mockImplementationOnce(async (params) => ({ runId: params.idempotencyKey }));
-  const waitForRun = jest.fn().mockResolvedValue({ status: 'ok' });
-  const list = jest.fn().mockImplementation(() => [{
-    id: 'accepted-task', runId: run.mock.calls[0][0].idempotencyKey, status: 'running',
-  }]);
-  const { notify, system } = setup({ run, waitForRun }, { runs: { bindSession: jest.fn().mockReturnValue({ list }) } });
-
-  await expect(notify()).resolves.toBe(false);
-  clock.mockReturnValue(16 * 60 * 1_000);
-  await expect(notify()).resolves.toBe(true);
-  expect(run).toHaveBeenCalledTimes(2);
-  expect(run.mock.calls[1][0]).toEqual(run.mock.calls[0][0]);
-  noQueuedFallback(system);
+  await expect(context.notify()).resolves.toBe(true);
+  expect(send.mock.calls[1][0].idempotencyKey).not.toBe(send.mock.calls[0][0].idempotencyKey);
+  noOtherTransport(context);
 });

@@ -20,6 +20,11 @@ jest.mock('openclaw/plugin-sdk/plugin-entry', () => ({
   buildJsonPluginConfigSchema: (schema: any) => schema,
 }));
 
+const sendAuthReminderMock = jest.fn();
+jest.mock('./auth-reminder-transport', () => ({
+  sendAuthReminder: (...args: any[]) => sendAuthReminderMock(...args),
+}));
+
 // Mock discoverServers and resolveEigenfluxHome from config
 const discoverServersMock = jest.fn();
 const resolveEigenfluxHomeMock = jest.fn();
@@ -103,6 +108,9 @@ describe('register unit', () => {
   beforeEach(() => {
     jest.resetModules();
     jest.clearAllMocks();
+    sendAuthReminderMock.mockReset().mockImplementation(async params => ({
+      runId: params.idempotencyKey, status: 'ok', result: { deliverySucceeded: true },
+    }));
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-openclaw-home-'));
     eigenfluxHome = path.join(homeDir, '.eigenflux');
     fs.mkdirSync(eigenfluxHome, { recursive: true });
@@ -156,7 +164,7 @@ describe('register unit', () => {
     }
   });
 
-  test('sends auth prompt through runtime.subagent when service starts without token', async () => {
+  test('sends auth prompt through the final-result transport when service starts without token', async () => {
     const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
     fs.mkdirSync(serverDir, { recursive: true });
     // No credentials.json, so auth is required
@@ -196,14 +204,15 @@ describe('register unit', () => {
 
     await services[0].start();
 
-    expect(subagentRun).toHaveBeenCalledWith(
+    expect(subagentRun).not.toHaveBeenCalled();
+    expect(sendAuthReminderMock).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionKey: 'main',
         message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]'),
         deliver: true,
-      })
+      }), 480_000
     );
-    const promptMessage = String(subagentRun.mock.calls[0]?.[0]?.message);
+    const promptMessage = String(sendAuthReminderMock.mock.calls[0]?.[0]?.message);
     expect(promptMessage).toContain('server=eigenflux');
     expect(promptMessage).toContain(`homedir=${eigenfluxHome}`);
     expect(promptMessage).toContain('first connection, load the installed ef-onboarding Skill');
@@ -326,6 +335,49 @@ describe('register unit', () => {
     } finally {
       await services[0].stop();
       deliver.mockRestore();
+    }
+  });
+
+  test('plan auth notices retry a failed channel send and cool down only after final delivery', async () => {
+    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
+      { name: 'alpha', endpoint: 'http://127.0.0.1:18080', current: true },
+    ] });
+    pollingClientStartMock.mockResolvedValue(undefined);
+    const notice = JSON.stringify({ schema_version: 'eigenflux_auth_required.v1',
+      code: 'REFRESH_INVALID', owner_action: 'Recover my current EigenFlux account' });
+    execEigenfluxMock.mockImplementation(async (_bin: string, args: string[]) =>
+      args.includes('heartbeat') ? { kind: 'auth_required', stderr: notice } : { kind: 'success', data: undefined });
+    sendAuthReminderMock.mockImplementationOnce(async params => ({
+      runId: params.idempotencyKey, status: 'ok', result: { deliverySucceeded: false },
+    }));
+    const subagentRun = jest.fn();
+    const lifecycleWait = jest.fn().mockResolvedValue({ status: 'ok' });
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run: subagentRun, waitForRun: lifecycleWait } }, logger: createLogger(),
+      registerService: (service: any) => services.push(service), registerCommand: jest.fn(),
+      registerHook: jest.fn(), on: jest.fn(),
+    } as any);
+    try {
+      await services[0].start();
+      const actual = jest.requireActual('./polling-client') as typeof import('./polling-client');
+      const poller = new actual.EigenFluxPollingClient(capturedPollingConfig);
+      execEigenfluxMock.mockClear();
+      for (let cycle = 0; cycle < 3; cycle++) {
+        await expect(poller.pollOnce()).resolves.toMatchObject({ kind: 'auth_required' });
+      }
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(3);
+      expect(execEigenfluxMock.mock.calls.every(([, args]) => args.includes('heartbeat'))).toBe(true);
+      expect(sendAuthReminderMock).toHaveBeenCalledTimes(2);
+      expect(sendAuthReminderMock.mock.calls[0][0].message).toContain(notice);
+      expect(sendAuthReminderMock.mock.calls[1][0].idempotencyKey)
+        .not.toBe(sendAuthReminderMock.mock.calls[0][0].idempotencyKey);
+      expect(subagentRun).not.toHaveBeenCalled();
+      expect(lifecycleWait).not.toHaveBeenCalled();
+    } finally {
+      await services[0].stop();
     }
   });
 
@@ -644,13 +696,14 @@ describe('register unit', () => {
 
     await services[0].start();
 
-    expect(subagentRun).toHaveBeenCalledWith({
+    expect(subagentRun).not.toHaveBeenCalled();
+    expect(sendAuthReminderMock).toHaveBeenCalledWith({
       sessionKey: 'main',
       message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]'),
       deliver: true,
       idempotencyKey: expect.any(String),
       lane: 'eigenflux-bg',
-    });
+    }, 480_000);
 
     await services[0].stop();
   });
