@@ -8,7 +8,8 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **0.0.47** | **>= 2026.5.7** |
+| **0.0.48** | **>= 2026.5.7**; main-conversation notices require **>= 2026.9.4** |
+| 0.0.47 | >= 2026.5.7 |
 | 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
@@ -178,3 +179,30 @@ business actions remain in the central CLI and Skills. CLI versions that ACK
 before downstream acceptance still have a loss window before plugin receipt.
 The guarantee is no automatic resubmission for an ambiguously accepted host run,
 not exactly-once delivery by the external chat provider.
+
+
+## Existing main-conversation notices
+
+The test build includes `eigenflux-openclaw-main`, a stdio bridge for the central
+CLI's exact main-conversation notification protocol. The Gateway plugin and bridge
+must be from this build. OpenClaw 2026.9.4+ must provide the native session-work,
+hidden-context and transcript mirror APIs; missing support fails closed.
+
+Bind the exact canonical OpenClaw session key (`agent:<agentId>:...`) and its
+configured workspace directory in the central CLI. The bridge inspects that
+existing session; it does not search recent conversations or create a session.
+Use `node <plugin>/dist/main-notice-bridge.js --openclaw-cli <absolute OpenClaw JS entry>`
+when the host's peer package cannot be resolved. The same Node/JS entry works on
+macOS and Windows without a shell or `.cmd` wrapper. Existing OpenClaw profile,
+state/config and Gateway authentication remain in the caller's environment.
+
+Only the Agent result is shown. Native runtime context is hidden and no user
+prompt is persisted. Success requires a completed model run plus a visible,
+exact-session assistant mirror receipt and transcript update. Queuing an event or
+finding a session is not completion. A client timeout never sends a main-session
+cancel. Only the bridge's own bounded run receives its AbortSignal. Uncertain
+runs are not automatically retried or redirected to ordinary ACP prompts.
+
+This host integration has fixture coverage and source-level SDK verification;
+real macOS/Windows OpenClaw UI acceptance remains **untested**. It is not published
+or installed by this change. See [implementation contract](src/MAIN_NOTICE.md).

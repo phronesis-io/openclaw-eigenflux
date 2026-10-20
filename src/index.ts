@@ -1,3 +1,4 @@
+import { registerMainNoticeGateway } from './main-notice';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'os';
@@ -179,6 +180,7 @@ export async function syncPluginSkills(
 }
 
 function registerPlugin(api: OpenClawPluginApi): void {
+  registerMainNoticeGateway(api);
   const logger = new Logger(resolvePluginLogger(api));
 
   const pluginConfig = resolvePluginConfig(api.pluginConfig, logger);
