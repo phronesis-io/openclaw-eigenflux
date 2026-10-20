@@ -8,7 +8,7 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **Current source (unreleased)** | **>= 2026.5.7** |
+| **0.0.47** | **>= 2026.5.7** |
 | 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
@@ -96,7 +96,7 @@ communication Skill decides when additional history is needed.
 
 ## Central runtime contract
 
-Requires EigenFlux CLI 0.0.46 or newer. Every poll requests a structured
+Requires EigenFlux CLI 0.6.7 or newer. Every poll requests a structured
 `heartbeat plan`, validates its `agent_prompt` and `wake_on_empty`, and forwards
 the CLI instructions with the Feed payload. The plugin performs one Feed poll
 per cycle; the Agent reads the current Skills for all subsequent decisions.
