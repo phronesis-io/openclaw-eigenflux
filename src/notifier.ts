@@ -149,6 +149,8 @@ export type EigenFluxNotifierConfig = {
 };
 
 export type DeliverOptions = {
+  /** Authentication reminders require a completed host run, never an enqueue acknowledgement. */
+  requireCompletion?: boolean;
   /**
    * When set, deliver to a one-shot session derived from this prefix
    * (a random suffix is appended to prevent context accumulation).
@@ -199,11 +201,20 @@ type NotifyAttemptResult =
       terminal?: boolean;
     };
 
+type PendingConfirmedDelivery = {
+  message: string;
+  route: ResolvedNotificationRoute;
+  source: NotificationRouteSource;
+  idempotencyKey: string;
+  runId?: string;
+};
+
 export class EigenFluxNotifier {
   private readonly api: OpenClawPluginApi;
   private readonly logger: Logger;
   private readonly config: EigenFluxNotifierConfig;
   private readonly pendingCleanups: Promise<void>[] = [];
+  private pendingConfirmedDelivery?: PendingConfirmedDelivery;
 
   constructor(api: OpenClawPluginApi, logger: Logger, config: EigenFluxNotifierConfig) {
     this.api = api;
@@ -261,6 +272,7 @@ export class EigenFluxNotifier {
   }
 
   private async deliverCoordinated(message: string, options?: DeliverOptions): Promise<boolean> {
+    if (options?.requireCompletion) return this.deliverConfirmed(message);
     const targetKey = options?.targetSessionKey;
     const persistentKey = options?.persistentSessionKey;
     const silent = options?.silent === true;
@@ -371,6 +383,36 @@ export class EigenFluxNotifier {
 
     this.logger.error(`Failed to deliver notification: ${firstAttempt.errors.join(' | ')}`);
     return false;
+  }
+
+  /** Keep one observable run until its delivery outcome is known. */
+  private async deliverConfirmed(message: string): Promise<boolean> {
+    if (typeof this.runtime.subagent?.run !== 'function' ||
+      typeof this.runtime.subagent.waitForRun !== 'function') {
+      this.logger.warn('Authentication reminder remains retryable: runtime.subagent run/waitForRun unavailable');
+      return false;
+    }
+    if (!this.pendingConfirmedDelivery) {
+      const { route, source } = await this.resolveRoute();
+      this.pendingConfirmedDelivery = { message, route, source, idempotencyKey: randomUUID() };
+    }
+    const pending = this.pendingConfirmedDelivery;
+    const result = await this.tryNotifyViaRuntimeSubagent(
+      pending.message, pending.route, false, BACKGROUND_LANE, pending
+    );
+    if (result.ok || !result.terminal) this.pendingConfirmedDelivery = undefined;
+    if (!result.ok) {
+      this.logger.warn(`Authentication reminder delivery unconfirmed: ${result.error}`);
+      return false;
+    }
+    try {
+      await this.rememberRouteIfChanged(pending.route, pending.source);
+    } catch (error) {
+      // Route persistence cannot turn a completed delivery into another reminder.
+      this.logger.warn(`Authentication reminder route persistence failed: ${formatError(error)}`);
+    }
+    this.logDispatch(result);
+    return true;
   }
 
   /**
@@ -592,7 +634,8 @@ export class EigenFluxNotifier {
     message: string,
     route: ResolvedNotificationRoute,
     silent = false,
-    lane = BACKGROUND_LANE
+    lane = BACKGROUND_LANE,
+    pending?: Pick<PendingConfirmedDelivery, 'idempotencyKey' | 'runId'>
   ): Promise<NotifyAttemptResult> {
     const runtimeSubagent = this.runtime.subagent;
 
@@ -601,7 +644,12 @@ export class EigenFluxNotifier {
         ok: false,
         mode: 'runtime.subagent',
         error: 'runtime.subagent.run is unavailable',
+        ...(pending ? { terminal: true } : {}),
       };
+    }
+    if (pending && typeof runtimeSubagent.waitForRun !== 'function') {
+      return { ok: false, mode: 'runtime.subagent', terminal: true,
+        error: 'Authentication reminder completion API is unavailable' };
     }
 
     try {
@@ -611,16 +659,27 @@ export class EigenFluxNotifier {
       this.logger.info(
         `Attempting runtime.subagent delivery: ${formatRouteForLog(route)}, deliver=${deliver}, lane=${lane}`
       );
-      const { runId } = await runtimeSubagent.run({
-        sessionKey: route.sessionKey,
-        message,
-        deliver,
-        idempotencyKey: randomUUID(),
-        lane,
-      });
+      let runId = pending?.runId;
+      if (!runId) {
+        const submitted = await runtimeSubagent.run({
+          sessionKey: route.sessionKey,
+          message,
+          deliver,
+          idempotencyKey: pending?.idempotencyKey ?? randomUUID(),
+          lane,
+        });
+        runId = submitted.runId;
+        if (pending) {
+          if (!runId) throw new Error('Authentication reminder acceptance missing runId');
+          pending.runId = runId;
+        }
+      }
 
       // run() only enqueues; wait long enough for the full agent loop (LLM +
       // reply + channel send) to complete so we can surface real errors.
+      if (pending && typeof runtimeSubagent.waitForRun !== 'function') {
+        throw new Error('Authentication reminder completion API is unavailable');
+      }
       if (typeof runtimeSubagent.waitForRun === 'function') {
         const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {
@@ -637,12 +696,16 @@ export class EigenFluxNotifier {
           return {
             ok: false,
             mode: 'runtime.subagent',
-            terminal: true,
+            terminal: pending ? !cancelled : true,
             error:
               (waited.error ??
                 `subagent completion wait timed out after ${Math.round(SUBAGENT_TOTAL_WAIT_TIMEOUT_MS / 1000)}s`) +
               (cancelled ? '; run cancelled' : '; cancellation unavailable or failed'),
           };
+        }
+        if (pending && waited.status !== 'ok') {
+          return { ok: false, mode: 'runtime.subagent', terminal: true,
+            error: 'Authentication reminder completion status is unknown' };
         }
       }
 
@@ -657,6 +720,7 @@ export class EigenFluxNotifier {
         ok: false,
         mode: 'runtime.subagent',
         error: formatError(error),
+        ...(pending ? { terminal: true } : {}),
       };
     }
   }

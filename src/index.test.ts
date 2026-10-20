@@ -181,7 +181,7 @@ describe('register unit', () => {
       config: {},
       pluginConfig: {},
       runtime: {
-        subagent: { run: subagentRun },
+        subagent: { run: subagentRun, waitForRun: jest.fn().mockResolvedValue({ status: 'ok' }) },
       },
       logger: createLogger(),
       registerService: (service: any) => services.push(service),
@@ -244,6 +244,7 @@ describe('register unit', () => {
         '--homedir', eigenfluxHome, '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
       ]);
       expect(deliver).toHaveBeenCalledTimes(1);
+      expect(deliver).toHaveBeenLastCalledWith(expect.any(String), { requireCompletion: true });
       // Failed delivery must not suppress the next source's attempt.
       await capturedPollOnAuthRequired!({ reason: 'auth_required' });
       expect(deliver).toHaveBeenCalledTimes(2);
@@ -627,6 +628,7 @@ describe('register unit', () => {
       runtime: {
         subagent: {
           run: subagentRun,
+          waitForRun: jest.fn().mockResolvedValue({ status: 'ok' }),
         },
       },
       logger: createLogger(),

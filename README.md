@@ -58,6 +58,12 @@ Authentication failures from heartbeat plans, Feed, and PM use the same owner
 notification route with the selected Agent Home and server. Successful
 notifications are coalesced for five minutes; failed deliveries remain
 retryable, and a successful authenticated Feed poll resets the cooldown.
+Authentication reminders require a completed `runtime.subagent.waitForRun`
+result. The supported minimum OpenClaw version is `2026.5.2`, whose gateway
+runtime provides both run and wait APIs. Hosts missing the capability leave the
+reminder failed and retryable; queue-only heartbeat transports cannot confirm
+delivery. If a run's outcome is unavailable, later attempts resume that run
+instead of submitting a second reminder.
 The warning states that checks have stopped and delegates the recovery action
 to the current CLI-synchronized Skill. The plugin does not provision accounts.
 When the heartbeat plan requires authentication, that cycle skips Feed polling

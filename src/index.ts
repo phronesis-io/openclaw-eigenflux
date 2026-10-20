@@ -578,7 +578,8 @@ function createServerRuntime(
 
   const notifyAuthRequired = async (_authEvent: AuthRequiredEvent): Promise<void> => {
     await authNotificationGate.deliver(() => notifier.deliver(
-      buildAuthRequiredPromptTemplate({ context: getPromptContext() })
+      buildAuthRequiredPromptTemplate({ context: getPromptContext() }),
+      { requireCompletion: true }
     ));
   };
 
