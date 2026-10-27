@@ -1,4 +1,4 @@
-import { FeedPushScheduler } from './feed-push-scheduler';
+import { FeedPushScheduler, UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
 import { Logger } from './logger';
 
 function createLogger(): Logger {
@@ -148,4 +148,16 @@ describe('FeedPushScheduler', () => {
     expect(scheduler.hasPending()).toBe(false);
   });
 
+  test('an unconfirmed run outcome releases capacity without a retry', async () => {
+    const pushNow = jest.fn().mockRejectedValue(new UnconfirmedFeedDeliveryError('run may still be live'));
+    const {scheduler} = createScheduler({pushNow});
+    scheduler.schedule('unconfirmed');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scheduler.hasPending()).toBe(false);
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(pushNow).toHaveBeenCalledTimes(1);
+    scheduler.schedule('next cycle');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(pushNow).toHaveBeenLastCalledWith('next cycle');
+  });
 });

@@ -9,8 +9,22 @@ export type FeedPushSchedulerDeps = {
   budgetMs?: number;
 };
 
-// One retained payload owns capacity until delivery succeeds or both attempts
-// fail. Polling observes hasPending(), including while pushNow is in flight.
+/**
+ * Rejection from pushNow when the host run outcome could not be confirmed
+ * terminal. The run may still deliver, so the payload is dropped without retry.
+ */
+export class UnconfirmedFeedDeliveryError extends Error {
+  override name = 'UnconfirmedFeedDeliveryError';
+}
+
+/**
+ * Busy-aware Feed delivery with a single retained payload. A busy target defers
+ * delivery, rechecking every `recheckMs`, and delivers anyway once `budgetMs`
+ * has elapsed. While a payload is held or in flight, hasPending() is true and
+ * Feed polling is gated off; a second payload is not accepted. A failed
+ * delivery whose run is confirmed terminal is retried once, then dropped; an
+ * unconfirmed outcome (UnconfirmedFeedDeliveryError) is dropped without retry.
+ */
 export class FeedPushScheduler {
   private pendingPrompt: string | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -69,6 +83,11 @@ export class FeedPushScheduler {
         await this.deps.pushNow(this.pendingPrompt);
         this.pendingPrompt = null;
       } catch (error) {
+        if (error instanceof UnconfirmedFeedDeliveryError) {
+          this.deps.logger.error(`Dropping Feed payload without retry for server=${this.deps.serverName}: ${error.message}`);
+          this.pendingPrompt = null;
+          return;
+        }
         this.deps.logger.error(`Feed delivery attempt ${this.attempts}/2 failed for server=${this.deps.serverName}: ${String(error)}`);
         if (this.attempts >= 2) {
           this.deps.logger.error(`Dropping Feed payload after two failed deliveries for server=${this.deps.serverName}`);

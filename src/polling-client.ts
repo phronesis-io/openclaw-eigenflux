@@ -1,16 +1,19 @@
-import { supportsHeartbeatOrigin } from './cli-version';
 /**
  * Polling client for EigenFlux feed updates.
  * Uses the eigenflux CLI (`eigenflux feed poll`) instead of direct HTTP calls.
  */
 
 import { execEigenflux } from './cli-executor';
+import { supportsHeartbeatOrigin } from './cli-version';
+import { getInstalledCliVersion } from './config';
 import { Logger } from './logger';
 
 export const POLL_INTERVAL_CONFIG_KEY = 'feed_poll_interval';
 export const DEFAULT_POLL_INTERVAL_SEC = 600;
 export const MIN_POLL_INTERVAL_SEC = 10;
 export const MAX_POLL_INTERVAL_SEC = 24 * 60 * 60;
+/** Consecutive plan_unavailable skips before the paused-Feed warning. */
+export const PLAN_UNAVAILABLE_WARN_THRESHOLD = 3;
 
 /**
  * Reads the feed poll interval (in seconds) from the eigenflux CLI config
@@ -163,8 +166,7 @@ export class EigenFluxPollingClient {
   private config: PollingClientConfig;
   private timeoutId: NodeJS.Timeout | null = null;
   private isRunning = false;
-  private originSupported = false;
-  private versionChecked = false;
+  private planUnavailableSkips = 0;
   private activePoll: Promise<PollResult> | null = null;
 
   constructor(config: PollingClientConfig) {
@@ -178,14 +180,6 @@ export class EigenFluxPollingClient {
     }
 
     this.isRunning = true;
-    if (!this.versionChecked) {
-      this.versionChecked = true;
-      try {
-        const version = await execEigenflux<{cli_version?: string}>(this.config.eigenfluxBin, ['version']);
-        this.originSupported = version.kind === 'success' && supportsHeartbeatOrigin(version.data?.cli_version);
-      } catch { this.originSupported = false; }
-    }
-    if (!this.isRunning) return;
     this.config.logger.info(
       `Starting polling client for server=${this.config.serverName}`
     );
@@ -260,6 +254,7 @@ export class EigenFluxPollingClient {
       const scheduled = options.origin !== 'owner';
       const skipped = async (reason: 'capacity' | 'plan_unavailable'): Promise<PollResult> => {
         this.config.logger.info(`Skipping Feed poll (${reason}) for server=${this.config.serverName}`);
+        if (reason === 'plan_unavailable') this.recordPlanUnavailable();
         try { await this.config.onPollSkipped?.(); } catch (error) { this.config.logger.warn(String(error)); }
         return {kind: 'skipped', reason};
       };
@@ -275,6 +270,7 @@ export class EigenFluxPollingClient {
           try {
             const start = await this.config.onHeartbeatStart();
             if (scheduled && start && typeof start === 'object' && start.kind === 'plan_unavailable') return skipped('plan_unavailable');
+            if (start === true || start === undefined) this.recordPlanAvailable();
             authenticationRequired = start === false;
             if (start && typeof start === 'object' && start.kind === 'auth_required') {
               authenticationRequired = true;
@@ -300,10 +296,11 @@ export class EigenFluxPollingClient {
 
         this.config.logger.info(`Polling feed via CLI for server=${this.config.serverName}`);
 
+        const originSupported = await this.resolveOriginSupport();
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
           ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json',
-            ...(this.originSupported ? ['--origin', scheduled ? 'heartbeat' : 'owner'] : [])],
+            ...(originSupported ? ['--origin', scheduled ? 'heartbeat' : 'owner'] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
 
@@ -371,5 +368,33 @@ export class EigenFluxPollingClient {
       this.activePoll = null;
     });
     return this.activePoll;
+  }
+
+  /** Read the installed CLI version for this cycle; an unreadable version omits --origin. */
+  private async resolveOriginSupport(): Promise<boolean> {
+    try {
+      return supportsHeartbeatOrigin(await getInstalledCliVersion(this.config.eigenfluxBin, this.config.logger));
+    } catch {
+      return false;
+    }
+  }
+
+  private recordPlanUnavailable(): void {
+    this.planUnavailableSkips += 1;
+    if (this.planUnavailableSkips === PLAN_UNAVAILABLE_WARN_THRESHOLD) {
+      this.config.logger.warn(
+        `Feed polling is paused for server=${this.config.serverName} because the EigenFlux CLI heartbeat plan is unavailable ` +
+        `(${PLAN_UNAVAILABLE_WARN_THRESHOLD} consecutive cycles); update the EigenFlux CLI to restore Feed delivery`
+      );
+    }
+  }
+
+  private recordPlanAvailable(): void {
+    if (this.planUnavailableSkips >= PLAN_UNAVAILABLE_WARN_THRESHOLD) {
+      this.config.logger.info(
+        `Feed polling resumed for server=${this.config.serverName}: EigenFlux CLI heartbeat plan is available again`
+      );
+    }
+    this.planUnavailableSkips = 0;
   }
 }

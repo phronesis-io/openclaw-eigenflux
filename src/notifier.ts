@@ -14,6 +14,7 @@ import {
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 import { globalDeliveryCoordinator } from './delivery-coordinator';
 import { sendAuthReminder } from './auth-reminder-transport';
+import { UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
 
 /**
  * Typed subset of the OpenClaw runtime API used by the notifier.
@@ -129,6 +130,10 @@ const SUBAGENT_QUEUE_TIMEOUT_MS = 300_000;
 // queue + execution budget without relying on the ephemeral task registry.
 const SUBAGENT_TOTAL_WAIT_TIMEOUT_MS =
   SUBAGENT_QUEUE_TIMEOUT_MS + SUBAGENT_WAIT_TIMEOUT_MS;
+// A Feed run that cannot be cancelled is observed for at most this many full
+// waits, separated by a pause, before its delivery capacity is released.
+const FEED_OBSERVATION_MAX_ROUNDS = 3;
+const FEED_OBSERVATION_PAUSE_MS = 30_000;
 // Host run results are ephemeral. Bound unknown outcomes so a lost completion
 // cannot permanently suppress later authentication reminders.
 const AUTH_REMINDER_RETRY_AFTER_MS = 15 * 60 * 1000;
@@ -203,6 +208,8 @@ type NotifyAttemptResult =
       error: string;
       /** Stop the transport chain. Retrying could duplicate a timed-out run. */
       terminal?: boolean;
+      /** The submitted run was never confirmed terminal and may still deliver. */
+      unconfirmed?: boolean;
     };
 
 type PendingConfirmedDelivery = {
@@ -339,6 +346,7 @@ export class EigenFluxNotifier {
         this.enqueueCleanup(sessionKey);
       }
 
+      throwIfUnconfirmed(result.result);
       return result.result.ok;
     }
 
@@ -358,6 +366,7 @@ export class EigenFluxNotifier {
       return true;
     }
 
+    throwIfUnconfirmed(firstAttempt.result);
     if (firstAttempt.result.terminal) return false;
 
     // If every transport failed with a remembered route, it may be stale.
@@ -726,15 +735,17 @@ export class EigenFluxNotifier {
 
       // Ordinary notifications retain the host's agent lifecycle wait.
       if (typeof runtimeSubagent.waitForRun === 'function') {
-        const waited = lane === 'subagent'
-          ? await this.waitForFeedRun(route.sessionKey, runId)
-          : await this.waitForRunFromExecutionStart(route.sessionKey, runId);
+        const waited: { status: 'ok' | 'error' | 'timeout'; error?: string; unconfirmed?: boolean } =
+          lane === 'subagent'
+            ? await this.waitForFeedRun(route.sessionKey, runId)
+            : await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {
           return {
             ok: false,
             mode: 'runtime.subagent',
             error: `subagent run error${waited.error ? `: ${waited.error}` : ''}`,
             terminal: lane === 'subagent',
+            ...(waited.unconfirmed ? { unconfirmed: true } : {}),
           };
         }
         if (waited.status === 'timeout') {
@@ -786,9 +797,13 @@ export class EigenFluxNotifier {
   }
 
   // A Feed retry is safe only after a terminal run or confirmed cancellation.
-  // If an older host cannot cancel, continue observing this same run and retain
-  // its delivery capacity; a timeout alone cannot authorize another submission.
-  private async waitForFeedRun(sessionKey: string, runId: string): Promise<{status: 'ok' | 'error'; error?: string}> {
+  // If the host cannot cancel, observe the same run for a bounded number of
+  // rounds, then release capacity with an unconfirmed outcome that forbids
+  // resubmission; a timeout alone cannot authorize another submission.
+  private async waitForFeedRun(
+    sessionKey: string,
+    runId: string
+  ): Promise<{status: 'ok' | 'error'; error?: string; unconfirmed?: boolean}> {
     const signal = this.feedObservation.signal;
     let stop!: () => void;
     let timer: NodeJS.Timeout | undefined;
@@ -797,7 +812,7 @@ export class EigenFluxNotifier {
       signal.addEventListener('abort', stop, {once: true});
     });
     try {
-      while (!signal.aborted) {
+      for (let round = 1; round <= FEED_OBSERVATION_MAX_ROUNDS && !signal.aborted; round++) {
         try {
           const result = await Promise.race([this.waitForRunFromExecutionStart(sessionKey, runId), stopped]);
           if (result.status !== 'timeout') return {status: result.status, error: result.error};
@@ -808,9 +823,15 @@ export class EigenFluxNotifier {
           if (signal.aborted) break;
           this.logger.warn(`Feed completion unavailable for run_id=${runId}: ${formatError(error)}`);
         }
+        if (round === FEED_OBSERVATION_MAX_ROUNDS) {
+          const error = `Feed run outcome unconfirmed after ${FEED_OBSERVATION_MAX_ROUNDS} observation rounds and ` +
+            `cancellation was unavailable; releasing delivery capacity without resubmitting run_id=${runId}`;
+          this.logger.error(error);
+          return { status: 'error', error, unconfirmed: true };
+        }
         try {
           await Promise.race([new Promise<void>(resolve => {
-            timer = setTimeout(resolve, 30_000);
+            timer = setTimeout(resolve, FEED_OBSERVATION_PAUSE_MS);
             timer.unref?.();
           }), stopped]);
         } catch { break; }
@@ -1187,6 +1208,10 @@ function formatCommandFailure(result: {
     result.stdout?.trim() ||
     `command exited with ${result.code ?? 'unknown'}`
   );
+}
+
+function throwIfUnconfirmed(result: NotifyAttemptResult): void {
+  if (!result.ok && result.unconfirmed) throw new UnconfirmedFeedDeliveryError(result.error);
 }
 
 function formatError(error: unknown): string {

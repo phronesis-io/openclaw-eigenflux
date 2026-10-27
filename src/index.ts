@@ -37,7 +37,6 @@ import {
 import { findSessionRouteForBinding } from './notification-route-resolver';
 import {
   buildAuthRequiredPromptTemplate,
-  buildFeedPayloadPromptTemplate,
   buildHeartbeatExecutionPromptTemplate,
   buildNotInstalledPromptTemplate,
   INSTALL_ENTRY_URL,

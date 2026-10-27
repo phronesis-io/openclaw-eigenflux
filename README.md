@@ -183,12 +183,24 @@ not exactly-once delivery by the external chat provider.
 
 Scheduled Feed pulls require a current heartbeat plan and available delivery
 capacity. A held or in-flight payload prevents another pull; settings reporting,
-feedback flushes and profile maintenance continue. Failed delivery retains the
-same prompt for one retry, including a timed-out Agent run. The default,
+feedback flushes and profile maintenance continue. A delivery whose Agent run
+failed or was cancelled retains the same prompt for one retry. The default,
 `system-event`, and `oneshot` delivery routes remain selectable.
 
-The plugin reads the installed CLI version once at startup. CLI 0.7.0 and newer
-receive `--origin heartbeat` for scheduled pulls and `--origin owner` for manual
-checks. Existing poll interval configuration remains authoritative.
+When the heartbeat plan is unavailable for three consecutive scheduled cycles,
+the plugin logs one warning that Feed polling is paused and that the EigenFlux
+CLI should be updated, and logs once more when the plan becomes available again.
 
-Feed delivery retains capacity until the host confirms completion or cancellation. If a timeout cannot cancel the existing run, the adapter observes that same run without resubmitting it. An owner check waits for an overlapping poll to finish and then requests its own Feed.
+The plugin reads the installed CLI version before each Feed pull. CLI 0.7.0 and
+newer receive `--origin heartbeat` for scheduled pulls and `--origin owner` for
+manual checks; an unreadable version omits `--origin`. A CLI upgrade or
+downgrade takes effect on the next cycle. Existing poll interval configuration
+remains authoritative.
+
+Feed delivery retains capacity until the host confirms completion or
+cancellation. If a timeout cannot cancel the existing run, the adapter keeps
+observing that same run for at most three waits of up to 480 s each, separated
+by 30 s pauses. It then logs an error with the run ID, releases capacity, and
+drops the payload without resubmitting it, because the run may still deliver.
+The next cycle polls again. An owner check waits for an overlapping poll to
+finish and then requests its own Feed.

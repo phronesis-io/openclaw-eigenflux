@@ -1115,4 +1115,40 @@ describe('register unit', () => {
       expect(capturedPollingConfig.shouldPoll()).toBe(true);
     } finally {jest.useRealTimers();if(complete)complete(true);await services[0].stop();deliver.mockRestore();}
   });
+
+  test('an unconfirmed Feed run releases capacity without resubmission and the next cycle polls again', async () => {
+    discoverServersMock.mockResolvedValue({kind:'ok',servers:[{name:'eigenflux',endpoint:'http://127.0.0.1:18080',current:true}]});
+    execEigenfluxMock.mockImplementation(async (_bin,args)=>({kind:'success',data:args.includes('heartbeat')
+      ? {schema_version:'eigenflux_heartbeat_plan.v1',agent_prompt:'CURRENT PLAN',wake_on_empty:true}
+      : args.includes('poll') ? {items:[],notifications:[],has_more:false} : undefined}));
+    pollingClientStartMock.mockResolvedValue(undefined);
+    const {EigenFluxNotifier}=await import('./notifier');
+    const {UnconfirmedFeedDeliveryError}=await import('./feed-push-scheduler');
+    const deliver=jest.spyOn(EigenFluxNotifier.prototype,'deliver')
+      .mockRejectedValueOnce(new UnconfirmedFeedDeliveryError('run_id=feed-stuck outcome unconfirmed'))
+      .mockResolvedValue(true);
+    const {default:plugin}=await import('./index');const services:any[]=[];
+    plugin.register({registrationMode:'full',config:{},pluginConfig:{},runtime:{},logger:createLogger(),
+      registerService:(service:any)=>services.push(service),registerCommand:jest.fn()} as any);
+    try {
+      await services[0].start();await capturedPollingConfig.onHeartbeatStart();
+      jest.useFakeTimers();
+      await capturedPollingConfig.onFeedPolled({code:0,msg:'success',data:{items:[{item_id:'stuck'}],notifications:[],has_more:false}});
+      await jest.advanceTimersByTimeAsync(0);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(capturedPollingConfig.shouldPoll()).toBe(true);
+      await jest.advanceTimersByTimeAsync(300_000);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      jest.useRealTimers();
+
+      const actual=jest.requireActual('./polling-client') as typeof import('./polling-client');
+      const poller=new actual.EigenFluxPollingClient(capturedPollingConfig);
+      execEigenfluxMock.mockClear();
+      expect((await poller.pollOnce()).kind).toBe('success');
+      expect(execEigenfluxMock.mock.calls.some(call=>call[1].includes('poll'))).toBe(true);
+      await new Promise(resolve=>setImmediate(resolve));
+      expect(deliver).toHaveBeenCalledTimes(2);
+      expect(deliver.mock.calls[1][0]).not.toContain('stuck');
+    } finally {jest.useRealTimers();await services[0].stop();deliver.mockRestore();}
+  });
 });
