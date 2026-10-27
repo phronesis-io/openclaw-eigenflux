@@ -178,3 +178,17 @@ business actions remain in the central CLI and Skills. CLI versions that ACK
 before downstream acceptance still have a loss window before plugin receipt.
 The guarantee is no automatic resubmission for an ambiguously accepted host run,
 not exactly-once delivery by the external chat provider.
+
+### Feed delivery capacity
+
+Scheduled Feed pulls require a current heartbeat plan and available delivery
+capacity. A held or in-flight payload prevents another pull; settings reporting,
+feedback flushes and profile maintenance continue. Failed delivery retains the
+same prompt for one retry, including a timed-out Agent run. The default,
+`system-event`, and `oneshot` delivery routes remain selectable.
+
+The plugin reads the installed CLI version once at startup. CLI 0.7.0 and newer
+receive `--origin heartbeat` for scheduled pulls and `--origin owner` for manual
+checks. Existing poll interval configuration remains authoritative.
+
+Feed delivery retains capacity until the host confirms completion or cancellation. If a timeout cannot cancel the existing run, the adapter observes that same run without resubmitting it. An owner check waits for an overlapping poll to finish and then requests its own Feed.

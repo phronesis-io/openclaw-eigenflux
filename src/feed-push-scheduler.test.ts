@@ -68,7 +68,7 @@ describe('FeedPushScheduler', () => {
     expect(pushNow).toHaveBeenCalledWith('[FEED] batch-1');
   });
 
-  test('newer poll supersedes the held payload — only the latest batch is pushed', async () => {
+  test('retains the first payload while capacity is occupied', async () => {
     const isBusy = jest
       .fn()
       .mockResolvedValueOnce(true)
@@ -81,7 +81,7 @@ describe('FeedPushScheduler', () => {
 
     await jest.advanceTimersByTimeAsync(30_000); // idle now
     expect(pushNow).toHaveBeenCalledTimes(1);
-    expect(pushNow).toHaveBeenCalledWith('[FEED] batch-2');
+    expect(pushNow).toHaveBeenCalledWith('[FEED] batch-1');
   });
 
   test('budget exhausted while busy → pushes anyway (never strands)', async () => {
@@ -123,4 +123,29 @@ describe('FeedPushScheduler', () => {
     await jest.advanceTimersByTimeAsync(600_000);
     expect(pushNow).not.toHaveBeenCalled();
   });
+  test('failed delivery retains capacity and retries only once', async () => {
+    const pushNow = jest.fn().mockRejectedValue(new Error('transport failed'));
+    const {scheduler} = createScheduler({pushNow});
+    scheduler.schedule('retained');
+    expect(scheduler.hasPending()).toBe(true);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scheduler.hasPending()).toBe(true);
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(pushNow).toHaveBeenCalledTimes(2);
+    expect(scheduler.hasPending()).toBe(false);
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(pushNow).toHaveBeenCalledTimes(2);
+  });
+  test('in-flight delivery holds capacity until success', async () => {
+    let complete!: () => void;
+    const pushNow = jest.fn(() => new Promise<void>(resolve => {complete=resolve;}));
+    const {scheduler}=createScheduler({pushNow});
+    scheduler.schedule('one');
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scheduler.hasPending()).toBe(true);
+    complete();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scheduler.hasPending()).toBe(false);
+  });
+
 });

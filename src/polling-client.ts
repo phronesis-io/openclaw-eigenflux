@@ -1,3 +1,4 @@
+import { supportsHeartbeatOrigin } from './cli-version';
 /**
  * Polling client for EigenFlux feed updates.
  * Uses the eigenflux CLI (`eigenflux feed poll`) instead of direct HTTP calls.
@@ -105,6 +106,8 @@ export interface FeedResponse {
 }
 
 export interface PollingClientConfig {
+  shouldPoll?: () => boolean;
+  onPollSkipped?: () => Promise<void>;
   serverName: string;
   eigenfluxBin: string;
   /** Actual model observed for this runtime; absent until ownership is verified. */
@@ -119,7 +122,7 @@ export interface PollingClientConfig {
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
   /** False requires login; auth_unavailable stops this cycle without a login prompt. */
-  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error } | { kind: 'auth_required'; stderr?: string }>;
+  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error } | { kind: 'auth_required'; stderr?: string } | { kind: 'plan_unavailable' }>;
   /**
    * Optional hook invoked once per successful poll (heartbeat), regardless of
    * whether the feed contained any items/notifications. Used for side-channel
@@ -136,6 +139,7 @@ export interface AuthRequiredEvent {
 }
 
 export type PollResult =
+  | { kind: 'skipped'; reason: 'plan_unavailable' | 'capacity' }
   | {
       kind: 'success';
       payload: FeedResponse;
@@ -150,6 +154,7 @@ export type PollResult =
     };
 
 export interface PollOnceOptions {
+  origin?: 'heartbeat' | 'owner';
   notifyFeed?: boolean;
   notifyAuthRequired?: boolean;
 }
@@ -158,6 +163,8 @@ export class EigenFluxPollingClient {
   private config: PollingClientConfig;
   private timeoutId: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private originSupported = false;
+  private versionChecked = false;
   private activePoll: Promise<PollResult> | null = null;
 
   constructor(config: PollingClientConfig) {
@@ -171,6 +178,14 @@ export class EigenFluxPollingClient {
     }
 
     this.isRunning = true;
+    if (!this.versionChecked) {
+      this.versionChecked = true;
+      try {
+        const version = await execEigenflux<{cli_version?: string}>(this.config.eigenfluxBin, ['version']);
+        this.originSupported = version.kind === 'success' && supportsHeartbeatOrigin(version.data?.cli_version);
+      } catch { this.originSupported = false; }
+    }
+    if (!this.isRunning) return;
     this.config.logger.info(
       `Starting polling client for server=${this.config.serverName}`
     );
@@ -232,22 +247,34 @@ export class EigenFluxPollingClient {
   }
 
   async pollOnce(options: PollOnceOptions = {}): Promise<PollResult> {
+    if (this.activePoll && options.origin === 'owner') {
+      await this.activePoll;
+      return this.pollOnce(options);
+    }
     if (this.activePoll) {
       this.config.logger.warn('Skipping feed poll because a previous poll is still in progress');
       return this.activePoll;
     }
 
     const run = async (): Promise<PollResult> => {
+      const scheduled = options.origin !== 'owner';
+      const skipped = async (reason: 'capacity' | 'plan_unavailable'): Promise<PollResult> => {
+        this.config.logger.info(`Skipping Feed poll (${reason}) for server=${this.config.serverName}`);
+        try { await this.config.onPollSkipped?.(); } catch (error) { this.config.logger.warn(String(error)); }
+        return {kind: 'skipped', reason};
+      };
       const notifyFeed = options.notifyFeed ?? true;
       const notifyAuthRequired = options.notifyAuthRequired ?? true;
 
       try {
+        if (scheduled && this.config.shouldPoll && !this.config.shouldPoll()) return skipped('capacity');
         if (this.config.onHeartbeatStart) {
           let authenticationRequired = false;
           let authenticationDetail: string | undefined;
           let authenticationError: Error | undefined;
           try {
             const start = await this.config.onHeartbeatStart();
+            if (scheduled && start && typeof start === 'object' && start.kind === 'plan_unavailable') return skipped('plan_unavailable');
             authenticationRequired = start === false;
             if (start && typeof start === 'object' && start.kind === 'auth_required') {
               authenticationRequired = true;
@@ -260,6 +287,7 @@ export class EigenFluxPollingClient {
             this.config.logger.warn(
               `onHeartbeatStart hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
             );
+            if (scheduled) return skipped('plan_unavailable');
           }
           if (authenticationError) return { kind: 'error', error: authenticationError };
           if (authenticationRequired) {
@@ -274,7 +302,8 @@ export class EigenFluxPollingClient {
 
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
-          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json'],
+          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json',
+            ...(this.originSupported ? ['--origin', scheduled ? 'heartbeat' : 'owner'] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
 

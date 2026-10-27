@@ -267,6 +267,10 @@ export class EigenFluxNotifier {
     return result.status === 'ok';
   }
 
+  private readonly feedObservation = new AbortController();
+
+  stopFeedObservation(): void { this.feedObservation.abort(); }
+
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
     const serializationKey =
       options?.persistentSessionKey ?? options?.targetSessionKey ?? this.config.sessionKey;
@@ -276,6 +280,7 @@ export class EigenFluxNotifier {
   }
 
   private async deliverCoordinated(message: string, options?: DeliverOptions): Promise<boolean> {
+    if (options?.lane === 'subagent' && this.feedObservation.signal.aborted) return false;
     if (options?.requireCompletion) return this.deliverConfirmed(message);
     const targetKey = options?.targetSessionKey;
     const persistentKey = options?.persistentSessionKey;
@@ -352,6 +357,8 @@ export class EigenFluxNotifier {
       this.logDispatch(firstAttempt.result);
       return true;
     }
+
+    if (firstAttempt.result.terminal) return false;
 
     // If every transport failed with a remembered route, it may be stale.
     // Re-resolve fresh (skipping remembered), then retry the transport chain once.
@@ -719,12 +726,15 @@ export class EigenFluxNotifier {
 
       // Ordinary notifications retain the host's agent lifecycle wait.
       if (typeof runtimeSubagent.waitForRun === 'function') {
-        const waited = await this.waitForRunFromExecutionStart(route.sessionKey, runId);
+        const waited = lane === 'subagent'
+          ? await this.waitForFeedRun(route.sessionKey, runId)
+          : await this.waitForRunFromExecutionStart(route.sessionKey, runId);
         if (waited.status === 'error') {
           return {
             ok: false,
             mode: 'runtime.subagent',
             error: `subagent run error${waited.error ? `: ${waited.error}` : ''}`,
+            terminal: lane === 'subagent',
           };
         }
         if (waited.status === 'timeout') {
@@ -773,6 +783,43 @@ export class EigenFluxNotifier {
     }
 
     return waitForRun({ runId, timeoutMs: SUBAGENT_TOTAL_WAIT_TIMEOUT_MS });
+  }
+
+  // A Feed retry is safe only after a terminal run or confirmed cancellation.
+  // If an older host cannot cancel, continue observing this same run and retain
+  // its delivery capacity; a timeout alone cannot authorize another submission.
+  private async waitForFeedRun(sessionKey: string, runId: string): Promise<{status: 'ok' | 'error'; error?: string}> {
+    const signal = this.feedObservation.signal;
+    let stop!: () => void;
+    let timer: NodeJS.Timeout | undefined;
+    const stopped = new Promise<never>((_, reject) => {
+      stop = () => reject(new Error('Feed observation stopped'));
+      signal.addEventListener('abort', stop, {once: true});
+    });
+    try {
+      while (!signal.aborted) {
+        try {
+          const result = await Promise.race([this.waitForRunFromExecutionStart(sessionKey, runId), stopped]);
+          if (result.status !== 'timeout') return {status: result.status, error: result.error};
+          if (await Promise.race([this.tryCancelRun(sessionKey, runId), stopped])) {
+            return { status: 'error', error: 'Feed run timed out and was cancelled' };
+          }
+        } catch (error) {
+          if (signal.aborted) break;
+          this.logger.warn(`Feed completion unavailable for run_id=${runId}: ${formatError(error)}`);
+        }
+        try {
+          await Promise.race([new Promise<void>(resolve => {
+            timer = setTimeout(resolve, 30_000);
+            timer.unref?.();
+          }), stopped]);
+        } catch { break; }
+      }
+      return {status: 'error', error: 'Feed observation stopped during shutdown'};
+    } finally {
+      signal.removeEventListener('abort', stop);
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /** Best-effort true cancellation after either queue or execution timeout. */

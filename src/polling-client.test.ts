@@ -157,7 +157,7 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
-  test('continues polling when the Heartbeat plan hook fails', async () => {
+  test('skips polling when the Heartbeat plan hook fails', async () => {
     const loggerSpies = createLoggerSpies();
     execEigenfluxMock.mockResolvedValue({
       kind: 'success',
@@ -175,7 +175,7 @@ describe('EigenFluxPollingClient', () => {
     });
 
     await expect(client.pollOnce()).resolves.toEqual(
-      expect.objectContaining({ kind: 'success' })
+      expect.objectContaining({ kind: 'skipped', reason: 'plan_unavailable' })
     );
     expect(loggerSpies.warn).toHaveBeenCalledWith(
       expect.stringContaining('onHeartbeatStart hook failed')
@@ -455,7 +455,7 @@ describe('EigenFluxPollingClient', () => {
       await client.start();
       // Initial poll + first scheduleNext should have consulted the resolver once.
       expect(resolvePollIntervalSec).toHaveBeenCalledTimes(1);
-      expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
 
       // Fire the first scheduled timer → triggers second poll, then resolver again.
       await jest.advanceTimersByTimeAsync(30_000);
@@ -463,7 +463,7 @@ describe('EigenFluxPollingClient', () => {
       await Promise.resolve();
       await Promise.resolve();
 
-      expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
+      expect(execEigenfluxMock).toHaveBeenCalledTimes(3);
       expect(resolvePollIntervalSec).toHaveBeenCalledTimes(2);
 
       client.stop();
@@ -540,4 +540,43 @@ describe('readPollIntervalSec', () => {
     const interval = await readPollIntervalSec('eigenflux', 'eigenflux', createLogger());
     expect(interval).toBe(DEFAULT_POLL_INTERVAL_SEC);
   });
+});
+
+describe('scheduled Feed gates', () => {
+  test.each(['plan_unavailable', 'capacity'] as const)('%s skips Feed and keeps maintenance', async reason => {
+    execEigenfluxMock.mockClear();
+    const maintenance=jest.fn().mockResolvedValue(undefined);
+    const client=new EigenFluxPollingClient({serverName:'test',eigenfluxBin:'eigenflux',logger:createLogger(),
+      resolvePollIntervalSec:async()=>60,onFeedPolled:async()=>{},onAuthRequired:async()=>{},
+      onHeartbeatStart:async()=>reason==='plan_unavailable'?{kind:'plan_unavailable'}:true,
+      shouldPoll:()=>reason!=='capacity',onPollSkipped:maintenance});
+    expect(await client.pollOnce()).toEqual({kind:'skipped',reason});
+    expect(execEigenfluxMock).not.toHaveBeenCalled();expect(maintenance).toHaveBeenCalledTimes(1);
+  });
+  test.each(['0.6.10','0.7.0','0.8.1','unknown'])('gates origin for CLI %s and reads version once', async version => {
+    execEigenfluxMock.mockReset().mockImplementation(async (_bin,args)=>({kind:'success',data:args[0]==='version'?{cli_version:version}:{items:[],notifications:[],has_more:false}}));
+    const client=new EigenFluxPollingClient({serverName:'test',eigenfluxBin:'eigenflux',logger:createLogger(),
+      resolvePollIntervalSec:async()=>60,onFeedPolled:async()=>{},onAuthRequired:async()=>{}});
+    await client.start();client.stop();await client.pollOnce();
+    const polls=execEigenfluxMock.mock.calls.filter(call=>call[1].includes('poll'));
+    expect(execEigenfluxMock.mock.calls.filter(call=>call[1][0]==='version')).toHaveLength(1);
+    for (const [,argv] of polls) {expect(argv.includes('--origin')).toBe(version==='0.7.0'||version==='0.8.1');if(argv.includes('--origin'))expect(argv.slice(-2)).toEqual(['--origin','heartbeat']);}
+  });
+});
+
+
+test('an owner poll waits for scheduled maintenance then fetches independently', async () => {
+  let release!:()=>void;
+  const maintenance=new Promise<void>(resolve=>{release=resolve;});
+  execEigenfluxMock.mockReset().mockResolvedValue({kind:'success',data:{items:[],notifications:[],has_more:false}});
+  const client=new EigenFluxPollingClient({serverName:'test',eigenfluxBin:'eigenflux',logger:createLogger(),
+    resolvePollIntervalSec:async()=>60,onFeedPolled:async()=>{},onAuthRequired:async()=>{},
+    shouldPoll:()=>false,onPollSkipped:()=>maintenance});
+  const scheduled=client.pollOnce();
+  const owner=client.pollOnce({origin:'owner',notifyFeed:false});
+  expect(execEigenfluxMock).not.toHaveBeenCalled();
+  release();
+  expect(await scheduled).toEqual({kind:'skipped',reason:'capacity'});
+  expect((await owner).kind).toBe('success');
+  expect(execEigenfluxMock).toHaveBeenCalledTimes(1);
 });

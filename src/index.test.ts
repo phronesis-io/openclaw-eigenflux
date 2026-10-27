@@ -282,7 +282,7 @@ describe('register unit', () => {
     }
   });
 
-  test('credential service plan failures stop this poll while ordinary plan failures still fetch Feed', async () => {
+  test('all unavailable plans stop Feed before creating exposures', async () => {
     discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
       { name: 'alpha', endpoint: 'http://127.0.0.1:18080', current: true },
     ] });
@@ -327,9 +327,8 @@ describe('register unit', () => {
       for (const message of ['HTTP 503 unavailable', 'settings PUT failed: HTTP 503']) {
         planError = { kind: 'error', error: new Error(message), exitCode: 2, stderr: message };
         execEigenfluxMock.mockClear();
-        await expect(poller.pollOnce()).resolves.toMatchObject({ kind: 'success' });
-        expect(execEigenfluxMock).toHaveBeenCalledTimes(2);
-        expect(execEigenfluxMock.mock.calls[1][1]).toContain('poll');
+        await expect(poller.pollOnce()).resolves.toMatchObject({ kind: 'skipped', reason: 'plan_unavailable' });
+        expect(execEigenfluxMock.mock.calls.some(call => call[1].includes('poll'))).toBe(false);
         expect(deliver).not.toHaveBeenCalled();
       }
     } finally {
@@ -1083,149 +1082,37 @@ describe('register unit', () => {
     expect(commands).toHaveLength(0);
   });
 
-  test('skips feed delivery when previous delivery is still in progress', async () => {
-    const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
-    fs.mkdirSync(serverDir, { recursive: true });
-
-    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
-      { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
-    ] });
-
-    // Make subagent.run return a pending promise that we control
-    let resolveFirstDelivery!: (value: any) => void;
-    const firstDeliveryPromise = new Promise((resolve) => {
-      resolveFirstDelivery = resolve;
-    });
-    const subagentRun = jest.fn().mockReturnValue(firstDeliveryPromise);
-    const testLogger = createLogger();
-
-    pollingClientStartMock.mockImplementation(async () => {
-      // Simulate first feed poll triggering delivery
-      if (capturedPollOnFeedPolled) {
-        // Don't await — let it hang as pending delivery
-        capturedPollOnFeedPolled({
-          code: 0,
-          msg: 'success',
-          data: {
-            items: [{ item_id: '100', broadcast_type: 'info', updated_at: 1760000000000 }],
-            has_more: false,
-            notifications: [],
-          },
-        });
-      }
-    });
-
-    const { default: plugin } = await import('./index');
-    const services: any[] = [];
-
-    plugin.register({
-      registrationMode: 'full',
-      config: {},
-      pluginConfig: {},
-      runtime: {
-        subagent: { run: subagentRun },
-      },
-      logger: testLogger,
-      registerService: (service: any) => services.push(service),
-      registerCommand: jest.fn(),
-    } as any);
-
-    await services[0].start();
-    // Allow notifier's async resolveRoute() to settle before asserting
-    await new Promise((r) => setImmediate(r));
-
-    // First delivery should have been triggered
-    expect(subagentRun).toHaveBeenCalledTimes(1);
-
-    // Now trigger a second onFeedPolled while the first is still pending
-    expect(capturedPollOnFeedPolled).toBeTruthy();
-    await capturedPollOnFeedPolled!({
-      code: 0,
-      msg: 'success',
-      data: {
-        items: [{ item_id: '200', broadcast_type: 'info', updated_at: 1760000000500 }],
-        has_more: false,
-        notifications: [{ notification_id: 'n1', type: 'friend_request', content: 'hi', created_at: 1760000000600 }],
-      },
-    });
-
-    // Second delivery should have been skipped
-    expect(subagentRun).toHaveBeenCalledTimes(1);
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Skipping feed delivery')
-    );
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('skipped_items=1')
-    );
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('skipped_notifications=1')
-    );
-
-    // Resolve first delivery so stop() can complete
-    resolveFirstDelivery({ runId: 'run-bp' });
-    await services[0].stop();
-  });
-
-  test('logs skip count and item details when delivery is skipped', async () => {
-    const serverDir = path.join(eigenfluxHome, 'servers', 'eigenflux');
-    fs.mkdirSync(serverDir, { recursive: true });
-
-    discoverServersMock.mockResolvedValue({ kind: 'ok', servers: [
-      { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
-    ] });
-
-    let resolveDelivery!: (value: any) => void;
-    const subagentRun = jest.fn().mockReturnValue(
-      new Promise((resolve) => { resolveDelivery = resolve; })
-    );
-    const testLogger = createLogger();
-
-    pollingClientStartMock.mockImplementation(async () => {
-      if (capturedPollOnFeedPolled) {
-        capturedPollOnFeedPolled({
-          code: 0, msg: 'success',
-          data: { items: [{ item_id: '100', broadcast_type: 'info', updated_at: 1 }], has_more: false, notifications: [] },
-        });
-      }
-    });
-
-    const { default: plugin } = await import('./index');
-    const services: any[] = [];
-
-    plugin.register({
-      registrationMode: 'full',
-      config: {},
-      pluginConfig: {},
-      runtime: { subagent: { run: subagentRun } },
-      logger: testLogger,
-      registerService: (service: any) => services.push(service),
-      registerCommand: jest.fn(),
-    } as any);
-
-    await services[0].start();
-
-    // Skip twice to verify cumulative count
-    await capturedPollOnFeedPolled!({
-      code: 0, msg: 'success',
-      data: { items: [{ item_id: '200', broadcast_type: 'info', updated_at: 2 }], has_more: false, notifications: [] },
-    });
-    await capturedPollOnFeedPolled!({
-      code: 0, msg: 'success',
-      data: { items: [{ item_id: '300', broadcast_type: 'info', updated_at: 3 }, { item_id: '301', broadcast_type: 'alert', updated_at: 4 }], has_more: false, notifications: [] },
-    });
-
-    // Check cumulative skip count
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('total_skips=1')
-    );
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('total_skips=2')
-    );
-    expect(testLogger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('skipped_items=2')
-    );
-
-    resolveDelivery({ runId: 'run-skip-count' });
-    await services[0].stop();
+  test('a retained delivery prevents the next poll without superseding its payload', async () => {
+    discoverServersMock.mockResolvedValue({kind:'ok',servers:[{name:'eigenflux',endpoint:'http://127.0.0.1:18080',current:true}]});
+    execEigenfluxMock.mockImplementation(async (_bin,args)=>({kind:'success',data:args.includes('heartbeat')
+      ? {schema_version:'eigenflux_heartbeat_plan.v1',agent_prompt:'CURRENT PLAN',wake_on_empty:true}
+      : undefined}));
+    pollingClientStartMock.mockResolvedValue(undefined);
+    const {EigenFluxNotifier}=await import('./notifier');
+    let complete!: (ok:boolean)=>void;
+    const deliver=jest.spyOn(EigenFluxNotifier.prototype,'deliver').mockImplementation(()=>new Promise(resolve=>{complete=resolve;}));
+    const {default:plugin}=await import('./index');const services:any[]=[];
+    plugin.register({registrationMode:'full',config:{},pluginConfig:{},runtime:{},logger:createLogger(),
+      registerService:(service:any)=>services.push(service),registerCommand:jest.fn()} as any);
+    try {
+      await services[0].start();await capturedPollingConfig.onHeartbeatStart();
+      expect(capturedPollingConfig.shouldPoll()).toBe(true);
+      jest.useFakeTimers();
+      await capturedPollingConfig.onFeedPolled({code:0,msg:'success',data:{items:[{item_id:'first'}],notifications:[],has_more:false}});
+      await jest.advanceTimersByTimeAsync(0);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(360_000);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      jest.useRealTimers();
+      expect(capturedPollingConfig.shouldPoll()).toBe(false);
+      const actual=jest.requireActual('./polling-client') as typeof import('./polling-client');
+      const maintenance=jest.fn().mockResolvedValue(undefined);
+      const poller=new actual.EigenFluxPollingClient({...capturedPollingConfig,onPollSkipped:maintenance});
+      execEigenfluxMock.mockClear();
+      expect(await poller.pollOnce()).toEqual({kind:'skipped',reason:'capacity'});
+      expect(execEigenfluxMock).not.toHaveBeenCalled();expect(maintenance).toHaveBeenCalledTimes(1);
+      complete(true);await new Promise(resolve=>setImmediate(resolve));
+      expect(capturedPollingConfig.shouldPoll()).toBe(true);
+    } finally {jest.useRealTimers();if(complete)complete(true);await services[0].stop();deliver.mockRestore();}
   });
 });

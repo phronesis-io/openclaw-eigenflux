@@ -1023,3 +1023,38 @@ describe('EigenFluxNotifier', () => {
     });
   });
 });
+
+
+test('Feed retains the original run when timeout cancellation is unavailable', async () => {
+  jest.useFakeTimers();
+  const run=jest.fn().mockResolvedValue({runId:'feed-original'});
+  const waitForRun=jest.fn().mockResolvedValueOnce({status:'timeout'}).mockResolvedValueOnce({status:'ok'});
+  const notifier=new EigenFluxNotifier(createApi({runtime:{subagent:{run,waitForRun}} as any}),createLogger(),createConfig());
+  let done=false;
+  const delivery=notifier.deliver('same payload',{lane:'subagent'}).then(result=>{done=true;return result;});
+  try {
+    await jest.advanceTimersByTimeAsync(0);
+    expect(done).toBe(false);
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(await delivery).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(waitForRun.mock.calls.map(call=>call[0].runId)).toEqual(['feed-original','feed-original']);
+  } finally {jest.useRealTimers();}
+});
+
+
+test('shutdown ends Feed observation without resubmitting an unresolved run', async () => {
+  jest.useFakeTimers();
+  const run=jest.fn().mockResolvedValue({runId:'feed-shutdown'});
+  const waitForRun=jest.fn().mockReturnValue(new Promise(()=>{}));
+  const notifier=new EigenFluxNotifier(createApi({runtime:{subagent:{run,waitForRun}} as any}),createLogger(),createConfig());
+  const delivery=notifier.deliver('same payload',{lane:'subagent'});
+  try {
+    await jest.advanceTimersByTimeAsync(0);
+    expect(waitForRun).toHaveBeenCalledTimes(1);
+    notifier.stopFeedObservation();
+    expect(await delivery).toBe(false);
+    expect(await notifier.deliver('same payload',{lane:'subagent'})).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+  } finally {jest.useRealTimers();}
+});
