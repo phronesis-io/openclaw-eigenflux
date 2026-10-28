@@ -197,7 +197,7 @@ test('late reconnect callbacks cannot spawn another child over an active replace
   try {
     await client.start();
     await until(() => ready);
-    (client as any).scheduleRestart();
+    (client as any).scheduleRestart((client as any).generation);
     (client as any).spawnStreamProcess();
     await new Promise(resolve => setTimeout(resolve, 1100));
     expect(f.records().filter(record => record.kind === 'start')).toHaveLength(1);

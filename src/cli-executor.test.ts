@@ -1,6 +1,57 @@
 import { execEigenflux } from './cli-executor';
 
+const unavailableNotice = {
+  schema_version: 'eigenflux_auth_unavailable.v1', status: 'auth_unavailable',
+  code: 'AGENT_AUTH_UNAVAILABLE', home: '/stable/home', server: 'alpha',
+  checks_blocked: true, login_required: false, retryable: true,
+};
+
+function failingCli(stderr: string, exitCode = 2) {
+  return execEigenflux(process.execPath, [
+    '-e', 'process.stderr.write(process.argv[1]); process.exit(Number(process.argv[2]))',
+    stderr, String(exitCode),
+  ]);
+}
+
 describe('execEigenflux', () => {
+  test.each(['AGENT_AUTH_UNAVAILABLE', 'AUTH_NETWORK_UNAVAILABLE'])(
+    'classifies the final structured %s notice after multiline diagnostics', async (code) => {
+      const stderr = `refresh request failed\r\nadditional diagnostic\r\n${JSON.stringify({ ...unavailableNotice, code })}\r\n\n`;
+      await expect(failingCli(stderr)).resolves.toMatchObject({
+        kind: 'error', exitCode: 2, stderr: stderr.trim(), authenticationUnavailable: true,
+      });
+    }
+  );
+
+  test.each([
+    'HTTP 503 AGENT_AUTH_UNAVAILABLE',
+    'settings PUT failed: HTTP 503',
+    '{invalid JSON}',
+    'null', '[]',
+    JSON.stringify({ ...unavailableNotice, schema_version: 'unknown' }),
+    JSON.stringify({ ...unavailableNotice, status: 'auth_required' }),
+    JSON.stringify({ ...unavailableNotice, checks_blocked: 'true' }),
+    JSON.stringify({ ...unavailableNotice, checks_blocked: false }),
+    JSON.stringify({ ...unavailableNotice, login_required: true }),
+    JSON.stringify({ ...unavailableNotice, login_required: 'false' }),
+    JSON.stringify({ ...unavailableNotice, retryable: false }),
+    JSON.stringify({ ...unavailableNotice, retryable: 'true' }),
+    JSON.stringify({ ...unavailableNotice, code: '' }),
+    JSON.stringify({ ...unavailableNotice, home: null }),
+    JSON.stringify({ ...unavailableNotice, server: '' }),
+    `${JSON.stringify(unavailableNotice)}\ntrailing diagnostic`,
+  ])('leaves unstructured or invalid diagnostics as ordinary errors: %s', async (stderr) => {
+    const result = await failingCli(stderr);
+    expect(result.kind).toBe('error');
+    expect(result).not.toHaveProperty('authenticationUnavailable');
+  });
+
+  test('the unavailable notice does not change non-usage exit or login-required handling', async () => {
+    const stderr = JSON.stringify(unavailableNotice);
+    expect(await failingCli(stderr, 1)).not.toHaveProperty('authenticationUnavailable');
+    await expect(failingCli(stderr, 4)).resolves.toEqual({ kind: 'auth_required', stderr });
+  });
+
   test('per-child model overrides preserve parent metadata without mutating the Gateway', async () => {
     const savedModel = process.env.EIGENFLUX_MODEL;
     const savedChannel = process.env.EIGENFLUX_CHANNEL;

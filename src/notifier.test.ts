@@ -12,6 +12,7 @@ jest.mock('./session-route-memory', () => ({
 }));
 
 import { EigenFluxNotifier } from './notifier';
+import { UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
 
 function createLogger(): Logger {
   return new Logger({
@@ -1021,5 +1022,101 @@ describe('EigenFluxNotifier', () => {
       ).resolves.toBe(true);
       expect(run).toHaveBeenCalledTimes(1);
     });
+  });
+});
+
+
+test('Feed retains the original run when timeout cancellation is unavailable', async () => {
+  jest.useFakeTimers();
+  const run=jest.fn().mockResolvedValue({runId:'feed-original'});
+  const waitForRun=jest.fn().mockResolvedValueOnce({status:'timeout'}).mockResolvedValueOnce({status:'ok'});
+  const notifier=new EigenFluxNotifier(createApi({runtime:{subagent:{run,waitForRun}} as any}),createLogger(),createConfig());
+  let done=false;
+  const delivery=notifier.deliver('same payload',{lane:'subagent'}).then(result=>{done=true;return result;});
+  try {
+    await jest.advanceTimersByTimeAsync(0);
+    expect(done).toBe(false);
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(await delivery).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(waitForRun.mock.calls.map(call=>call[0].runId)).toEqual(['feed-original','feed-original']);
+  } finally {jest.useRealTimers();}
+});
+
+
+test('shutdown ends Feed observation without resubmitting an unresolved run', async () => {
+  jest.useFakeTimers();
+  const run=jest.fn().mockResolvedValue({runId:'feed-shutdown'});
+  const waitForRun=jest.fn().mockReturnValue(new Promise(()=>{}));
+  const notifier=new EigenFluxNotifier(createApi({runtime:{subagent:{run,waitForRun}} as any}),createLogger(),createConfig());
+  const delivery=notifier.deliver('same payload',{lane:'subagent'});
+  try {
+    await jest.advanceTimersByTimeAsync(0);
+    expect(waitForRun).toHaveBeenCalledTimes(1);
+    notifier.stopFeedObservation();
+    expect(await delivery).toBe(false);
+    expect(await notifier.deliver('same payload',{lane:'subagent'})).toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+  } finally {jest.useRealTimers();}
+});
+
+describe('Feed run observation bound', () => {
+  const ROUND_MS = 480_000;
+  const PAUSE_MS = 30_000;
+  const timedOutWait = () => jest.fn(({timeoutMs}: {timeoutMs: number}) =>
+    new Promise(resolve => setTimeout(() => resolve({status: 'timeout'}), timeoutMs)));
+
+  test.each([
+    ['without runtime.tasks.runs', undefined],
+    ['when the task is not listed', {runs: {bindSession: () => ({list: () => [], cancel: jest.fn()})}}],
+  ])('gives up after the observation cap %s and releases the delivery slot', async (_label, tasks) => {
+    jest.useFakeTimers();
+    const spies = {info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn()};
+    const run = jest.fn().mockResolvedValue({runId: 'feed-stuck'});
+    const waitForRun = timedOutWait();
+    const notifier = new EigenFluxNotifier(
+      createApi({runtime: {subagent: {run, waitForRun}, ...(tasks ? {tasks} : {})} as any}),
+      new Logger(spies),
+      createConfig()
+    );
+    let settled = false;
+    const delivery = notifier.deliver('same payload', {lane: 'subagent'});
+    const outcome = delivery.then(() => 'resolved', error => error);
+    void outcome.then(() => { settled = true; });
+    try {
+      await jest.advanceTimersByTimeAsync(3 * ROUND_MS + PAUSE_MS);
+      expect(settled).toBe(false);
+      await jest.advanceTimersByTimeAsync(PAUSE_MS);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(UnconfirmedFeedDeliveryError);
+      expect(waitForRun).toHaveBeenCalledTimes(3);
+      expect(run).toHaveBeenCalledTimes(1);
+      expect(spies.error).toHaveBeenCalledWith(expect.stringMatching(
+        /unconfirmed after 3 observation rounds and cancellation was unavailable.*run_id=feed-stuck/));
+
+      // The process-wide slot is free: an unrelated delivery completes and the
+      // stuck run is never resubmitted.
+      run.mockResolvedValue({runId: 'pm-next'});
+      waitForRun.mockImplementation(async () => ({status: 'ok'}) as any);
+      await expect(notifier.deliver('pm', {persistentSessionKey: 'agent:main:eigenflux:pm:1'})).resolves.toBe(true);
+      expect(run.mock.calls.filter(([params]) => params.message === 'same payload')).toHaveLength(1);
+    } finally { jest.useRealTimers(); }
+  });
+
+  test('a run that completes within the final observation round still succeeds', async () => {
+    jest.useFakeTimers();
+    const run = jest.fn().mockResolvedValue({runId: 'feed-late'});
+    const waitForRun = jest.fn()
+      .mockResolvedValueOnce({status: 'timeout'})
+      .mockRejectedValueOnce(new Error('gateway unavailable'))
+      .mockResolvedValueOnce({status: 'ok'});
+    const notifier = new EigenFluxNotifier(createApi({runtime: {subagent: {run, waitForRun}} as any}), createLogger(), createConfig());
+    const delivery = notifier.deliver('same payload', {lane: 'subagent'});
+    try {
+      await jest.advanceTimersByTimeAsync(2 * PAUSE_MS);
+      expect(await delivery).toBe(true);
+      expect(waitForRun).toHaveBeenCalledTimes(3);
+      expect(run).toHaveBeenCalledTimes(1);
+    } finally { jest.useRealTimers(); }
   });
 });

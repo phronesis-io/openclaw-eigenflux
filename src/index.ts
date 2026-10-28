@@ -37,7 +37,6 @@ import {
 import { findSessionRouteForBinding } from './notification-route-resolver';
 import {
   buildAuthRequiredPromptTemplate,
-  buildFeedPayloadPromptTemplate,
   buildHeartbeatExecutionPromptTemplate,
   buildNotInstalledPromptTemplate,
   INSTALL_ENTRY_URL,
@@ -49,6 +48,7 @@ import {
 import { FeedPushScheduler } from './feed-push-scheduler';
 import { EigenFluxHeartbeatPlanRunner, type HeartbeatExecutionPlan } from './heartbeat-plan-runner';
 import { EigenFluxNotifier } from './notifier';
+import { AuthNotificationGate } from './auth-notification-gate';
 import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm-delivery';
 
 /** "Recently active" window for the busy-aware feed push: the main session
@@ -278,6 +278,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
         runtime.feedPoller.stop();
         runtime.orderNotifications.stop();
         runtime.feedPushScheduler.stop();
+        runtime.notifier.stopFeedObservation();
         await runtime.waitForPendingDelivery();
         await runtime.notifier.drainPendingCleanups();
         await runtime.streamClient.stop();
@@ -569,23 +570,17 @@ function createServerRuntime(
     eigenfluxHome,
   });
 
-  let lastAuthPromptKey: string | null = null;
+  const authNotificationGate = new AuthNotificationGate();
 
   const resetAuthPromptGate = (): void => {
-    lastAuthPromptKey = null;
+    authNotificationGate.reset();
   };
 
-  const notifyAuthRequired = async (_authEvent: AuthRequiredEvent): Promise<void> => {
-    const promptKey = `auth_required:${server.name}`;
-    if (lastAuthPromptKey === promptKey) {
-      logger.debug(`Skipping duplicate auth prompt for server=${server.name}`);
-      return;
-    }
-
-    lastAuthPromptKey = promptKey;
-    await notifier.deliver(
-      buildAuthRequiredPromptTemplate({ context: getPromptContext() })
-    );
+  const notifyAuthRequired = async (authEvent: AuthRequiredEvent): Promise<void> => {
+    await authNotificationGate.deliver(() => notifier.deliver(
+      buildAuthRequiredPromptTemplate({ context: getPromptContext(), stderr: authEvent.stderr }),
+      { requireCompletion: true }
+    ));
   };
 
   // Pushes the agent's runtime mode to the backend once per heartbeat via the
@@ -597,72 +592,42 @@ function createServerRuntime(
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
   });
+  let heartbeatAuthRequired = false;
+  let heartbeatAuthDetail: string | undefined;
+  let heartbeatAuthUnavailable: Error | undefined;
   const heartbeatPlanRunner = new EigenFluxHeartbeatPlanRunner({
     eigenfluxBin: pluginConfig.eigenfluxBin,
     eigenfluxHome,
     serverName: server.name,
     logger,
+    onAuthRequired: (stderr) => { heartbeatAuthRequired = true; heartbeatAuthDetail = stderr; },
+    onAuthUnavailable: (error) => { heartbeatAuthUnavailable = error; },
   });
   // A successful plan is Agent work, not merely a plugin health check. Keep
   // the plan for exactly the poll that produced it; pollOnce is single-flight.
   let currentHeartbeatPlan: HeartbeatExecutionPlan | null = null;
 
-  // Backpressure state for the LEGACY one-shot feed path only
-  // (EIGENFLUX_FEED_DELIVERY=oneshot). The default 2a main-session path returns
-  // before touching any of these — they stay at their initial values there, so
-  // never read them outside the oneshot branch. Guard: notifier.deliver() may
-  // take longer than the poll interval, so we skip overlapping deliveries to
-  // avoid duplicate agent tasks.
+  // Retain capacity until the host resolves the current delivery.
   let feedDeliveryInFlight = false;
-  let feedDeliveryStartedAt = 0;
-  let feedDeliverySkipCount = 0;
-  let activeFeedDelivery: Promise<boolean> | null = null;
-  const FEED_DELIVERY_TIMEOUT_MS = 300_000;
+  let activeFeedDelivery: Promise<void> | null = null;
 
   /** Overlap-guarded notifier.deliver() — shared by the default main-session
    *  push (via the scheduler) and the legacy one-shot path. */
   async function runGuardedFeedDelivery(
     prompt: string,
-    options?: { targetSessionKey?: string },
-    skipContext?: { items: number; notifications: number }
+    options?: { targetSessionKey?: string }
   ): Promise<void> {
-    // Check for stale delivery flag (delivery promise hung)
-    if (feedDeliveryInFlight && feedDeliveryStartedAt > 0) {
-      const elapsed = Date.now() - feedDeliveryStartedAt;
-      if (elapsed > FEED_DELIVERY_TIMEOUT_MS) {
-        logger.error(
-          `Feed delivery flag stuck for ${Math.round(elapsed / 1000)}s on server=${server.name}, force-resetting`
-        );
-        feedDeliveryInFlight = false;
-        activeFeedDelivery = null;
-      }
-    }
-
-    if (feedDeliveryInFlight) {
-      feedDeliverySkipCount += 1;
-      const elapsed = Date.now() - feedDeliveryStartedAt;
-      logger.warn(
-        `Skipping feed delivery for server=${server.name}: previous delivery still in progress ` +
-        `(elapsed=${Math.round(elapsed / 1000)}s, skipped_items=${skipContext?.items ?? 'n/a'}, ` +
-        `skipped_notifications=${skipContext?.notifications ?? 'n/a'}, total_skips=${feedDeliverySkipCount})`
-      );
-      return;
-    }
-
+    if (feedDeliveryInFlight) throw new Error('Feed delivery already in flight');
     feedDeliveryInFlight = true;
     const startedAt = Date.now();
-    feedDeliveryStartedAt = startedAt;
     // OpenClaw grants optional terminal replies only to its standard subagent lane.
     // Scope this to Feed/heartbeat runs; PM and order lanes retain their isolation.
-    activeFeedDelivery = notifier.deliver(prompt, { ...options, lane: 'subagent' }).finally(() => {
-      const duration = Date.now() - startedAt;
-      logger.info(`Feed delivery completed for server=${server.name} in ${Math.round(duration / 1000)}s`);
-      // Only clear flags if this delivery is still the current one.
-      // A stale .finally() from a force-reset delivery must not clobber a newer delivery's state.
-      if (feedDeliveryStartedAt === startedAt) {
-        feedDeliveryInFlight = false;
-        activeFeedDelivery = null;
-      }
+    activeFeedDelivery = notifier.deliver(prompt, { ...options, lane: 'subagent' })
+      .then(delivered => { if (!delivered) throw new Error('Feed delivery was not accepted'); })
+      .finally(() => {
+      logger.info(`Feed delivery completed for server=${server.name} in ${Math.round((Date.now() - startedAt) / 1000)}s`);
+      feedDeliveryInFlight = false;
+      activeFeedDelivery = null;
     });
 
     await activeFeedDelivery;
@@ -673,8 +638,11 @@ function createServerRuntime(
   // See FeedPushScheduler for the full policy.
   const feedPushScheduler = new FeedPushScheduler({
     isBusy: async () =>
-      feedDeliveryInFlight || notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS),
-    pushNow: (prompt) => runGuardedFeedDelivery(prompt),
+      feedDeliveryInFlight || (!process.env.EIGENFLUX_FEED_DELIVERY && await notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS)),
+    pushNow: (prompt) => process.env.EIGENFLUX_FEED_DELIVERY === 'system-event'
+      ? notifier.deliverToMainSession(prompt).then(delivered => { if (!delivered) throw new Error('Main-session delivery was not accepted'); })
+      : runGuardedFeedDelivery(prompt, process.env.EIGENFLUX_FEED_DELIVERY === 'oneshot'
+          ? { targetSessionKey: buildFeedSessionKey(server.name) } : undefined),
     logger,
     serverName: server.name,
   });
@@ -691,25 +659,7 @@ function createServerRuntime(
 
     if (!hasPayload && !plan.wake_on_empty) return;
     const prompt = buildHeartbeatExecutionPromptTemplate(plan.agent_prompt, payload, getPromptContext());
-    switch (process.env.EIGENFLUX_FEED_DELIVERY) {
-      case 'system-event':
-        void notifier.deliverToMainSession(prompt).catch((err) =>
-          logger.error(`Heartbeat main-session delivery error for server=${server.name}: ${String(err)}`)
-        );
-        return;
-      case 'oneshot':
-        await runGuardedFeedDelivery(
-          prompt,
-          { targetSessionKey: buildFeedSessionKey(server.name) },
-          {
-            items: payload.data?.items?.length ?? 0,
-            notifications: payload.data?.notifications?.length ?? 0,
-          }
-        );
-        return;
-      default:
-        feedPushScheduler.schedule(prompt);
-    }
+    feedPushScheduler.schedule(prompt);
   };
 
   const orderAgentPath = path.join(eigenfluxHome, 'servers', server.name, 'agent-v2-credentials.json');
@@ -732,75 +682,32 @@ function createServerRuntime(
       readPollIntervalSec(pluginConfig.eigenfluxBin, server.name, logger),
     logger,
     onHeartbeatStart: async () => {
+      heartbeatAuthRequired = false;
+      heartbeatAuthDetail = undefined;
+      heartbeatAuthUnavailable = undefined;
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
       if (currentHeartbeatPlan) {
         await streamClient.adoptCLIVersion(currentHeartbeatPlan.cli_version);
         await refreshOpenClawSkillsSnapshot(logger);
       }
+      if (heartbeatAuthUnavailable) {
+        return { kind: 'auth_unavailable' as const, error: heartbeatAuthUnavailable };
+      }
+      if (heartbeatAuthRequired) return { kind: 'auth_required' as const, stderr: heartbeatAuthDetail };
+      return currentHeartbeatPlan ? true : { kind: 'plan_unavailable' as const };
+    },
+    shouldPoll: () => !feedDeliveryInFlight && !feedPushScheduler.hasPending(),
+    onPollSkipped: async () => {
+      await settingsReporter.report();
+      flushLoop.kick();
+      void profileRefresher.tick();
     },
     onFeedPolled: async (payload: FeedResponse) => {
-      // Always reset auth gate on successful poll, even if delivery is skipped
-      resetAuthPromptGate();
-
-      const items = payload.data?.items ?? [];
-      const notifications = payload.data?.notifications ?? [];
-
-      // The CLI caches every feed response itself, so `feed event record` reads
-      // item_ids straight from that cache — the plugin no longer mirrors them.
-
-      // Delivery modes (EIGENFLUX_FEED_DELIVERY):
-      //
-      // (default)      — the original pre-oneshot path: notifier.deliver() runs
-      //                  the agent ON the user's real main session via
-      //                  runtime.subagent (deliver:true). The PLUGIN initiates
-      //                  the run, so feed is an ACTIVE push with full user
-      //                  context and no dependency on the host heartbeat
-      //                  scheduler (which has been observed to stall for hours).
-      // 'system-event' — mode 2a: enqueue into the main session + heartbeat
-      //                  wake. Fully non-blocking, but delivery timing depends
-      //                  on the host heartbeat actually firing; until that is
-      //                  reliable this mode is opt-in only.
-      // 'oneshot'      — legacy isolated one-shot session (no user context).
-      if (currentHeartbeatPlan) {
-        await scheduleHeartbeatExecution(payload);
-        return;
-      }
-
-      const feedDeliveryMode = process.env.EIGENFLUX_FEED_DELIVERY;
-      if (feedDeliveryMode === 'system-event') {
-        // Nothing worth surfacing → don't wake the heartbeat at all.
-        if (items.length === 0 && notifications.length === 0) {
-          return;
-        }
-        // Fire-and-forget: enqueueSystemEvent is non-blocking and coalescing, so
-        // the poll loop needs no backpressure guard and never stalls on delivery.
-        void notifier
-          .deliverToMainSession(buildFeedPayloadPromptTemplate(payload, getPromptContext()))
-          .catch((err) =>
-            logger.error(`Feed main-session delivery error for server=${server.name}: ${String(err)}`)
-          );
-        return;
-      }
-
-      const prompt = buildFeedPayloadPromptTemplate(payload, getPromptContext());
-
-      if (feedDeliveryMode === 'oneshot') {
-        // Legacy isolated path: unchanged semantics (immediate, awaited,
-        // overlap-guarded with skip logging).
-        await runGuardedFeedDelivery(
-          prompt,
-          { targetSessionKey: buildFeedSessionKey(server.name) },
-          { items: items.length, notifications: notifications.length }
-        );
-        return;
-      }
-
-      // Default: busy-aware active push. Hold the payload while the user's
-      // conversation is active and deliver at the next quiet moment; a newer
-      // poll's payload supersedes the held one (latest batch wins).
-      feedPushScheduler.schedule(prompt);
+      await scheduleHeartbeatExecution(payload);
     },
     onPollSuccess: async (payload: FeedResponse) => {
+      // Empty successful polls also prove authentication has recovered.
+      resetAuthPromptGate();
       // Push local settings to the backend once per heartbeat (throttled
       // internally). Errors are swallowed inside report().
       await settingsReporter.report();
@@ -852,8 +759,8 @@ function createServerRuntime(
         );
       }
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 
@@ -869,8 +776,8 @@ function createServerRuntime(
       resetAuthPromptGate();
       await notifier.deliver(prompt);
     },
-    onAuthRequired: async () => {
-      await notifyAuthRequired({ reason: 'auth_required' });
+    onAuthRequired: async (stderr) => {
+      await notifyAuthRequired({ reason: 'auth_required', stderr });
     },
   });
 
@@ -1293,6 +1200,7 @@ async function buildProfileText(
 
 async function buildFeedText(runtime: ServerRuntime): Promise<string> {
   const result = await runtime.feedPoller.pollOnce({
+    origin: 'owner',
     notifyFeed: false,
     notifyAuthRequired: false,
   });

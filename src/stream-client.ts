@@ -5,6 +5,7 @@
 
 import { spawn, ChildProcess } from 'child_process';
 import { createInterface, Interface as ReadlineInterface } from 'readline';
+import { StringDecoder } from 'node:string_decoder';
 import { Logger } from './logger';
 import { cliEnvironment } from './cli-executor';
 
@@ -59,7 +60,7 @@ export interface StreamClientConfig {
   eigenfluxHome?: string;
   logger: Logger;
   onPmEvent: (event: PmStreamEvent) => Promise<void>;
-  onAuthRequired: () => Promise<void>;
+  onAuthRequired: (stderr?: string) => Promise<void>;
   onStreamError?: (error: Error) => void;
 }
 
@@ -102,9 +103,9 @@ export class EigenFluxStreamClient {
       this.config.logger.warn('Previous stream has not closed; deferring start');
       return;
     }
-    this.generation += 1;
     this.running = true;
     this.stopping = false;
+    this.generation += 1;
     this.adopting = false;
     this.config.logger.info(`Starting stream client for server=${this.config.serverName}`);
     this.spawnStreamProcess();
@@ -116,9 +117,9 @@ export class EigenFluxStreamClient {
     }
 
     this.config.logger.info(`Stopping stream client for server=${this.config.serverName}`);
-    this.generation += 1;
     this.stopping = true;
     this.running = false;
+    this.generation += 1;
 
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
@@ -209,6 +210,7 @@ export class EigenFluxStreamClient {
     if (this.stopping || !this.running || this.child) {
       return;
     }
+    const generation = this.generation;
 
     const args = ['stream', '-s', this.config.serverName, '-f', 'json'];
     if (this.config.eigenfluxHome) args.push('--homedir', this.config.eigenfluxHome);
@@ -231,44 +233,51 @@ export class EigenFluxStreamClient {
     this.readline = rl;
 
     rl.on('line', (line) => {
-      this.handleLine(line);
+      if (generation === this.generation) this.handleLine(line);
     });
 
+    let stderrTail = '';
+    const stderrDecoder = new StringDecoder('utf8');
     child.stderr?.on('data', (chunk: Buffer) => {
-      const text = chunk.toString().trim();
+      const decoded = stderrDecoder.write(chunk);
+      stderrTail = (stderrTail + decoded).slice(-16_384);
+      const text = decoded.trim();
       if (text) {
         this.config.logger.debug(`[stream stderr] ${text}`);
       }
     });
 
     child.on('error', (err) => {
+      if (generation !== this.generation) return;
       this.config.logger.error(`Stream process error: ${err.message}`);
       this.config.onStreamError?.(err);
     });
 
+    // close follows stderr drainage, including the CLI's final owner action.
     child.on('close', (code, signal) => {
-      this.config.logger.info(
-        `Stream process closed (code=${code}, signal=${signal})`
-      );
-
       if (this.child !== child) return;
       this.child = null;
       this.childClosed = null;
-      this.readline = null;
+      if (this.readline === rl) this.readline = null;
+      if (generation !== this.generation) return;
+      stderrTail = (stderrTail + stderrDecoder.end()).slice(-16_384);
+      this.config.logger.info(
+        `Stream process exited (code=${code}, signal=${signal})`
+      );
       if (this.stopping || !this.running || this.adopting) return;
 
       if (code === EXIT_AUTH_REQUIRED) {
         this.config.logger.warn('Stream auth required');
-        this.config.onAuthRequired().then(() => {
-          this.scheduleRestart();
+        this.config.onAuthRequired(stderrTail.trim()).then(() => {
+          this.scheduleRestart(generation);
         }).catch((err) => {
           this.config.logger.error(`Auth required handler error: ${err instanceof Error ? err.message : String(err)}`);
-          this.scheduleRestart();
+          this.scheduleRestart(generation);
         });
         return;
       }
 
-      this.scheduleRestart();
+      this.scheduleRestart(generation);
     });
   }
 
@@ -304,8 +313,8 @@ export class EigenFluxStreamClient {
     }
   }
 
-  private scheduleRestart(): void {
-    if (this.stopping || !this.running || this.adopting || this.child) {
+  private scheduleRestart(generation: number): void {
+    if (generation !== this.generation || this.stopping || !this.running || this.adopting || this.child) {
       return;
     }
 
@@ -324,6 +333,7 @@ export class EigenFluxStreamClient {
     );
 
     this.restartTimer = setTimeout(() => {
+      if (generation !== this.generation || this.stopping || !this.running) return;
       this.restartTimer = null;
       this.spawnStreamProcess();
     }, this.backoffMs);

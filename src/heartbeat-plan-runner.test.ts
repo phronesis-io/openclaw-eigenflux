@@ -46,3 +46,41 @@ test('preserves the replacement CLI version without requiring it from legacy pla
   execMock.mockResolvedValue({ kind: 'success', data: modern });
   await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(modern);
 });
+
+test('routes plan authentication failure to the host notification callback', async () => {
+  const onAuthRequired = jest.fn().mockResolvedValue(undefined);
+  execMock.mockResolvedValue({ kind: 'auth_required', stderr: 'authentication required' });
+  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired }).run()).resolves.toBeNull();
+  expect(onAuthRequired).toHaveBeenCalledTimes(1);
+  expect(onAuthRequired).toHaveBeenCalledWith('authentication required');
+});
+
+test('operational plan failure does not ask the owner to authenticate', async () => {
+  const onAuthRequired = jest.fn();
+  const onAuthUnavailable = jest.fn();
+  execMock.mockResolvedValue({ kind: 'error', error: new Error('503 unavailable'), exitCode: 2, stderr: '' });
+  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired, onAuthUnavailable }).run()).resolves.toBeNull();
+  expect(onAuthRequired).not.toHaveBeenCalled();
+  expect(onAuthUnavailable).not.toHaveBeenCalled();
+});
+
+test('credential service failure stops through its own callback without requesting login', async () => {
+  const onAuthRequired = jest.fn();
+  const onAuthUnavailable = jest.fn();
+  const error = new Error('503 AGENT_AUTH_UNAVAILABLE');
+  execMock.mockResolvedValue({
+    kind: 'error', error, exitCode: 2, stderr: error.message, authenticationUnavailable: true,
+  });
+  await expect(new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired, onAuthUnavailable }).run()).resolves.toBeNull();
+  expect(onAuthUnavailable).toHaveBeenCalledWith(error);
+  expect(onAuthRequired).not.toHaveBeenCalled();
+});
+
+test('notification failure releases plan single-flight state for a later retry', async () => {
+  const onAuthRequired = jest.fn().mockRejectedValueOnce(new Error('host unavailable')).mockResolvedValue(undefined);
+  execMock.mockResolvedValue({ kind: 'auth_required', stderr: 'authentication required' });
+  const runner = new EigenFluxHeartbeatPlanRunner({ ...config, onAuthRequired });
+  await expect(runner.run()).resolves.toBeNull();
+  await expect(runner.run()).resolves.toBeNull();
+  expect(onAuthRequired).toHaveBeenCalledTimes(2);
+});

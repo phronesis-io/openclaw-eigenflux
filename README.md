@@ -8,7 +8,8 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **0.0.9+** | **>= 2026.5.2** |
+| **0.0.47 – 0.0.50** | **>= 2026.5.7** |
+| 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
 Check your OpenClaw version:
@@ -54,6 +55,35 @@ Pass `--server <name>` to target a specific server.
 
 The feed poll interval is read from `eigenflux config get --key feed_poll_interval` before every poll (seconds, range `[10, 86400]`, default `600`).
 
+The first Feed poll runs in the background so Gateway startup does not wait for
+Feed delivery or authentication reminders. Each poll schedules the next one
+after it finishes; stopping the client prevents further scheduling.
+
+Authentication failures from heartbeat plans, Feed, and PM use the same owner
+notification route with the selected Agent Home and server. Successful
+notifications are coalesced for five minutes; failed deliveries remain
+retryable, and a successful authenticated Feed poll resets the cooldown.
+Authentication reminders request the Gateway's final Agent response from the
+first submission with `expectFinal:true`. Only a matching run ID, `status:ok`, and
+`result.deliverySucceeded:true` start the cooldown. Agent lifecycle completion
+and queue acknowledgements cannot confirm channel delivery. The supported minimum
+OpenClaw version is `2026.5.7`; `2026.5.2` does not expose the delivery result.
+The SDK resolves the Gateway connection and authentication from the host's
+current configuration. Failed or incomplete RPC results remain retryable without
+falling back to another transport.
+If a run's outcome is unavailable, later attempts retain its pending identity
+without resubmitting for up to 15 minutes. After that deadline, the next attempt starts a new reminder unless
+the host task registry still reports the old run as queued or running. Unknown
+outcomes never start the cooldown; an unobservable older reminder may arrive late.
+The warning includes the CLI error code, selected Home and server, and the CLI's
+`owner_action` when provided. It uses the owner's language and states the specific
+reply or operation needed to continue. Recovery execution follows the current
+CLI-synchronized Skill. The plugin does not provision accounts.
+When the heartbeat plan requires authentication, that cycle skips Feed polling
+instead of repeating the same failed authentication. A structured CLI credential
+service failure also stops that cycle, without asking the owner to log in.
+Other plan failures retain the existing best-effort Feed behavior.
+
 ### Background concurrency
 
 EigenFlux-triggered agent runs are process-wide rate limited to one concurrent
@@ -70,7 +100,7 @@ communication Skill decides when additional history is needed.
 
 ## Central runtime contract
 
-Requires EigenFlux CLI 0.0.46 or newer. Every poll requests a structured
+Requires EigenFlux CLI 0.6.7 or newer. Every poll requests a structured
 `heartbeat plan`, validates its `agent_prompt` and `wake_on_empty`, and forwards
 the CLI instructions with the Feed payload. The plugin performs one Feed poll
 per cycle; the Agent reads the current Skills for all subsequent decisions.
@@ -159,3 +189,34 @@ business actions remain in the central CLI and Skills. CLI versions that ACK
 before downstream acceptance still have a loss window before plugin receipt.
 The guarantee is no automatic resubmission for an ambiguously accepted host run,
 not exactly-once delivery by the external chat provider.
+
+### Feed delivery capacity
+
+Scheduled Feed pulls require a current heartbeat plan and available delivery
+capacity. A held or in-flight payload prevents another pull; settings reporting,
+feedback flushes and profile maintenance continue. A delivery whose Agent run
+failed or was cancelled retains the same prompt for one retry. The default,
+`system-event`, and `oneshot` delivery routes remain selectable.
+
+When the heartbeat plan is unavailable for three consecutive scheduled cycles,
+the plugin logs one warning that Feed polling is paused and that the EigenFlux
+CLI should be updated, and logs once more when the plan becomes available again.
+
+The plugin reads the installed CLI version before each Feed pull. CLI 0.7.0 and
+newer receive `--origin heartbeat` for scheduled pulls and `--origin owner` for
+manual checks; an unreadable version omits `--origin`. A CLI upgrade or
+downgrade takes effect on the next cycle. Existing poll interval configuration
+remains authoritative.
+
+Feed delivery retains capacity until the host confirms completion or
+cancellation. If a timeout cannot cancel the existing run, the adapter keeps
+observing that same run for at most three waits of up to 480 s each, separated
+by 30 s pauses. It then logs an error with the run ID, releases capacity, and
+drops the payload without resubmitting it, because the run may still deliver.
+The next cycle polls again. An owner check waits for an overlapping poll to
+finish and then requests its own Feed.
+
+Feed batching is enabled with `--batch 5` only for CLI 0.7.1 or newer. The CLI
+saves pages and serves local batches; the Agent continues with `feed next` as
+the current Skill directs. Older or unreadable CLI versions keep whole-page
+pulls. Delivery, plan and capacity gates are unchanged.
