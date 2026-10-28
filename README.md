@@ -204,3 +204,8 @@ by 30 s pauses. It then logs an error with the run ID, releases capacity, and
 drops the payload without resubmitting it, because the run may still deliver.
 The next cycle polls again. An owner check waits for an overlapping poll to
 finish and then requests its own Feed.
+
+Feed batching is enabled with `--batch 5` only for CLI 0.7.1 or newer. The CLI
+saves pages and serves local batches; the Agent continues with `feed next` as
+the current Skill directs. Older or unreadable CLI versions keep whole-page
+pulls. Delivery, plan and capacity gates are unchanged.

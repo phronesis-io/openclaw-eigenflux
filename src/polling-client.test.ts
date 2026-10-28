@@ -554,7 +554,7 @@ describe('scheduled Feed gates', () => {
     expect(await client.pollOnce()).toEqual({kind:'skipped',reason});
     expect(execEigenfluxMock).not.toHaveBeenCalled();expect(maintenance).toHaveBeenCalledTimes(1);
   });
-  test.each(['0.6.10','0.7.0','0.8.1','unknown'])('gates origin for CLI %s and reads the version each cycle', async version => {
+  test.each(['0.6.10','0.7.0','0.7.1','0.8.1','unknown','0.7.1-rc.1'])('gates origin for CLI %s and reads the version each cycle', async version => {
     execEigenfluxMock.mockReset().mockImplementation(async (_bin,args)=>({kind:'success',data:args[0]==='version'?{cli_version:version}:{items:[],notifications:[],has_more:false}}));
     const client=new EigenFluxPollingClient({serverName:'test',eigenfluxBin:'eigenflux',logger:createLogger(),
       resolvePollIntervalSec:async()=>60,onFeedPolled:async()=>{},onAuthRequired:async()=>{}});
@@ -562,7 +562,7 @@ describe('scheduled Feed gates', () => {
     const polls=execEigenfluxMock.mock.calls.filter(call=>call[1].includes('poll'));
     expect(polls).toHaveLength(2);
     expect(execEigenfluxMock.mock.calls.filter(call=>call[1][0]==='version')).toHaveLength(2);
-    for (const [,argv] of polls) {expect(argv.includes('--origin')).toBe(version==='0.7.0'||version==='0.8.1');if(argv.includes('--origin'))expect(argv.slice(-2)).toEqual(['--origin','heartbeat']);}
+    for (const [,argv] of polls) {expect(argv.includes('--batch')).toBe(version==='0.7.1'||version==='0.8.1'); if(argv.includes('--batch'))expect(argv[argv.indexOf('--batch')+1]).toBe('5');expect(argv.includes('--origin')).toBe(version==='0.7.0'||version==='0.7.1'||version==='0.8.1');if(argv.includes('--origin'))expect(argv.slice(-2)).toEqual(['--origin','heartbeat']);}
   });
 
   test('a CLI upgrade or downgrade between cycles flips --origin without restart', async () => {
@@ -574,10 +574,11 @@ describe('scheduled Feed gates', () => {
       execEigenfluxMock.mockClear();
       await client.pollOnce(options);
       const argv=execEigenfluxMock.mock.calls.find(call=>call[1].includes('poll'))![1];
+      expect(argv.includes('--batch')).toBe(version==='0.7.1');
       return argv.includes('--origin')?argv[argv.indexOf('--origin')+1]:null;
     };
     expect(await originOf()).toBeNull();
-    version='0.7.0';
+    version='0.7.1';
     expect(await originOf()).toBe('heartbeat');
     expect(await originOf({origin:'owner'})).toBe('owner');
     version='0.6.10';

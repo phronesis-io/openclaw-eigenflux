@@ -258,3 +258,13 @@ describe('agent prompt templates', () => {
     expect(prompt).toContain('friend request response(s)');
   });
 });
+
+test('saved batch delivery preserves metadata and points to local continuation', () => {
+  const payload = {code: 0, msg: 'ok', data: {items: [], notifications: [], has_more: false,
+    output_contract: 'contract', local_batch: {source: 'local', backlog: 10}}};
+  const context = {serverName: 'alpha', eigenfluxHome: '/tmp/.eigenflux'};
+  const prompt = buildHeartbeatExecutionPromptTemplate('plan', payload, context);
+  expect(prompt).toContain('This payload is batch 1 of a saved page (local_batch). Process further batches with feed next as the Skill directs.');
+  expect(prompt).toContain('"backlog": 10');
+  expect(prompt.indexOf('do not run another feed poll')).toBeLessThan(prompt.indexOf('This payload is batch 1'));
+});
