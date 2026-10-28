@@ -8,7 +8,7 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **0.0.47** | **>= 2026.5.7** |
+| **0.0.47 – 0.0.50** | **>= 2026.5.7** |
 | 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
