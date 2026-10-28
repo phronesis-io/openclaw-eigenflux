@@ -55,6 +55,10 @@ Pass `--server <name>` to target a specific server.
 
 The feed poll interval is read from `eigenflux config get --key feed_poll_interval` before every poll (seconds, range `[10, 86400]`, default `600`).
 
+The first Feed poll runs in the background so Gateway startup does not wait for
+Feed delivery or authentication reminders. Each poll schedules the next one
+after it finishes; stopping the client prevents further scheduling.
+
 Authentication failures from heartbeat plans, Feed, and PM use the same owner
 notification route with the selected Agent Home and server. Successful
 notifications are coalesced for five minutes; failed deliveries remain
