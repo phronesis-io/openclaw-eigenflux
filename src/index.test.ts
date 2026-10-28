@@ -65,6 +65,7 @@ const streamClientGetLastCursorMock = jest.fn().mockReturnValue(null);
 jest.mock('./stream-client', () => ({
   EigenFluxStreamClient: jest.fn().mockImplementation(() => ({
     start: streamClientStartMock,
+    adoptCLIVersion: jest.fn().mockResolvedValue(undefined),
     stop: streamClientStopMock,
     isRunning: streamClientIsRunningMock,
     getLastCursor: streamClientGetLastCursorMock,

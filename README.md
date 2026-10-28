@@ -112,6 +112,13 @@ no embedded business-rule fallback. Signed Skills are synchronized at startup
 and through heartbeat planning; valid plans refresh the OpenClaw Skills
 snapshot so updates apply to subsequent Agent turns.
 
+Heartbeat planning allows five minutes for signed CLI updates; other one-shot
+commands retain their default timeout. When the plan reports a changed CLI
+version, the existing PM stream finishes received deliveries, stops its old
+child and reads trailing stdout before launching the replacement with the same
+Home, server and cursor. Delivery and close waits are bounded; an incomplete
+handoff is logged and deferred. Legacy plans remain compatible.
+
 The existing heartbeat also invokes `profile refresh-task`, passing OpenClaw
 memory paths and recent session snippets. The CLI owns profile eligibility,
 due-time state, and follow-up instructions. Empty stdout skips delivery;

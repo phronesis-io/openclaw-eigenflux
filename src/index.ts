@@ -686,7 +686,10 @@ function createServerRuntime(
       heartbeatAuthDetail = undefined;
       heartbeatAuthUnavailable = undefined;
       currentHeartbeatPlan = await heartbeatPlanRunner.run();
-      if (currentHeartbeatPlan) await refreshOpenClawSkillsSnapshot(logger);
+      if (currentHeartbeatPlan) {
+        await streamClient.adoptCLIVersion(currentHeartbeatPlan.cli_version);
+        await refreshOpenClawSkillsSnapshot(logger);
+      }
       if (heartbeatAuthUnavailable) {
         return { kind: 'auth_unavailable' as const, error: heartbeatAuthUnavailable };
       }
@@ -723,6 +726,7 @@ function createServerRuntime(
 
   const streamClient = new EigenFluxStreamClient({
     serverName: server.name,
+    eigenfluxHome,
     eigenfluxBin: pluginConfig.eigenfluxBin,
     logger,
     onPmEvent: async (event: PmStreamEvent) => {

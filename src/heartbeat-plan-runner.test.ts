@@ -15,7 +15,7 @@ test('loads the structured plan for the stable Home and explicit server', async 
   await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(plan);
   expect(execMock).toHaveBeenCalledWith('/opt/eigenflux', [
     '--homedir', '/stable/home', '--server', 'alpha', 'heartbeat', 'plan', '--format', 'json',
-  ], { logger });
+  ], { logger, timeout: 300_000 });
 });
 
 test.each([
@@ -39,6 +39,12 @@ test('accepts the central completed-mode delivery choice without inspecting prom
 test('plan failure returns no replacement business instructions', async () => {
   execMock.mockResolvedValue({ kind: 'error', error: new Error('offline'), exitCode: 2, stderr: 'offline' });
   await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toBeNull();
+});
+
+test('preserves the replacement CLI version without requiring it from legacy plans', async () => {
+  const modern = { ...plan, cli_version: '0.6.7' };
+  execMock.mockResolvedValue({ kind: 'success', data: modern });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual(modern);
 });
 
 test('routes plan authentication failure to the host notification callback', async () => {
