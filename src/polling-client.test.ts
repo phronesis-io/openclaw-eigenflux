@@ -430,6 +430,64 @@ describe('EigenFluxPollingClient', () => {
     );
   });
 
+  test.each([false, true])('starts while the initial auth reminder is pending (stop before completion=%s)', async (stopBeforeCompletion) => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    const reminder = createDeferred<void>();
+    const onAuthRequired = jest.fn(() => reminder.promise);
+    const resolvePollIntervalSec = jest.fn().mockResolvedValue(60);
+    const client = new EigenFluxPollingClient({
+      serverName: 'local', eigenfluxBin: 'eigenflux', logger: createLogger(),
+      onHeartbeatStart: jest.fn().mockResolvedValue(false),
+      onFeedPolled: jest.fn(), onAuthRequired, resolvePollIntervalSec,
+    });
+    const started = client.start();
+    try {
+      const ready = await Promise.race([
+        started.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]);
+      expect(onAuthRequired).toHaveBeenCalledTimes(1);
+      expect(ready).toBe(true);
+      await client.start();
+      expect(onAuthRequired).toHaveBeenCalledTimes(1);
+      expect(resolvePollIntervalSec).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+
+      if (stopBeforeCompletion) client.stop();
+      reminder.resolve();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(resolvePollIntervalSec).toHaveBeenCalledTimes(stopBeforeCompletion ? 0 : 1);
+      expect(jest.getTimerCount()).toBe(stopBeforeCompletion ? 0 : 1);
+    } finally {
+      client.stop();
+      reminder.resolve();
+      await started;
+      await jest.advanceTimersByTimeAsync(0);
+      jest.useRealTimers();
+    }
+  });
+
+  test('logs an unexpected initial poll rejection and schedules the next poll', async () => {
+    jest.useFakeTimers();
+    const spies = createLoggerSpies();
+    const resolvePollIntervalSec = jest.fn().mockResolvedValue(60);
+    const client = new EigenFluxPollingClient({
+      serverName: 'local', eigenfluxBin: 'eigenflux', logger: createLogger(spies),
+      onFeedPolled: jest.fn(), onAuthRequired: jest.fn(), resolvePollIntervalSec,
+    });
+    jest.spyOn(client, 'pollOnce').mockRejectedValueOnce(new Error('initial poll failed'));
+    try {
+      await expect(client.start()).resolves.toBeUndefined();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(spies.error).toHaveBeenCalledWith(expect.stringContaining('Polling error: initial poll failed'));
+      expect(resolvePollIntervalSec).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(1);
+    } finally {
+      client.stop();
+      jest.useRealTimers();
+    }
+  });
+
   test('re-resolves pollInterval after every poll and reschedules with the new value', async () => {
     jest.useFakeTimers();
     try {
@@ -453,6 +511,7 @@ describe('EigenFluxPollingClient', () => {
       });
 
       await client.start();
+      await jest.advanceTimersByTimeAsync(0);
       // Initial poll + first scheduleNext should have consulted the resolver once.
       // Each poll cycle reads the CLI version, then polls.
       expect(resolvePollIntervalSec).toHaveBeenCalledTimes(1);
@@ -558,7 +617,10 @@ describe('scheduled Feed gates', () => {
     execEigenfluxMock.mockReset().mockImplementation(async (_bin,args)=>({kind:'success',data:args[0]==='version'?{cli_version:version}:{items:[],notifications:[],has_more:false}}));
     const client=new EigenFluxPollingClient({serverName:'test',eigenfluxBin:'eigenflux',logger:createLogger(),
       resolvePollIntervalSec:async()=>60,onFeedPolled:async()=>{},onAuthRequired:async()=>{}});
-    await client.start();client.stop();await client.pollOnce();
+    await client.start();
+    client.stop();
+    await client.pollOnce(); // Join the initial background poll.
+    await client.pollOnce();
     const polls=execEigenfluxMock.mock.calls.filter(call=>call[1].includes('poll'));
     expect(polls).toHaveLength(2);
     expect(execEigenfluxMock.mock.calls.filter(call=>call[1][0]==='version')).toHaveLength(2);

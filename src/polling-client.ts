@@ -184,10 +184,16 @@ export class EigenFluxPollingClient {
       `Starting polling client for server=${this.config.serverName}`
     );
 
-    // Initial fetch, then self-schedule subsequent polls using the interval
-    // freshly resolved from the eigenflux CLI config after each run.
-    await this.pollOnce();
-    this.scheduleNext();
+    // Delivery can wait for Gateway readiness, so it must not block service startup.
+    void this.pollOnce()
+      .catch((err) => {
+        this.config.logger.error(
+          `Polling error: ${err instanceof Error ? err.message : String(err)}`
+        );
+      })
+      .finally(() => {
+        this.scheduleNext();
+      });
   }
 
   stop(): void {

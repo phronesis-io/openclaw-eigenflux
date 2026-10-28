@@ -39,6 +39,11 @@ jest.mock('./cli-executor', () => ({
   execEigenflux: (...args: any[]) => execEigenfluxMock(...args),
 }));
 
+const sendAuthReminderMock = jest.fn();
+jest.mock('./auth-reminder-transport', () => ({
+  sendAuthReminder: (...args: any[]) => sendAuthReminderMock(...args),
+}));
+
 // Mock EigenFluxStreamClient
 const streamClientStartMock = jest.fn().mockResolvedValue(undefined);
 const streamClientStopMock = jest.fn().mockResolvedValue(undefined);
@@ -155,6 +160,42 @@ describe('register integration', () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
+  test('service starts while the first poll waits for Gateway auth reminder delivery', async () => {
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const cli = execEigenfluxMock.getMockImplementation()!;
+    execEigenfluxMock.mockImplementation((bin: string, args: string[]) =>
+      args.includes('heartbeat') && args.includes('plan')
+        ? Promise.resolve({ kind: 'auth_required', stderr: 'credentials expired' })
+        : cli(bin, args)
+    );
+    let finishReminder!: (result: Record<string, unknown>) => void;
+    sendAuthReminderMock.mockImplementation(() => new Promise((resolve) => { finishReminder = resolve; }));
+    const services: any[] = [];
+    plugin.register({
+      registrationMode: 'full', config: {}, pluginConfig: {}, runtime: {},
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    const started = services[0].start();
+    try {
+      await waitFor(() => sendAuthReminderMock.mock.calls.length === 1);
+      expect(await Promise.race([
+        started.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ])).toBe(true);
+      expect(streamClientStartMock).toHaveBeenCalledTimes(1);
+      expect(sendAuthReminderMock).toHaveBeenCalledWith(
+        expect.objectContaining({ message: expect.stringContaining('[EIGENFLUX_AUTH_REQUIRED]') }),
+        480_000
+      );
+    } finally {
+      finishReminder?.({ status: 'error' });
+      await started;
+      await services[0].stop();
+    }
+  });
+
   test.each([false, true])('empty Feed follows CLI wake_on_empty=%s while background adapters continue', async (wake) => {
     wakeOnEmpty = wake;
     feedItems = [];
@@ -169,6 +210,7 @@ describe('register integration', () => {
       registerService: (service: any) => services.push(service),
     } as any);
     await services[0].start();
+    await waitFor(() => execEigenfluxMock.mock.calls.some(([, args]) => args[0] === 'profile' && args[1] === 'refresh-task'));
     expect(subagentRun).toHaveBeenCalledTimes(wake ? 1 : 0);
     expect(execEigenfluxMock.mock.calls.some(([, args]) => args[0] === 'profile' && args[1] === 'refresh-task')).toBe(true);
     await services[0].stop();
@@ -189,6 +231,7 @@ describe('register integration', () => {
       registerService: (service: any) => services.push(service),
     } as any);
     await services[0].start();
+    await waitFor(() => subagentRun.mock.calls.length === 1);
     expect(subagentRun).toHaveBeenCalledTimes(1);
     expect(subagentRun.mock.calls[0][0]).toMatchObject({ message: profileTask, deliver: true });
     await services[0].stop();
