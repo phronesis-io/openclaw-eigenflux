@@ -4,7 +4,7 @@
  */
 
 import { execEigenflux } from './cli-executor';
-import { supportsHeartbeatOrigin } from './cli-version';
+import { supportsHeartbeatOrigin, supportsFeedBatches } from './cli-version';
 import { getInstalledCliVersion } from './config';
 import { Logger } from './logger';
 
@@ -296,10 +296,12 @@ export class EigenFluxPollingClient {
 
         this.config.logger.info(`Polling feed via CLI for server=${this.config.serverName}`);
 
-        const originSupported = await this.resolveOriginSupport();
+        const cliVersion = await this.resolveCliVersion();
+        const originSupported = supportsHeartbeatOrigin(cliVersion);
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
           ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json',
+            ...(supportsFeedBatches(cliVersion) ? ['--batch', '5'] : []),
             ...(originSupported ? ['--origin', scheduled ? 'heartbeat' : 'owner'] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
@@ -370,12 +372,12 @@ export class EigenFluxPollingClient {
     return this.activePoll;
   }
 
-  /** Read the installed CLI version for this cycle; an unreadable version omits --origin. */
-  private async resolveOriginSupport(): Promise<boolean> {
+  /** Read the installed CLI version for this cycle; an unreadable version omits optional flags. */
+  private async resolveCliVersion(): Promise<string | null> {
     try {
-      return supportsHeartbeatOrigin(await getInstalledCliVersion(this.config.eigenfluxBin, this.config.logger));
+      return await getInstalledCliVersion(this.config.eigenfluxBin, this.config.logger);
     } catch {
-      return false;
+      return null;
     }
   }
 
