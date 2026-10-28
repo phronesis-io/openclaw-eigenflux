@@ -4,12 +4,16 @@
  */
 
 import { execEigenflux } from './cli-executor';
+import { supportsHeartbeatOrigin } from './cli-version';
+import { getInstalledCliVersion } from './config';
 import { Logger } from './logger';
 
 export const POLL_INTERVAL_CONFIG_KEY = 'feed_poll_interval';
 export const DEFAULT_POLL_INTERVAL_SEC = 600;
 export const MIN_POLL_INTERVAL_SEC = 10;
 export const MAX_POLL_INTERVAL_SEC = 24 * 60 * 60;
+/** Consecutive plan_unavailable skips before the paused-Feed warning. */
+export const PLAN_UNAVAILABLE_WARN_THRESHOLD = 3;
 
 /**
  * Reads the feed poll interval (in seconds) from the eigenflux CLI config
@@ -105,6 +109,8 @@ export interface FeedResponse {
 }
 
 export interface PollingClientConfig {
+  shouldPoll?: () => boolean;
+  onPollSkipped?: () => Promise<void>;
   serverName: string;
   eigenfluxBin: string;
   /** Actual model observed for this runtime; absent until ownership is verified. */
@@ -119,7 +125,7 @@ export interface PollingClientConfig {
   onFeedPolled: (payload: FeedResponse) => Promise<void>;
   onAuthRequired: (event: AuthRequiredEvent) => Promise<void>;
   /** False requires login; auth_unavailable stops this cycle without a login prompt. */
-  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error } | { kind: 'auth_required'; stderr?: string }>;
+  onHeartbeatStart?: () => Promise<void | boolean | { kind: 'auth_unavailable'; error: Error } | { kind: 'auth_required'; stderr?: string } | { kind: 'plan_unavailable' }>;
   /**
    * Optional hook invoked once per successful poll (heartbeat), regardless of
    * whether the feed contained any items/notifications. Used for side-channel
@@ -136,6 +142,7 @@ export interface AuthRequiredEvent {
 }
 
 export type PollResult =
+  | { kind: 'skipped'; reason: 'plan_unavailable' | 'capacity' }
   | {
       kind: 'success';
       payload: FeedResponse;
@@ -150,6 +157,7 @@ export type PollResult =
     };
 
 export interface PollOnceOptions {
+  origin?: 'heartbeat' | 'owner';
   notifyFeed?: boolean;
   notifyAuthRequired?: boolean;
 }
@@ -158,6 +166,7 @@ export class EigenFluxPollingClient {
   private config: PollingClientConfig;
   private timeoutId: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private planUnavailableSkips = 0;
   private activePoll: Promise<PollResult> | null = null;
 
   constructor(config: PollingClientConfig) {
@@ -232,22 +241,36 @@ export class EigenFluxPollingClient {
   }
 
   async pollOnce(options: PollOnceOptions = {}): Promise<PollResult> {
+    if (this.activePoll && options.origin === 'owner') {
+      await this.activePoll;
+      return this.pollOnce(options);
+    }
     if (this.activePoll) {
       this.config.logger.warn('Skipping feed poll because a previous poll is still in progress');
       return this.activePoll;
     }
 
     const run = async (): Promise<PollResult> => {
+      const scheduled = options.origin !== 'owner';
+      const skipped = async (reason: 'capacity' | 'plan_unavailable'): Promise<PollResult> => {
+        this.config.logger.info(`Skipping Feed poll (${reason}) for server=${this.config.serverName}`);
+        if (reason === 'plan_unavailable') this.recordPlanUnavailable();
+        try { await this.config.onPollSkipped?.(); } catch (error) { this.config.logger.warn(String(error)); }
+        return {kind: 'skipped', reason};
+      };
       const notifyFeed = options.notifyFeed ?? true;
       const notifyAuthRequired = options.notifyAuthRequired ?? true;
 
       try {
+        if (scheduled && this.config.shouldPoll && !this.config.shouldPoll()) return skipped('capacity');
         if (this.config.onHeartbeatStart) {
           let authenticationRequired = false;
           let authenticationDetail: string | undefined;
           let authenticationError: Error | undefined;
           try {
             const start = await this.config.onHeartbeatStart();
+            if (scheduled && start && typeof start === 'object' && start.kind === 'plan_unavailable') return skipped('plan_unavailable');
+            if (start === true || start === undefined) this.recordPlanAvailable();
             authenticationRequired = start === false;
             if (start && typeof start === 'object' && start.kind === 'auth_required') {
               authenticationRequired = true;
@@ -260,6 +283,7 @@ export class EigenFluxPollingClient {
             this.config.logger.warn(
               `onHeartbeatStart hook failed for server=${this.config.serverName}: ${hookError instanceof Error ? hookError.message : String(hookError)}`
             );
+            if (scheduled) return skipped('plan_unavailable');
           }
           if (authenticationError) return { kind: 'error', error: authenticationError };
           if (authenticationRequired) {
@@ -272,9 +296,11 @@ export class EigenFluxPollingClient {
 
         this.config.logger.info(`Polling feed via CLI for server=${this.config.serverName}`);
 
+        const originSupported = await this.resolveOriginSupport();
         const result = await execEigenflux<FeedResponseData>(
           this.config.eigenfluxBin,
-          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json'],
+          ['feed', 'poll', '--limit', '20', '--action', 'refresh', '-s', this.config.serverName, '-f', 'json',
+            ...(originSupported ? ['--origin', scheduled ? 'heartbeat' : 'owner'] : [])],
           { logger: this.config.logger, env: { EIGENFLUX_MODEL: this.config.resolveModel?.() } }
         );
 
@@ -342,5 +368,33 @@ export class EigenFluxPollingClient {
       this.activePoll = null;
     });
     return this.activePoll;
+  }
+
+  /** Read the installed CLI version for this cycle; an unreadable version omits --origin. */
+  private async resolveOriginSupport(): Promise<boolean> {
+    try {
+      return supportsHeartbeatOrigin(await getInstalledCliVersion(this.config.eigenfluxBin, this.config.logger));
+    } catch {
+      return false;
+    }
+  }
+
+  private recordPlanUnavailable(): void {
+    this.planUnavailableSkips += 1;
+    if (this.planUnavailableSkips === PLAN_UNAVAILABLE_WARN_THRESHOLD) {
+      this.config.logger.warn(
+        `Feed polling is paused for server=${this.config.serverName} because the EigenFlux CLI heartbeat plan is unavailable ` +
+        `(${PLAN_UNAVAILABLE_WARN_THRESHOLD} consecutive cycles); update the EigenFlux CLI to restore Feed delivery`
+      );
+    }
+  }
+
+  private recordPlanAvailable(): void {
+    if (this.planUnavailableSkips >= PLAN_UNAVAILABLE_WARN_THRESHOLD) {
+      this.config.logger.info(
+        `Feed polling resumed for server=${this.config.serverName}: EigenFlux CLI heartbeat plan is available again`
+      );
+    }
+    this.planUnavailableSkips = 0;
   }
 }
