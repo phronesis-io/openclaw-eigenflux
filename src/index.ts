@@ -646,7 +646,7 @@ function createServerRuntime(
         return;
       }
       // Isolate background Feed work only when its reply has a real destination.
-      const isolated = mode === 'oneshot' || (!mode && await notifier.hasExternalReplyRoute());
+      const isolated = mode === 'oneshot' || (!mode && await notifier.canIsolateFeed());
       await runGuardedFeedDelivery(prompt, isolated ? { targetSessionKey: buildFeedSessionKey(server.name) } : undefined);
     },
     logger,

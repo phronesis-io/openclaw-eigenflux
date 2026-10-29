@@ -1014,6 +1014,35 @@ describe('EigenFluxNotifier', () => {
       expect(events).toEqual(['seed', 'run']);
     });
 
+    test.each([
+      { channel: 'telegram', to: '12345', id: 42, kind: 'topic' },
+      { channel: 'slack', to: 'C123', id: '1710000000.000123', kind: 'thread' },
+      { channel: 'telegram', to: '12345', id: 0, kind: 'topic' },
+    ])('isolated Feed retains $channel thread/topic $id', async ({ channel, to, id, kind }) => {
+      const thread = { id, kind, source: 'session' };
+      const patchSessionEntry = jest.fn(async (_params: any) => ({}));
+      const run = jest.fn(async (_params: any) => ({ runId: 'run-thread-feed' }));
+      const notifier = new EigenFluxNotifier(createApi({ runtime: {
+        version: '2026.9.4', subagent: { run }, agent: { session: {
+          listSessionEntries: () => [{ sessionKey: 'agent:main:main', entry: {
+            chatType: 'direct', delivery: { kind: 'external',
+              context: { channel, to, accountId: 'default', threadId: id },
+              route: { thread }, origin: { provider: channel, to } },
+          } }],
+          resolveStorePath: () => '/missing/sessions.json', patchSessionEntry,
+        } },
+      } as unknown as OpenClawPluginApi['runtime'] }), createLogger(), {
+        sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json', openclawCliBin: 'openclaw',
+      });
+      await expect(notifier.deliver('Feed', { targetSessionKey: 'eigenflux:feed:eigenflux' })).resolves.toBe(true);
+      const seeded = patchSessionEntry.mock.calls[0][0].update({}, {});
+      expect(seeded).toMatchObject({
+        deliveryContext: { threadId: id }, lastThreadId: id,
+        delivery: { context: { channel, to, threadId: id }, route: { thread }, origin: { threadId: id } },
+      });
+      expect(run.mock.calls[0][0].sessionKey).toBe(patchSessionEntry.mock.calls[0][0].sessionKey);
+    });
+
     test('writes the resolved route into the one-shot session store before the run', async () => {
       const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
       // Assert seeding happens BEFORE the run (so the deliver:true run can read it).

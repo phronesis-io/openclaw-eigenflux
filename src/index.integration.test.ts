@@ -299,21 +299,24 @@ describe('register integration', () => {
     });
     const enqueueSystemEvent = jest.fn().mockReturnValue(true);
     const requestHeartbeatNow = jest.fn();
+    const patchSessionEntry = jest.fn().mockResolvedValue({});
 
     plugin.register({
       registrationMode: 'full',
       config: {},
       pluginConfig: {},
       runtime: {
+        version: '2026.8.1',
         subagent: { run: subagentRun },
         agent: { session: {
           listSessionEntries: () => [{ sessionKey: 'agent:main:main', entry: {
             chatType: 'direct', delivery: { kind: 'external',
-              context: { channel: 'feishu', to: 'user:ou_main' },
-              origin: { provider: 'feishu', to: 'user:ou_main' } },
+              context: { channel: 'telegram', to: '12345', threadId: 42 },
+              route: { thread: { id: 42, kind: 'topic', source: 'session' } },
+              origin: { provider: 'telegram', to: '12345' } },
           } }],
           resolveStorePath: () => '/missing/sessions.json',
-          patchSessionEntry: jest.fn().mockResolvedValue({}),
+          patchSessionEntry,
         } },
         system: { enqueueSystemEvent, requestHeartbeatNow },
       },
@@ -333,8 +336,44 @@ describe('register integration', () => {
     expect(params.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(patchSessionEntry.mock.calls[0][0].update({}, {})).toMatchObject({ delivery: {
+      context: { channel: 'telegram', to: '12345', threadId: 42 },
+      route: { thread: { id: 42, kind: 'topic', source: 'session' } },
+    } });
 
     await services[0].stop();
+  });
+
+  test.each([
+    { version: '2026.5.7', sessionAPIs: false },
+    { version: '2026.7.1', sessionAPIs: true },
+    { version: undefined, sessionAPIs: true },
+    { version: '2026.9.4', sessionAPIs: false },
+  ])('default Feed keeps the original external session for host $version with sessionAPIs=$sessionAPIs', async ({ version, sessionAPIs }) => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const sessionKey = 'agent:main:telegram:direct:12345';
+    const run = jest.fn().mockResolvedValue({ runId: 'run-original-feed' });
+    const patchSessionEntry = jest.fn().mockResolvedValue({});
+    plugin.register({ registrationMode: 'full', config: {},
+      pluginConfig: { serverRouting: { eigenflux: { sessionKey, replyChannel: 'telegram', replyTo: '12345' } } },
+      runtime: { version, subagent: { run }, agent: { session: {
+        resolveStorePath: () => '/missing/sessions.json',
+        ...(sessionAPIs ? { listSessionEntries: () => [], patchSessionEntry } : {}),
+      } } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    try {
+      await services[0].start();
+      await waitFor(() => run.mock.calls.length === 1);
+      expect(run.mock.calls[0][0]).toMatchObject({ sessionKey, deliver: true, lane: 'subagent' });
+      expect(patchSessionEntry).not.toHaveBeenCalled();
+    } finally {
+      await services[0].stop();
+    }
   });
 
   test('default Feed keeps the main-session delivery when no external reply route exists', async () => {

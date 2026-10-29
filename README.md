@@ -122,8 +122,10 @@ handoff is logged and deferred. Legacy plans remain compatible.
 Update deferrals log their reason and next check time when the state changes;
 update and maintenance-reporting failures remain visible in Gateway logs.
 Hosts with SQLite session storage resolve routes through the host's read-only
-session API. Default Feed delivery uses an isolated session when an external
-reply target is available, and retains the main-session path otherwise.
+session API. Default Feed delivery uses an isolated session on OpenClaw 2026.8.1+
+with the required session APIs and an external reply target. Older or unknown
+hosts retain the original main-session path. Isolated delivery preserves the
+source thread/topic target.
 Explicit `oneshot` and `system-event` modes retain their behavior.
 
 The existing heartbeat also invokes `profile refresh-task`, passing OpenClaw

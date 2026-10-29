@@ -54,6 +54,31 @@ describe('resolveNotificationRoute', () => {
     expect(result.route.replyTo).toBeUndefined();
   });
 
+  test('canonical route ignores stale legacy thread fields', async () => {
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json' },
+      createLogger(), { readSessionStore: () => ({ 'agent:main:main': { ...sdkRoute('user:ou_main'),
+        lastThreadId: 'stale-thread', deliveryContext: { channel: 'feishu', to: 'user:ou_main', threadId: 'stale-thread' },
+      } }) });
+    expect(result.route.replyThread).toBeUndefined();
+  });
+
+  test.each(['replyChannel', 'replyTo', 'replyAccountId'] as const)('pinned %s cannot inherit another destination thread', async (field) => {
+    const result = await resolveNotificationRoute({ sessionKey: 'agent:main:main', agentId: 'main',
+      replyChannel: field === 'replyChannel' ? 'telegram' : 'feishu',
+      replyTo: field === 'replyTo' ? 'user:ou_pinned' : 'user:ou_main',
+      replyAccountId: field === 'replyAccountId' ? 'pinned-account' : 'default',
+      sessionStorePath: '/missing/sessions.json', routeOverrides: {
+        sessionKey: false, agentId: false, replyChannel: field === 'replyChannel',
+        replyTo: field === 'replyTo', replyAccountId: field === 'replyAccountId',
+      },
+    }, createLogger(), { readSessionStore: () => ({ 'agent:main:main': {
+      updatedAt: 100, delivery: { kind: 'external', context: {
+        channel: 'feishu', to: 'user:ou_main', accountId: 'default', threadId: 42,
+      } },
+    } }) });
+    expect(result.route.replyThread).toBeUndefined();
+  });
+
   test('explicit route fields remain pinned when the SDK offers a different target', async () => {
     const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json',
       replyChannel: 'feishu', replyTo: 'user:ou_pinned', routeOverrides: {

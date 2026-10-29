@@ -16,6 +16,7 @@ type DeliveryContextLike = {
   channel?: unknown;
   to?: unknown;
   accountId?: unknown;
+  threadId?: unknown;
 };
 
 type SessionOriginLike = {
@@ -23,16 +24,21 @@ type SessionOriginLike = {
   to?: unknown;
   accountId?: unknown;
   chatType?: unknown;
+  threadId?: unknown;
 };
+
+type ReplyThread = { id: string | number; kind?: string; source?: string };
 
 type SessionStoreEntry = {
   updatedAt?: unknown;
   deliveryContext?: DeliveryContextLike;
   lastTo?: unknown;
   lastAccountId?: unknown;
+  lastThreadId?: unknown;
   origin?: SessionOriginLike;
   chatType?: unknown;
-  delivery?: { kind?: unknown; context?: DeliveryContextLike; origin?: SessionOriginLike };
+  delivery?: { kind?: unknown; context?: DeliveryContextLike; origin?: SessionOriginLike;
+    route?: { thread?: { id?: unknown; kind?: unknown; source?: unknown } } };
 };
 
 type SessionStoreSnapshot = {
@@ -59,6 +65,7 @@ export type ResolvedNotificationRoute = {
   replyChannel?: string;
   replyTo?: string;
   replyAccountId?: string;
+  replyThread?: ReplyThread;
 };
 
 export type NotificationRouteSource = 'config' | 'remembered' | 'session-store' | 'default';
@@ -94,6 +101,10 @@ function readNonEmptyString(value: unknown): string | undefined {
 
 function normalizeChannel(value: unknown): string | undefined {
   return readNonEmptyString(value)?.toLowerCase();
+}
+
+function readThreadId(value: unknown): string | number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : readNonEmptyString(value);
 }
 
 function normalizeUpdatedAt(value: unknown): number {
@@ -371,6 +382,9 @@ function extractRouteFromEntry(
     readNonEmptyString(entry.deliveryContext?.accountId) ??
     readNonEmptyString(entry.lastAccountId) ??
     readNonEmptyString(entry.origin?.accountId);
+  const thread = entry.delivery?.route?.thread;
+  const threadId = readThreadId(entry.deliveryContext?.threadId) ?? readThreadId(entry.lastThreadId)
+    ?? readThreadId(entry.origin?.threadId) ?? readThreadId(thread?.id);
 
   if (!replyChannel || !replyTo) {
     return undefined;
@@ -382,6 +396,10 @@ function extractRouteFromEntry(
     replyChannel,
     replyTo,
     replyAccountId,
+    ...(threadId !== undefined ? { replyThread: { id: threadId,
+      ...(readNonEmptyString(thread?.kind) ? { kind: readNonEmptyString(thread?.kind) } : {}),
+      ...(readNonEmptyString(thread?.source) ? { source: readNonEmptyString(thread?.source) } : {}),
+    } } : {}),
   };
 }
 
@@ -488,6 +506,7 @@ function readSessionStores(
           origin: entry.delivery.kind === 'external' ? entry.delivery.origin : undefined,
           lastTo: undefined,
           lastAccountId: undefined,
+          lastThreadId: undefined,
         } : entry]));
       const keys = Object.keys(store);
       logger.info(
@@ -532,6 +551,10 @@ function mergeRoute(
       overrides.replyAccountId === true
         ? base.replyAccountId
         : resolved.replyAccountId ?? base.replyAccountId,
+    replyThread: (!overrides.replyChannel || base.replyChannel === resolved.replyChannel)
+      && (!overrides.replyTo || base.replyTo === resolved.replyTo)
+      && (!overrides.replyAccountId || base.replyAccountId === resolved.replyAccountId)
+      ? resolved.replyThread : undefined,
   };
 }
 

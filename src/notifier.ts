@@ -1,7 +1,7 @@
 import type { OrderDeliveryReceipt } from './order-notifications';
 import { createHash, randomUUID } from 'node:crypto';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
-import { type NotificationRouteOverrides } from './config';
+import { isCliOutdated, type NotificationRouteOverrides } from './config';
 import { Logger } from './logger';
 import {
   isInternalSessionKey,
@@ -284,7 +284,13 @@ export class EigenFluxNotifier {
 
   stopFeedObservation(): void { this.feedObservation.abort(); }
 
-  async hasExternalReplyRoute(): Promise<boolean> {
+  async canIsolateFeed(): Promise<boolean> {
+    const version = this.api.runtime?.version;
+    const session = this.runtime.agent?.session;
+    // Earlier hosts may expose these methods without readOnly/fallbackEntry support.
+    if (!/^\d+\.\d+\.\d+(?:-\d+)?$/.test(version ?? '') || isCliOutdated(version, '2026.8.1')
+      || typeof session?.listSessionEntries !== 'function' || typeof session.patchSessionEntry !== 'function'
+      || typeof session.resolveStorePath !== 'function' || typeof this.runtime.subagent?.run !== 'function') return false;
     const { route } = await this.resolveRoute();
     return Boolean(route.replyChannel && route.replyChannel !== 'webchat' && route.replyTo);
   }
@@ -325,6 +331,7 @@ export class EigenFluxNotifier {
         ...(baseRoute.route.replyChannel && { replyChannel: baseRoute.route.replyChannel }),
         ...(baseRoute.route.replyTo && { replyTo: baseRoute.route.replyTo }),
         ...(baseRoute.route.replyAccountId && { replyAccountId: baseRoute.route.replyAccountId }),
+        ...(baseRoute.route.replyThread && { replyThread: baseRoute.route.replyThread }),
       };
       this.logger.info(
         `Delivery route resolved: source=${persistentKey ? 'targeted-persistent' : 'targeted-oneshot'}, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
@@ -630,6 +637,7 @@ export class EigenFluxNotifier {
       channel: route.replyChannel,
       to: route.replyTo,
       ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
+      ...(route.replyThread ? { threadId: route.replyThread.id } : {}),
     };
     try {
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
@@ -647,11 +655,14 @@ export class EigenFluxNotifier {
           lastChannel: route.replyChannel,
           lastTo: route.replyTo,
           ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+          ...(route.replyThread ? { lastThreadId: route.replyThread.id } : {}),
           ...(session.listSessionEntries ? { delivery: {
             kind: 'external',
             context: deliveryContext,
-            route: { channel: deliveryContext.channel, target: { to: deliveryContext.to }, accountId: deliveryContext.accountId },
-            origin: { provider: deliveryContext.channel, to: deliveryContext.to, accountId: deliveryContext.accountId },
+            route: { channel: deliveryContext.channel, target: { to: deliveryContext.to }, accountId: deliveryContext.accountId,
+              ...(route.replyThread ? { thread: route.replyThread } : {}) },
+            origin: { provider: deliveryContext.channel, to: deliveryContext.to, accountId: deliveryContext.accountId,
+              ...(route.replyThread ? { threadId: route.replyThread.id } : {}) },
           } } : {}),
         }),
       });
