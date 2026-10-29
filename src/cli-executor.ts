@@ -106,6 +106,12 @@ export function execEigenflux<T>(
           return;
         }
 
+        // Maintenance failures may be best-effort while the command itself
+        // succeeds. Preserve only those diagnostics, not arbitrary stderr.
+        for (const line of stderr.split(/\r?\n/)) {
+          if (line.startsWith('[eigenflux:maintenance] ')) logger?.warn(line);
+        }
+
         const trimmed = stdout.trim();
         if (!trimmed) {
           resolve({
