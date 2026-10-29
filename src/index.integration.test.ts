@@ -151,8 +151,7 @@ describe('register integration', () => {
       { name: 'eigenflux', endpoint: 'http://127.0.0.1:18080', current: true },
     ] });
 
-    // These integration tests assert the legacy one-shot subagent feed path;
-    // opt into it explicitly (default is now main-session 2a).
+    // Keep explicit oneshot compatibility covered alongside the default path.
     process.env.EIGENFLUX_FEED_DELIVERY = 'oneshot';
   });
 
@@ -287,12 +286,17 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('default mode: active push — runs the subagent on the main session, not a one-shot key', async () => {
-    delete process.env.EIGENFLUX_FEED_DELIVERY; // default = classic main-session push
+  test('default Feed uses an isolated session and does not submit work against the user main session', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
     jest.resetModules();
     const { default: plugin } = await import('./index');
     const services: any[] = [];
-    const subagentRun = jest.fn().mockResolvedValue({ runId: 'run-main-session-feed' });
+    const subagentRun = jest.fn(async (params: { sessionKey: string; deliver: boolean; lane: string; message: string }) => {
+      if (!params.sessionKey.startsWith('agent:main:eigenflux:feed:eigenflux:')) {
+        throw new Error('Session "agent:main:main" changed while starting work. Retry. | SESSION_WORK_START_CHANGED');
+      }
+      return { runId: 'run-isolated-feed' };
+    });
     const enqueueSystemEvent = jest.fn().mockReturnValue(true);
     const requestHeartbeatNow = jest.fn();
 
@@ -302,6 +306,15 @@ describe('register integration', () => {
       pluginConfig: {},
       runtime: {
         subagent: { run: subagentRun },
+        agent: { session: {
+          listSessionEntries: () => [{ sessionKey: 'agent:main:main', entry: {
+            chatType: 'direct', delivery: { kind: 'external',
+              context: { channel: 'feishu', to: 'user:ou_main' },
+              origin: { provider: 'feishu', to: 'user:ou_main' } },
+          } }],
+          resolveStorePath: () => '/missing/sessions.json',
+          patchSessionEntry: jest.fn().mockResolvedValue({}),
+        } },
         system: { enqueueSystemEvent, requestHeartbeatNow },
       },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
@@ -313,15 +326,31 @@ describe('register integration', () => {
     await services[0].start();
     await waitFor(() => subagentRun.mock.calls.length === 1);
 
-    // The plugin itself initiates the run (active push) on a persistent main
-    // session — NOT a throwaway one-shot key, and NOT via system-event enqueue.
+    // Reuse the existing one-shot lifecycle while keeping channel delivery on.
     const params = subagentRun.mock.calls[0][0];
     expect(params.deliver).toBe(true);
     expect(params.lane).toBe('subagent');
-    expect(params.sessionKey).not.toMatch(/^eigenflux:feed:/);
+    expect(params.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
 
+    await services[0].stop();
+  });
+
+  test('default Feed keeps the main-session delivery when no external reply route exists', async () => {
+    delete process.env.EIGENFLUX_FEED_DELIVERY;
+    jest.resetModules();
+    const { default: plugin } = await import('./index');
+    const services: any[] = [];
+    const run = jest.fn().mockResolvedValue({ runId: 'run-main-session-feed' });
+    plugin.register({ registrationMode: 'full', config: {}, pluginConfig: {},
+      runtime: { subagent: { run } },
+      logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+      registerService: (service: any) => services.push(service),
+    } as any);
+    await services[0].start();
+    await waitFor(() => run.mock.calls.length === 1);
+    expect(run.mock.calls[0][0]).toMatchObject({ sessionKey: 'main', deliver: true, lane: 'subagent' });
     await services[0].stop();
   });
 

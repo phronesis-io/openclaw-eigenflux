@@ -4,11 +4,12 @@ import { Logger } from './logger';
 
 jest.mock('./cli-executor');
 const execMock = execEigenflux as jest.MockedFunction<typeof execEigenflux>;
-const logger = new Logger({ debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() });
+const logs = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+const logger = new Logger(logs);
 const config = { eigenfluxBin: '/opt/eigenflux', eigenfluxHome: '/stable/home', serverName: 'alpha', logger };
 const plan = { schema_version: 'eigenflux_heartbeat_plan.v1', agent_prompt: 'CENTRAL PLAN', wake_on_empty: false };
 
-beforeEach(() => execMock.mockReset());
+beforeEach(() => { execMock.mockReset(); jest.clearAllMocks(); });
 
 test('loads the structured plan for the stable Home and explicit server', async () => {
   execMock.mockResolvedValue({ kind: 'success', data: plan });
@@ -83,4 +84,41 @@ test('notification failure releases plan single-flight state for a later retry',
   await expect(runner.run()).resolves.toBeNull();
   await expect(runner.run()).resolves.toBeNull();
   expect(onAuthRequired).toHaveBeenCalledTimes(2);
+});
+
+test.each(['deferred', 'skipped', 'busy'])('logs unchanged %s decisions only once', async (status) => {
+  const cli_update = { status, phase: 'check', reason: 'check_interval', next_check_at: '2026-10-30T12:34:00+08:00' };
+  execMock.mockResolvedValue({ kind: 'success', data: { ...plan, cli_update } });
+  const runner = new EigenFluxHeartbeatPlanRunner(config);
+  await runner.run();
+  await runner.run();
+  expect(logs.info).toHaveBeenCalledTimes(1);
+  expect(logs.info).toHaveBeenCalledWith(expect.stringContaining(JSON.stringify({ server: 'alpha', ...cli_update })));
+  expect(logs.warn).not.toHaveBeenCalled();
+});
+
+test('logs a changed decision and allows the same deferral after a completed check', async () => {
+  const deferred = { status: 'deferred', reason: 'check_interval', next_check_at: '2026-10-30T12:34:00+08:00' };
+  execMock.mockResolvedValueOnce({ kind: 'success', data: { ...plan, cli_update: deferred } })
+    .mockResolvedValueOnce({ kind: 'success', data: { ...plan, cli_update: { ...deferred, next_check_at: '2026-10-31T12:34:00+08:00' } } })
+    .mockResolvedValueOnce({ kind: 'success', data: { ...plan, cli_update: { status: 'current' } } })
+    .mockResolvedValueOnce({ kind: 'success', data: { ...plan, cli_update: deferred } });
+  const runner = new EigenFluxHeartbeatPlanRunner(config);
+  for (let i = 0; i < 4; i++) await runner.run();
+  expect(logs.info).toHaveBeenCalledTimes(3);
+});
+
+test.each(['failed', 'unconfigured'])('warns on %s even when the plan succeeded', async (status) => {
+  const cli_update = { status, phase: 'verify', reason: 'invalid_signature', error: 'untrusted private diagnostic' };
+  execMock.mockResolvedValue({ kind: 'success', data: { ...plan, cli_update } });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual({ ...plan, cli_update });
+  expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining(JSON.stringify({ server: 'alpha', status, phase: 'verify', reason: 'invalid_signature' })));
+  expect(JSON.stringify(logs.warn.mock.calls)).not.toContain('untrusted private diagnostic');
+});
+
+test.each([undefined, null, 'legacy', {}, { status: 12 }])('ignores absent or malformed optional update diagnostics: %j', async (cli_update) => {
+  execMock.mockResolvedValue({ kind: 'success', data: { ...plan, cli_update } });
+  await expect(new EigenFluxHeartbeatPlanRunner(config).run()).resolves.toEqual({ ...plan, cli_update });
+  expect(logs.warn).not.toHaveBeenCalled();
+  expect(logs.info).not.toHaveBeenCalled();
 });

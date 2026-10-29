@@ -31,6 +31,55 @@ describe('resolveNotificationRoute', () => {
     readStoredNotificationRouteMock.mockResolvedValue(undefined);
   });
 
+  const sdkRoute = (to: string, updatedAt = 100) => ({
+    updatedAt, chatType: 'direct',
+    delivery: { kind: 'external', context: { channel: 'feishu', to, accountId: 'default' },
+      origin: { provider: 'feishu', to, chatType: 'direct' } },
+  });
+
+  test('reads canonical host routes without requiring a legacy sessions.json file', async () => {
+    const readSessionStore = jest.fn(() => ({ 'agent:main:main': sdkRoute('user:ou_main') }));
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json' },
+      createLogger(), { readSessionStore });
+    expect(readSessionStore).toHaveBeenCalledWith('main', '/missing/sessions.json');
+    expect(result.route).toMatchObject({ agentId: 'main', replyChannel: 'feishu', replyTo: 'user:ou_main' });
+  });
+
+  test('SDK discovery cannot adopt another agent route or remembered target', async () => {
+    readStoredNotificationRouteMock.mockResolvedValue({ sessionKey: 'agent:other:main', agentId: 'other',
+      replyChannel: 'feishu', replyTo: 'user:ou_other' });
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json' },
+      createLogger(), { readSessionStore: () => ({ 'agent:other:main': sdkRoute('user:ou_other', 999) }) });
+    expect(result.source).toBe('default');
+    expect(result.route.replyTo).toBeUndefined();
+  });
+
+  test('explicit route fields remain pinned when the SDK offers a different target', async () => {
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json',
+      replyChannel: 'feishu', replyTo: 'user:ou_pinned', routeOverrides: {
+        sessionKey: false, agentId: false, replyChannel: true, replyTo: true, replyAccountId: false,
+      } },
+      createLogger(), { readSessionStore: () => ({ 'agent:main:main': sdkRoute('user:ou_other') }) });
+    expect(result.source).toBe('config');
+    expect(result.route.replyTo).toBe('user:ou_pinned');
+  });
+
+  test('same-agent remembered route stays ahead of a fresher SDK target', async () => {
+    readStoredNotificationRouteMock.mockResolvedValue({ sessionKey: 'agent:main:saved', agentId: 'main',
+      replyChannel: 'feishu', replyTo: 'user:ou_saved' });
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json' },
+      createLogger(), { readSessionStore: () => ({ 'agent:main:main': sdkRoute('user:ou_other', 999) }) });
+    expect(result.source).toBe('remembered');
+    expect(result.route.replyTo).toBe('user:ou_saved');
+  });
+
+  test('canonical non-delivery state does not revive stale legacy delivery fields', async () => {
+    const result = await resolveNotificationRoute({ sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json' },
+      createLogger(), { readSessionStore: () => ({ 'agent:main:feishu:direct:ou_stale': { ...sdkRoute('user:ou_stale'),
+        deliveryContext: { channel: 'feishu', to: 'user:ou_stale' }, delivery: { kind: 'none' } } }) });
+    expect(result.route.replyTo).toBeUndefined();
+  });
+
   test('prefers remembered session route over dynamically fresher session when config is automatic', async () => {
     const workdir = fs.mkdtempSync(path.join(os.tmpdir(), 'eigenflux-route-memory-'));
     const sessionStorePath = path.join(workdir, 'sessions.json');

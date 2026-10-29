@@ -61,6 +61,11 @@ type EigenFluxRuntimeApi = {
         sessionKey: string;
         storePath?: string;
       }) => SessionStoreEntryLike | undefined;
+      listSessionEntries?: (params: {
+        agentId: string;
+        storePath?: string;
+        readOnly: true;
+      }) => Array<{ sessionKey: string; entry: SessionStoreEntryLike }>;
       /** Row-scoped write: patch a single session entry by identity. Replaces the
        *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
        *  `sdk-session-store-write`). Merges the returned partial into the entry. */
@@ -68,6 +73,7 @@ type EigenFluxRuntimeApi = {
         agentId?: string;
         sessionKey: string;
         storePath?: string;
+        fallbackEntry?: SessionStoreEntryLike;
         update: (
           entry: SessionStoreEntryLike,
           context: { existingEntry?: SessionStoreEntryLike }
@@ -278,6 +284,11 @@ export class EigenFluxNotifier {
 
   stopFeedObservation(): void { this.feedObservation.abort(); }
 
+  async hasExternalReplyRoute(): Promise<boolean> {
+    const { route } = await this.resolveRoute();
+    return Boolean(route.replyChannel && route.replyChannel !== 'webchat' && route.replyTo);
+  }
+
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
     const serializationKey =
       options?.persistentSessionKey ?? options?.targetSessionKey ?? this.config.sessionKey;
@@ -305,7 +316,9 @@ export class EigenFluxNotifier {
       // then override the sessionKey with a one-shot key to avoid context accumulation.
       const baseRoute = await this.resolveRoute();
 
-      const sessionKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const isolatedKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const sessionKey = targetKey && this.runtime.agent?.session?.listSessionEntries && !isolatedKey.startsWith('agent:')
+        ? `agent:${baseRoute.route.agentId}:${isolatedKey}` : isolatedKey;
       const route: ResolvedNotificationRoute = {
         sessionKey,
         agentId: baseRoute.route.agentId,
@@ -321,9 +334,10 @@ export class EigenFluxNotifier {
       // subagent resolves its reply target from the session store (it cannot be passed
       // through subagent.run), and a fresh one-shot session has none — without this the
       // run fails with Feishu "requires target" (missing target). Skip when silent
-      // (no channel reply) since there is nothing to route. Best-effort.
+      // (no channel reply). New-host Feed submission requires a persisted target.
       if (!silent) {
-        await this.seedOneShotDeliveryContext(sessionKey, route);
+        const seeded = await this.seedOneShotDeliveryContext(sessionKey, route);
+        if (targetKey && this.runtime.agent?.session?.listSessionEntries && !seeded) return false;
       }
 
       // Isolated delivery uses only runtime.subagent. Current command/heartbeat
@@ -598,19 +612,19 @@ export class EigenFluxNotifier {
   private async seedOneShotDeliveryContext(
     sessionKey: string,
     route: ResolvedNotificationRoute
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (!route.replyChannel || !route.replyTo) {
       this.logger.warn(
         `Cannot seed deliveryContext for one-shot session ${sessionKey}: route has no channel/to`
       );
-      return;
+      return false;
     }
     const session = this.runtime.agent?.session;
     if (typeof session?.resolveStorePath !== 'function' || typeof session?.patchSessionEntry !== 'function') {
       this.logger.warn(
         'runtime.agent.session store API unavailable; cannot seed deliveryContext for one-shot session'
       );
-      return;
+      return false;
     }
     const deliveryContext = {
       channel: route.replyChannel,
@@ -622,24 +636,38 @@ export class EigenFluxNotifier {
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
       // Row-scoped write (patchSessionEntry) instead of the deprecated whole-store
       // updateSessionStore: patch merges the returned partial into just this entry.
-      await session.patchSessionEntry({
+      const patched = await session.patchSessionEntry({
         agentId: route.agentId,
         sessionKey,
         storePath,
+        ...(session.listSessionEntries && /(^|:)eigenflux:feed:/.test(sessionKey)
+          ? { fallbackEntry: { sessionId: randomUUID(), updatedAt: Date.now() } } : {}),
         update: () => ({
           deliveryContext,
           lastChannel: route.replyChannel,
           lastTo: route.replyTo,
           ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+          ...(session.listSessionEntries ? { delivery: {
+            kind: 'external',
+            context: deliveryContext,
+            route: { channel: deliveryContext.channel, target: { to: deliveryContext.to }, accountId: deliveryContext.accountId },
+            origin: { provider: deliveryContext.channel, to: deliveryContext.to, accountId: deliveryContext.accountId },
+          } } : {}),
         }),
       });
+      if (session.listSessionEntries && !patched) {
+        this.logger.warn('Host did not persist the isolated session delivery context');
+        return false;
+      }
       this.logger.info(
         `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
       );
+      return true;
     } catch (error) {
       this.logger.warn(
         `Failed to seed deliveryContext for one-shot session ${sessionKey}: ${formatError(error)}`
       );
+      return false;
     }
   }
 
@@ -1053,10 +1081,13 @@ export class EigenFluxNotifier {
   private async resolveRoute(
     options: { ignoreRemembered?: boolean } = {}
   ): Promise<ResolvedNotificationRouteResult> {
+    const session = this.runtime.agent?.session;
     return resolveNotificationRoute(
       this.config as NotificationRouteConfig,
       this.logger,
-      options
+      { ...options, ...(session?.listSessionEntries ? { readSessionStore: (agentId: string, storePath: string) =>
+        Object.fromEntries(session.listSessionEntries!({ agentId, storePath, readOnly: true })
+          .map(({ sessionKey, entry }) => [sessionKey, entry])) } : {}) }
     );
   }
 

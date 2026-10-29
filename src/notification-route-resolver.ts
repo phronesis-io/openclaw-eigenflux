@@ -32,6 +32,7 @@ type SessionStoreEntry = {
   lastAccountId?: unknown;
   origin?: SessionOriginLike;
   chatType?: unknown;
+  delivery?: { kind?: unknown; context?: DeliveryContextLike; origin?: SessionOriginLike };
 };
 
 type SessionStoreSnapshot = {
@@ -69,6 +70,7 @@ export type ResolvedNotificationRouteResult = {
 
 export type NotificationRouteResolveOptions = {
   ignoreRemembered?: boolean;
+  readSessionStore?: (agentId: string, storePath: string) => Record<string, SessionStoreEntry>;
 };
 
 type PreferredRoute = {
@@ -460,7 +462,8 @@ function readSessionStore(
 function readSessionStores(
   sessionStorePath: string | undefined,
   baseAgentId: string,
-  logger: Logger
+  logger: Logger,
+  reader?: NotificationRouteResolveOptions['readSessionStore']
 ): SessionStoreSnapshot[] {
   const snapshots: SessionStoreSnapshot[] = [];
   const candidates = listSessionStorePaths(sessionStorePath, baseAgentId);
@@ -468,11 +471,27 @@ function readSessionStores(
     `Session store scan candidates: base_agent_id=${baseAgentId}, explicit_path=${sessionStorePath ?? 'n/a'}, candidates=${JSON.stringify(candidates)}`
   );
   for (const candidate of candidates) {
-    const store = readSessionStore(candidate, logger);
+    if (reader && (tryDeriveAgentIdFromStorePath(candidate) ?? baseAgentId) !== baseAgentId) continue;
+    let store: Record<string, SessionStoreEntry> | undefined;
+    try {
+      store = reader ? reader(baseAgentId, candidate) : readSessionStore(candidate, logger);
+    } catch {
+      logger.warn('Host session route snapshot unavailable');
+    }
     if (store) {
+      store = Object.fromEntries(Object.entries(store)
+        .filter(([key, entry]) => (!reader || (deriveAgentIdFromSessionKey(key) ?? baseAgentId) === baseAgentId)
+          && (!entry?.delivery || entry.delivery.kind === 'external'))
+        .map(([key, entry]) => [key, entry?.delivery ? {
+          ...entry,
+          deliveryContext: entry.delivery.kind === 'external' ? entry.delivery.context : undefined,
+          origin: entry.delivery.kind === 'external' ? entry.delivery.origin : undefined,
+          lastTo: undefined,
+          lastAccountId: undefined,
+        } : entry]));
       const keys = Object.keys(store);
       logger.info(
-        `Session store loaded: path=${candidate}, entries=${keys.length}, session_keys=${JSON.stringify(keys)}`
+        `Session store loaded: source=${reader ? 'host-sdk' : 'legacy-json'}, entries=${keys.length}`
       );
       snapshots.push({ path: candidate, store });
     }
@@ -717,7 +736,7 @@ export async function resolveNotificationRoute(
     !isInternalSessionKey(configRoute.sessionKey) ||
     Boolean(configRoute.replyChannel && configRoute.replyTo);
   if (hasExplicitConfig) {
-    const snapshots = readSessionStores(config.sessionStorePath, configRoute.agentId, logger);
+    const snapshots = readSessionStores(config.sessionStorePath, configRoute.agentId, logger, options.readSessionStore);
     // Try exact sessionKey match first. If config sessionKey is internal but
     // channel+to are pinned, fall back to peer-shape match to enrich accountId
     // (and pick up the real sessionKey) from the session store.
@@ -743,7 +762,7 @@ export async function resolveNotificationRoute(
     return { route: resolved, source: 'config' };
   }
 
-  const snapshots = readSessionStores(config.sessionStorePath, configRoute.agentId, logger);
+  const snapshots = readSessionStores(config.sessionStorePath, configRoute.agentId, logger, options.readSessionStore);
 
   // 2. Remembered route (openclaw_deliver_session CLI config).
   if (options.ignoreRemembered !== true) {
@@ -752,7 +771,7 @@ export async function resolveNotificationRoute(
       config.serverName,
       logger
     );
-    if (remembered) {
+    if (remembered && (!options.readSessionStore || remembered.agentId === configRoute.agentId)) {
       logger.info(
         `Route resolve remembered: session_key=${remembered.sessionKey}, agent_id=${remembered.agentId}, channel=${remembered.replyChannel ?? 'n/a'}, to=${remembered.replyTo ?? 'n/a'}, account=${remembered.replyAccountId ?? 'n/a'}`
       );

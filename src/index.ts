@@ -639,10 +639,16 @@ function createServerRuntime(
   const feedPushScheduler = new FeedPushScheduler({
     isBusy: async () =>
       feedDeliveryInFlight || (!process.env.EIGENFLUX_FEED_DELIVERY && await notifier.isMainRouteBusy(FEED_RECENT_ACTIVITY_MS)),
-    pushNow: (prompt) => process.env.EIGENFLUX_FEED_DELIVERY === 'system-event'
-      ? notifier.deliverToMainSession(prompt).then(delivered => { if (!delivered) throw new Error('Main-session delivery was not accepted'); })
-      : runGuardedFeedDelivery(prompt, process.env.EIGENFLUX_FEED_DELIVERY === 'oneshot'
-          ? { targetSessionKey: buildFeedSessionKey(server.name) } : undefined),
+    pushNow: async (prompt) => {
+      const mode = process.env.EIGENFLUX_FEED_DELIVERY;
+      if (mode === 'system-event') {
+        if (!await notifier.deliverToMainSession(prompt)) throw new Error('Main-session delivery was not accepted');
+        return;
+      }
+      // Isolate background Feed work only when its reply has a real destination.
+      const isolated = mode === 'oneshot' || (!mode && await notifier.hasExternalReplyRoute());
+      await runGuardedFeedDelivery(prompt, isolated ? { targetSessionKey: buildFeedSessionKey(server.name) } : undefined);
+    },
     logger,
     serverName: server.name,
   });

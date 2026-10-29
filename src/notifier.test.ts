@@ -776,6 +776,24 @@ describe('EigenFluxNotifier', () => {
     expect(callArgs.deliver).toBe(true);
   });
 
+  test('a host session identity rejection remains a failed isolated Feed delivery without main-session fallback', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-session-conflict' });
+    const waitForRun = jest.fn().mockResolvedValue({
+      status: 'error', error: 'Session changed while starting work. Retry. | SESSION_WORK_START_CHANGED',
+    });
+    const enqueueSystemEvent = jest.fn();
+    const notifier = new EigenFluxNotifier(createApi({ runtime: {
+      subagent: { run, waitForRun }, system: { enqueueSystemEvent },
+    } as unknown as OpenClawPluginApi['runtime'] }), createLogger(), createConfig());
+
+    await expect(notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux', lane: 'subagent',
+    })).resolves.toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0].sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+  });
+
   test('uses a stable persistent PM session and conversation-specific lane without cleanup', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-pm' });
     const deleteSession = jest.fn().mockResolvedValue(undefined);
@@ -951,6 +969,51 @@ describe('EigenFluxNotifier', () => {
   });
 
   describe('seeds deliveryContext for one-shot feed sessions', () => {
+    test.each([null, undefined])('does not submit Feed or claim seeding succeeded when the new host returns %j', async (receipt) => {
+      const run = jest.fn();
+      const logs = { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+      const notifier = new EigenFluxNotifier(createApi({ runtime: {
+        agent: { session: { listSessionEntries: () => [], resolveStorePath: () => '/missing/sessions.json',
+          patchSessionEntry: jest.fn().mockResolvedValue(receipt) } }, subagent: { run },
+      } as unknown as OpenClawPluginApi['runtime'] }), new Logger(logs), createConfig());
+      await expect(notifier.deliver('Feed', { targetSessionKey: 'eigenflux:feed:eigenflux', lane: 'subagent' })).resolves.toBe(false);
+      expect(run).not.toHaveBeenCalled();
+      expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining('Host did not persist'));
+      expect(JSON.stringify(logs.info.mock.calls)).not.toContain('Seeded deliveryContext');
+    });
+
+    test('new host snapshots supply the Feed route and seed a canonical new session before submission', async () => {
+      const events: string[] = [];
+      const listSessionEntries = jest.fn(() => [{ sessionKey: 'agent:main:main', entry: {
+        chatType: 'direct', delivery: { kind: 'external',
+          context: { channel: 'feishu', to: 'user:ou_main', accountId: 'default' },
+          origin: { provider: 'feishu', to: 'user:ou_main' } },
+      } }]);
+      const patchSessionEntry = jest.fn(async (_params: any) => { events.push('seed'); return {}; });
+      const run = jest.fn(async (_params: any) => { events.push('run'); return { runId: 'run-new-host' }; });
+      const notifier = new EigenFluxNotifier(createApi({ runtime: {
+        agent: { session: { listSessionEntries, patchSessionEntry, resolveStorePath: () => '/missing/sessions.json' } },
+        subagent: { run },
+      } as unknown as OpenClawPluginApi['runtime'] }), createLogger(), {
+        sessionKey: 'main', agentId: 'main', sessionStorePath: '/missing/sessions.json', openclawCliBin: 'openclaw',
+      });
+
+      await expect(notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+        targetSessionKey: 'eigenflux:feed:eigenflux', lane: 'subagent',
+      })).resolves.toBe(true);
+      expect(listSessionEntries).toHaveBeenCalledWith({ agentId: 'main', storePath: '/missing/sessions.json', readOnly: true });
+      const seed = patchSessionEntry.mock.calls[0][0];
+      expect(seed.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:/);
+      expect(seed.fallbackEntry).toEqual({ sessionId: expect.any(String), updatedAt: expect.any(Number) });
+      expect(seed.update({}, {})).toMatchObject({
+        delivery: { kind: 'external', context: { channel: 'feishu', to: 'user:ou_main' },
+          route: { channel: 'feishu', target: { to: 'user:ou_main' } } },
+        deliveryContext: { channel: 'feishu', to: 'user:ou_main' },
+      });
+      expect(run.mock.calls[0][0]).toMatchObject({ sessionKey: seed.sessionKey, deliver: true });
+      expect(events).toEqual(['seed', 'run']);
+    });
+
     test('writes the resolved route into the one-shot session store before the run', async () => {
       const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
       // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
