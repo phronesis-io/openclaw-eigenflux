@@ -13,7 +13,7 @@ function transport(run: jest.Mock, waitForRun: jest.Mock, fallback = jest.fn()) 
   const notifier = new EigenFluxNotifier({ runtime: { subagent: { run, waitForRun }, system: { runCommandWithTimeout: fallback } }, config: {} } as any, logger,
     { sessionKey: 'main', agentId: 'main', openclawCliBin: 'openclaw' });
   jest.spyOn(notifier as any, 'resolveRoute').mockResolvedValue({ route: { agentId: 'main', sessionKey: 'main', replyChannel: 'feishu', replyTo: 'test' } });
-  jest.spyOn(notifier as any, 'seedOneShotDeliveryContext').mockResolvedValue(undefined);
+  jest.spyOn(notifier as any, 'seedOneShotDeliveryContext').mockResolvedValue(true);
   return (item: any, receipt: any, checkpoint: any) => notifier.deliverOrder('order payload', { key: 'server:agent:' + item.notification_id, receipt, checkpoint });
 }
 

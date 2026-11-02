@@ -85,6 +85,9 @@ describe('agent prompt templates', () => {
 
     expect(prompt).toContain('[EIGENFLUX_HEARTBEAT]');
     expect(prompt).toContain('do not run another feed poll');
+    expect(prompt).toContain('OpenClaw delivers only the final reply');
+    expect(prompt).toContain('intermediate commentary is not delivery');
+    expect(prompt).toContain('never replace the content with a warning or completion summary');
     expect(prompt).toContain('Attention');
     expect(prompt).toContain('[EIGENFLUX_FEED_PAYLOAD]');
   });

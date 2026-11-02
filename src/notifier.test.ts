@@ -14,6 +14,36 @@ jest.mock('./session-route-memory', () => ({
 import { EigenFluxNotifier } from './notifier';
 import { UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
 
+const sessionStoreSdkMock: {
+  updateLastRoute?: jest.Mock;
+  deliveryContextFromSession?: jest.Mock;
+} = {};
+jest.mock('openclaw/plugin-sdk/session-store-runtime', () => sessionStoreSdkMock);
+
+beforeEach(() => {
+  sessionStoreSdkMock.updateLastRoute = undefined;
+  sessionStoreSdkMock.deliveryContextFromSession = undefined;
+});
+
+function createSessionStore() {
+  const entries = new Map<string, any>();
+  return {
+    entries,
+    resolveStorePath: jest.fn(() => '/tmp/sessions/main.json'),
+    getSessionEntry: jest.fn(({ sessionKey }: any) => entries.get(sessionKey)),
+    patchSessionEntry: jest.fn(async (params: any) => {
+      const existingEntry = entries.get(params.sessionKey);
+      const entry = existingEntry ?? params.fallbackEntry;
+      if (!entry) return null;
+      const patch = await params.update(entry, { existingEntry });
+      if (!patch) return null;
+      const updated = { ...entry, ...patch };
+      entries.set(params.sessionKey, updated);
+      return updated;
+    }),
+  };
+}
+
 function createLogger(): Logger {
   return new Logger({
     info: jest.fn(),
@@ -30,7 +60,6 @@ function createApi(overrides: Partial<OpenClawPluginApi> = {}): OpenClawPluginAp
     source: '/tmp/eigenflux',
     config: {},
     pluginConfig: {},
-    runtime: {} as unknown as OpenClawPluginApi['runtime'],
     logger: {
       info: jest.fn(),
       warn: jest.fn(),
@@ -39,6 +68,7 @@ function createApi(overrides: Partial<OpenClawPluginApi> = {}): OpenClawPluginAp
     },
     registerService: jest.fn(),
     ...overrides,
+    runtime: { agent: { session: createSessionStore() }, ...overrides.runtime },
   } as unknown as OpenClawPluginApi;
 }
 
@@ -950,77 +980,112 @@ describe('EigenFluxNotifier', () => {
     expect(deleteSession).toHaveBeenCalledTimes(1);
   });
 
-  describe('seeds deliveryContext for one-shot feed sessions', () => {
-    test('writes the resolved route into the one-shot session store before the run', async () => {
-      const run = jest.fn().mockResolvedValue({ runId: 'run-seed' });
-      // Assert seeding happens BEFORE the run (so the deliver:true run can read it).
-      const callOrder: string[] = [];
-      const patchSessionEntry = jest.fn(async (_params: any) => {
-        callOrder.push('seed');
-        return null;
-      });
-      const resolveStorePath = jest.fn(() => '/tmp/sessions/main.json');
-
-      run.mockImplementationOnce(async (_params: any) => {
-        callOrder.push('run');
-        return { runId: 'run-seed' };
-      });
-
-      const notifier = new EigenFluxNotifier(
-        createApi({
-          config: { session: { store: 'sessions' } } as any,
-          runtime: {
-            subagent: { run },
-            agent: { session: { resolveStorePath, patchSessionEntry } },
-          } as unknown as OpenClawPluginApi['runtime'],
-        }),
-        createLogger(),
-        { ...createConfig(), replyAccountId: 'default' }
-      );
-
-      await expect(
-        notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] x', { targetSessionKey: 'eigenflux:feed:eigenflux' })
-      ).resolves.toBe(true);
-
-      expect(resolveStorePath).toHaveBeenCalledWith('sessions', { agentId: 'main' });
-      expect(patchSessionEntry).toHaveBeenCalledTimes(1);
-
-      // Row-scoped patch targets the one-shot key and merges deliveryContext (+ last* mirror).
-      const params = patchSessionEntry.mock.calls[0][0];
-      const sessionKey = run.mock.calls[0][0].sessionKey;
-      expect(sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
-      expect(params.sessionKey).toBe(sessionKey);
-      expect(params.agentId).toBe('main');
-      expect(params.storePath).toBe('/tmp/sessions/main.json');
-      const patch = params.update({}, { existingEntry: undefined });
-      expect(patch).toMatchObject({
-        deliveryContext: { channel: 'feishu', to: 'user:ou_123', accountId: 'default' },
-        lastChannel: 'feishu',
-        lastTo: 'user:ou_123',
-        lastAccountId: 'default',
-      });
-
-      expect(callOrder).toEqual(['seed', 'run']);
+  describe('seeds deliveryContext for isolated sessions', () => {
+    test('fake store does not patch a missing entry without fallbackEntry', async () => {
+      const store = createSessionStore();
+      const update = jest.fn(() => ({ lastTo: 'user:ou_123' }));
+      expect(await store.patchSessionEntry({ sessionKey: 'missing', update })).toBeNull();
+      expect(update).not.toHaveBeenCalled();
+      expect(store.getSessionEntry({ sessionKey: 'missing' })).toBeUndefined();
     });
 
-    test('delivery still proceeds when the session-store API is unavailable', async () => {
-      const run = jest.fn().mockResolvedValue({ runId: 'run-no-seed' });
+    test.each(['new', 'legacy'])('%s host writes and verifies the route before running', async (host) => {
+      const store = createSessionStore();
+      if (host === 'new') {
+        sessionStoreSdkMock.updateLastRoute = jest.fn(async ({ sessionKey, storePath, ...context }) => {
+          store.entries.set(sessionKey, { delivery: { kind: 'external', context } });
+        });
+        sessionStoreSdkMock.deliveryContextFromSession = jest.fn(entry => entry?.delivery?.context);
+      }
+      const run = jest.fn(async ({ sessionKey }) => {
+        const entry = store.entries.get(sessionKey);
+        expect(entry?.delivery?.context ?? entry?.deliveryContext).toEqual({
+          channel: 'feishu', to: 'user:ou_123', accountId: 'default',
+        });
+        expect(store.getSessionEntry).toHaveBeenCalledWith({
+          agentId: 'main', sessionKey, storePath: '/tmp/sessions/main.json',
+        });
+        return { runId: 'run-seed' };
+      });
+      const logger = createLogger();
+      const info = jest.spyOn(logger, 'info');
+      const notifier = new EigenFluxNotifier(createApi({
+        config: { session: { store: 'sessions' } } as any,
+        runtime: { subagent: { run }, agent: { session: store } } as any,
+      }), logger, { ...createConfig(), replyAccountId: 'default' });
 
-      const notifier = new EigenFluxNotifier(
-        createApi({
-          runtime: {
-            subagent: { run },
-            // no runtime.agent.session
-          } as unknown as OpenClawPluginApi['runtime'],
-        }),
-        createLogger(),
-        createConfig()
-      );
+      await expect(notifier.deliver('payload', { targetSessionKey: 'eigenflux:feed:eigenflux' })).resolves.toBe(true);
+      expect(store.resolveStorePath).toHaveBeenCalledWith('sessions', { agentId: 'main' });
+      const sessionKey = run.mock.calls[0][0].sessionKey;
+      if (host === 'new') {
+        expect(sessionStoreSdkMock.updateLastRoute).toHaveBeenCalledWith({
+          storePath: '/tmp/sessions/main.json', sessionKey,
+          channel: 'feishu', to: 'user:ou_123', accountId: 'default',
+        });
+        expect(store.patchSessionEntry).not.toHaveBeenCalled();
+        expect(sessionStoreSdkMock.deliveryContextFromSession).toHaveBeenCalledWith(store.entries.get(sessionKey));
+      } else {
+        expect(store.patchSessionEntry).toHaveBeenCalledTimes(1);
+        expect(store.patchSessionEntry.mock.calls[0][0].fallbackEntry).toEqual({
+          sessionId: expect.any(String), updatedAt: expect.any(Number),
+        });
+        expect(store.entries.get(sessionKey)).toMatchObject({
+          lastChannel: 'feishu', lastTo: 'user:ou_123', lastAccountId: 'default',
+        });
+      }
+      expect(info).toHaveBeenCalledWith(expect.stringContaining('Seeded deliveryContext'));
+    });
 
-      await expect(
-        notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] y', { targetSessionKey: 'eigenflux:feed:eigenflux' })
-      ).resolves.toBe(true);
+    test.each(['pm', 'friend', 'order'])('%s does not run or checkpoint when verification fails, and can retry', async (kind) => {
+      const store = createSessionStore();
+      store.getSessionEntry.mockReturnValueOnce(undefined);
+      const run = jest.fn().mockResolvedValue({ runId: 'run-retry' });
+      const checkpoint = jest.fn();
+      const logger = createLogger();
+      const error = jest.spyOn(logger, 'error');
+      const info = jest.spyOn(logger, 'info');
+      const notifier = new EigenFluxNotifier(createApi({ runtime: {
+        subagent: { run, waitForRun: jest.fn().mockResolvedValue({ status: 'ok' }) },
+        agent: { session: store },
+      } as any }), logger, createConfig());
+      const deliver = () => kind === 'order'
+        ? notifier.deliverOrder('order', { key: 'order-1', receipt: { status: 'queued' }, checkpoint })
+        : notifier.deliver(kind, { persistentSessionKey: `agent:main:eigenflux:${kind}:1` });
+
+      await expect(deliver()).resolves.toBe(false);
+      expect(run).not.toHaveBeenCalled();
+      expect(checkpoint).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(expect.stringContaining('read-back did not confirm'));
+      expect(info).not.toHaveBeenCalledWith(expect.stringContaining('Seeded'));
+      await expect(deliver()).resolves.toBe(true);
       expect(run).toHaveBeenCalledTimes(1);
+    });
+
+    test.each(['missing API', 'null write', 'write error', 'stale target', 'legacy fields on new host'])(
+      'blocks delivery for %s', async (failure) => {
+        const store = createSessionStore();
+        if (failure === 'null write') store.patchSessionEntry.mockResolvedValue(null);
+        if (failure === 'write error') store.patchSessionEntry.mockRejectedValue(new Error('write failed'));
+        if (failure === 'stale target') store.getSessionEntry.mockReturnValue({ deliveryContext: { channel: 'feishu', to: 'wrong' } });
+        if (failure === 'legacy fields on new host') {
+          sessionStoreSdkMock.deliveryContextFromSession = jest.fn(entry => entry?.delivery?.context);
+        }
+        const run = jest.fn();
+        const notifier = new EigenFluxNotifier(createApi({ runtime: {
+          subagent: { run }, agent: failure === 'missing API' ? undefined : { session: store },
+        } as any }), createLogger(), createConfig());
+        await expect(notifier.deliver('payload', { targetSessionKey: 'eigenflux:feed:test' })).resolves.toBe(false);
+        expect(run).not.toHaveBeenCalled();
+      }
+    );
+
+    test('silent isolated runs do not require a delivery target or store', async () => {
+      const run = jest.fn().mockResolvedValue({ runId: 'silent' });
+      const notifier = new EigenFluxNotifier(createApi({ runtime: {
+        subagent: { run }, agent: undefined,
+      } as any }), createLogger(), createConfig());
+      await expect(notifier.deliver('payload', { targetSessionKey: 'eigenflux:profile:test', silent: true })).resolves.toBe(true);
+      expect(run).toHaveBeenCalledWith(expect.objectContaining({ deliver: false }));
     });
   });
 });
