@@ -13,6 +13,14 @@ export interface HeartbeatPlanRunnerConfig {
 export interface HeartbeatExecutionPlan {
   schema_version: 'eigenflux_heartbeat_plan.v1';
   cli_version?: string;
+  cli_update?: {
+    status: string;
+    phase?: string;
+    reason?: string;
+    error_code?: string;
+    next_check_at?: string;
+    error?: string;
+  };
   agent_prompt: string;
   wake_on_empty: boolean;
 }
@@ -27,6 +35,7 @@ function isHeartbeatExecutionPlan(value: unknown): value is HeartbeatExecutionPl
 
 export class EigenFluxHeartbeatPlanRunner {
   private inFlight = false;
+  private lastUpdateDeferral?: string;
 
   constructor(private readonly config: HeartbeatPlanRunnerConfig) {}
 
@@ -56,6 +65,7 @@ export class EigenFluxHeartbeatPlanRunner {
 
       if (result.kind === 'success') {
         if (isHeartbeatExecutionPlan(result.data)) {
+          this.logCLIUpdate(result.data.cli_update);
           return result.data;
         }
         this.config.logger.warn('Heartbeat plan returned an invalid execution contract; update the EigenFlux CLI');
@@ -84,6 +94,28 @@ export class EigenFluxHeartbeatPlanRunner {
       return null;
     } finally {
       this.inFlight = false;
+    }
+  }
+
+  private logCLIUpdate(update: HeartbeatExecutionPlan['cli_update']): void {
+    if (!update || typeof update !== 'object' || typeof update.status !== 'string') return;
+    const details = {
+      server: this.config.serverName,
+      status: update.status,
+      ...(typeof update.phase === 'string' ? { phase: update.phase } : {}),
+      ...(typeof update.reason === 'string' ? { reason: update.reason } : {}),
+      ...(typeof update.next_check_at === 'string' ? { next_check_at: update.next_check_at } : {}),
+      ...(typeof update.error_code === 'string' ? { error_code: update.error_code } : {}),
+    };
+    const summary = JSON.stringify(details);
+    if (['deferred', 'skipped', 'busy'].includes(update.status)) {
+      if (summary !== this.lastUpdateDeferral) this.config.logger.info(`CLI auto-update: ${summary}`);
+      this.lastUpdateDeferral = summary;
+      return;
+    }
+    this.lastUpdateDeferral = undefined;
+    if (update.status === 'failed' || update.status === 'unconfigured') {
+      this.config.logger.warn(`CLI auto-update: ${summary}`);
     }
   }
 }

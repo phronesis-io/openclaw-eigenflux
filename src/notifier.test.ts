@@ -806,6 +806,24 @@ describe('EigenFluxNotifier', () => {
     expect(callArgs.deliver).toBe(true);
   });
 
+  test('a host session identity rejection remains a failed isolated Feed delivery without main-session fallback', async () => {
+    const run = jest.fn().mockResolvedValue({ runId: 'run-session-conflict' });
+    const waitForRun = jest.fn().mockResolvedValue({
+      status: 'error', error: 'Session changed while starting work. Retry. | SESSION_WORK_START_CHANGED',
+    });
+    const enqueueSystemEvent = jest.fn();
+    const notifier = new EigenFluxNotifier(createApi({ runtime: {
+      subagent: { run, waitForRun }, system: { enqueueSystemEvent },
+    } as unknown as OpenClawPluginApi['runtime'] }), createLogger(), createConfig());
+
+    await expect(notifier.deliver('[EIGENFLUX_FEED_PAYLOAD] test', {
+      targetSessionKey: 'eigenflux:feed:eigenflux', lane: 'subagent',
+    })).resolves.toBe(false);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0][0].sessionKey).toMatch(/^eigenflux:feed:eigenflux:/);
+    expect(enqueueSystemEvent).not.toHaveBeenCalled();
+  });
+
   test('uses a stable persistent PM session and conversation-specific lane without cleanup', async () => {
     const run = jest.fn().mockResolvedValue({ runId: 'run-pm' });
     const deleteSession = jest.fn().mockResolvedValue(undefined);
@@ -987,6 +1005,54 @@ describe('EigenFluxNotifier', () => {
       expect(await store.patchSessionEntry({ sessionKey: 'missing', update })).toBeNull();
       expect(update).not.toHaveBeenCalled();
       expect(store.getSessionEntry({ sessionKey: 'missing' })).toBeUndefined();
+    });
+
+    test.each(['new', 'legacy'])('%s host preserves the resolved thread and rejects a missing thread on read-back', async (host) => {
+      for (const { channel, id, kind } of [
+        { channel: 'telegram', id: 42, kind: 'topic' },
+        { channel: 'telegram', id: 0, kind: 'topic' },
+        { channel: 'slack', id: '1710000000.000123', kind: 'thread' },
+      ]) {
+        const store = createSessionStore();
+        const thread = { id, kind, source: 'session' };
+        const listSessionEntries = jest.fn(() => [{ sessionKey: 'agent:main:main', entry: {
+          chatType: 'direct', delivery: { kind: 'external',
+            context: { channel, to: 'target', accountId: 'default', threadId: id },
+            route: { thread }, origin: { provider: channel, to: 'target' } },
+        } }]);
+        if (host === 'new') {
+          sessionStoreSdkMock.updateLastRoute = jest.fn(async ({ sessionKey, storePath, route, ...context }) => {
+            store.entries.set(sessionKey, { delivery: { kind: 'external', context, route } });
+          });
+          sessionStoreSdkMock.deliveryContextFromSession = jest.fn(entry => entry?.delivery?.context);
+        }
+        const run = jest.fn(async ({ sessionKey }) => {
+          const entry = store.entries.get(sessionKey);
+          expect(entry?.delivery?.context ?? entry?.deliveryContext).toMatchObject({ channel, to: 'target', threadId: id });
+          return { runId: 'thread-run' };
+        });
+        const notifier = new EigenFluxNotifier(createApi({ runtime: {
+          subagent: { run }, agent: { session: { ...store, listSessionEntries } },
+        } as any }), createLogger(), {
+          sessionKey: 'main', agentId: 'main', sessionStorePath: '/tmp/sessions/main.json', openclawCliBin: 'openclaw',
+        });
+        await expect(notifier.deliver('Feed', { targetSessionKey: 'eigenflux:feed:test' })).resolves.toBe(true);
+        const key = run.mock.calls[0][0].sessionKey;
+        expect(key).toMatch(/^agent:main:eigenflux:feed:test:/);
+        expect(listSessionEntries).toHaveBeenCalledWith({ agentId: 'main', storePath: '/tmp/sessions/main.json', readOnly: true });
+        if (host === 'new') {
+          expect(store.patchSessionEntry).not.toHaveBeenCalled();
+          expect(store.entries.get(key).delivery.route.thread).toEqual(thread);
+        } else {
+          expect(store.entries.get(key).lastThreadId).toBe(id);
+        }
+        store.getSessionEntry.mockReturnValueOnce({
+          delivery: { context: { channel, to: 'target', accountId: 'default' } },
+          deliveryContext: { channel, to: 'target', accountId: 'default' },
+        });
+        await expect(notifier.deliver('Feed', { targetSessionKey: 'eigenflux:feed:test' })).resolves.toBe(false);
+        expect(run).toHaveBeenCalledTimes(1);
+      }
     });
 
     test.each(['new', 'legacy'])('%s host writes and verifies the route before running', async (host) => {

@@ -1,4 +1,5 @@
 import { execEigenflux } from './cli-executor';
+import { Logger } from './logger';
 
 const unavailableNotice = {
   schema_version: 'eigenflux_auth_unavailable.v1', status: 'auth_unavailable',
@@ -14,6 +15,19 @@ function failingCli(stderr: string, exitCode = 2) {
 }
 
 describe('execEigenflux', () => {
+  test('preserves only maintenance diagnostics from a successful command', async () => {
+    const logs = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+    const stderr = 'private unrelated stderr\r\n[eigenflux:maintenance] record_failed attempt=abc\r\n'
+      + 'prefix [eigenflux:maintenance] not a diagnostic\n[eigenflux:maintenance] upload_pending attempt=abc\n';
+    await expect(execEigenflux(process.execPath, [
+      '-e', 'process.stderr.write(process.argv[1]); console.log(JSON.stringify({ok:true}))', stderr,
+    ], { logger: new Logger(logs) })).resolves.toEqual({ kind: 'success', data: { ok: true } });
+    expect(logs.warn.mock.calls).toEqual([
+      ['[EigenFlux] [eigenflux:maintenance] record_failed attempt=abc'],
+      ['[EigenFlux] [eigenflux:maintenance] upload_pending attempt=abc'],
+    ]);
+  });
+
   test.each(['AGENT_AUTH_UNAVAILABLE', 'AUTH_NETWORK_UNAVAILABLE'])(
     'classifies the final structured %s notice after multiline diagnostics', async (code) => {
       const stderr = `refresh request failed\r\nadditional diagnostic\r\n${JSON.stringify({ ...unavailableNotice, code })}\r\n\n`;

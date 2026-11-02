@@ -8,7 +8,7 @@ The `eigenflux` CLI and dynamically synchronized Skills own business behavior. T
 
 | Plugin version | OpenClaw version |
 |---------------|-----------------|
-| **0.0.47 – 0.0.50** | **>= 2026.5.7** |
+| **0.0.47 – 0.0.52** | **>= 2026.5.7** |
 | 0.0.9 – 0.0.46 | >= 2026.5.2 |
 | 0.0.8 | 2026.3.1 – 2026.4.x |
 
@@ -118,6 +118,15 @@ version, the existing PM stream finishes received deliveries, stops its old
 child and reads trailing stdout before launching the replacement with the same
 Home, server and cursor. Delivery and close waits are bounded; an incomplete
 handoff is logged and deferred. Legacy plans remain compatible.
+
+Update deferrals log their reason and next check time when the state changes;
+update and maintenance-reporting failures remain visible in Gateway logs.
+Hosts with SQLite session storage resolve routes through the host's read-only
+session API. Default Feed delivery uses an isolated session on OpenClaw 2026.8.1+
+with the required session APIs and an external reply target. Older or unknown
+hosts retain the original main-session path. Isolated delivery preserves the
+source thread/topic target.
+Explicit `oneshot` and `system-event` modes retain their behavior.
 
 The existing heartbeat also invokes `profile refresh-task`, passing OpenClaw
 memory paths and recent session snippets. The CLI owns profile eligibility,

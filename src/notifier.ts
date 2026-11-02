@@ -1,7 +1,7 @@
 import type { OrderDeliveryReceipt } from './order-notifications';
 import { createHash, randomUUID } from 'node:crypto';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
-import { type NotificationRouteOverrides } from './config';
+import { isCliOutdated, type NotificationRouteOverrides } from './config';
 import { Logger } from './logger';
 import {
   isInternalSessionKey,
@@ -21,7 +21,8 @@ import { UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
  */
 /** Minimal shape of a session-store entry we read/write when seeding a route. */
 type SessionStoreEntryLike = {
-  deliveryContext?: { channel?: string; to?: string; accountId?: string };
+  deliveryContext?: { channel?: string; to?: string; accountId?: string; threadId?: string | number };
+  lastThreadId?: string | number;
   lastChannel?: string;
   lastTo?: string;
   lastAccountId?: string;
@@ -61,6 +62,11 @@ type EigenFluxRuntimeApi = {
         sessionKey: string;
         storePath?: string;
       }) => SessionStoreEntryLike | undefined;
+      listSessionEntries?: (params: {
+        agentId: string;
+        storePath?: string;
+        readOnly: true;
+      }) => Array<{ sessionKey: string; entry: SessionStoreEntryLike }>;
       /** Row-scoped write: patch a single session entry by identity. Replaces the
        *  deprecated whole-store `updateSessionStore` (SQLite-migration guard
        *  `sdk-session-store-write`). Merges the returned partial into the entry. */
@@ -279,6 +285,17 @@ export class EigenFluxNotifier {
 
   stopFeedObservation(): void { this.feedObservation.abort(); }
 
+  async canIsolateFeed(): Promise<boolean> {
+    const version = this.api.runtime?.version;
+    const session = this.runtime.agent?.session;
+    // Earlier hosts may expose these methods without readOnly/fallbackEntry support.
+    if (!/^\d+\.\d+\.\d+(?:-\d+)?$/.test(version ?? '') || isCliOutdated(version, '2026.8.1')
+      || typeof session?.listSessionEntries !== 'function' || typeof session.patchSessionEntry !== 'function'
+      || typeof session.resolveStorePath !== 'function' || typeof this.runtime.subagent?.run !== 'function') return false;
+    const { route } = await this.resolveRoute();
+    return Boolean(route.replyChannel && route.replyChannel !== 'webchat' && route.replyTo);
+  }
+
   async deliver(message: string, options?: DeliverOptions): Promise<boolean> {
     const serializationKey =
       options?.persistentSessionKey ?? options?.targetSessionKey ?? this.config.sessionKey;
@@ -306,13 +323,16 @@ export class EigenFluxNotifier {
       // then override the sessionKey with a one-shot key to avoid context accumulation.
       const baseRoute = await this.resolveRoute();
 
-      const sessionKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const isolatedKey = persistentKey ?? `${targetKey}:${Date.now()}-${randomUUID().slice(0, 8)}`;
+      const sessionKey = targetKey && this.runtime.agent?.session?.listSessionEntries && !isolatedKey.startsWith('agent:')
+        ? `agent:${baseRoute.route.agentId}:${isolatedKey}` : isolatedKey;
       const route: ResolvedNotificationRoute = {
         sessionKey,
         agentId: baseRoute.route.agentId,
         ...(baseRoute.route.replyChannel && { replyChannel: baseRoute.route.replyChannel }),
         ...(baseRoute.route.replyTo && { replyTo: baseRoute.route.replyTo }),
         ...(baseRoute.route.replyAccountId && { replyAccountId: baseRoute.route.replyAccountId }),
+        ...(baseRoute.route.replyThread && { replyThread: baseRoute.route.replyThread }),
       };
       this.logger.info(
         `Delivery route resolved: source=${persistentKey ? 'targeted-persistent' : 'targeted-oneshot'}, ${formatRouteForLog(route)}, message_preview=${previewMessage(message)}`
@@ -598,6 +618,7 @@ export class EigenFluxNotifier {
         channel: route.replyChannel,
         to: route.replyTo,
         ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
+        ...(route.replyThread ? { threadId: route.replyThread.id } : {}),
       };
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
@@ -611,12 +632,19 @@ export class EigenFluxNotifier {
           channel: string;
           to: string;
           accountId?: string;
+          threadId?: string | number;
+          route?: { channel: string; target: { to: string }; accountId?: string; thread?: ResolvedNotificationRoute['replyThread'] };
         }) => Promise<unknown>;
         deliveryContextFromSession?: (entry?: SessionStoreEntryLike) => SessionStoreEntryLike['deliveryContext'];
       };
       if (typeof sdk.updateLastRoute === 'function') {
         // The host owns the persisted delivery shape and creates missing entries by default.
-        await sdk.updateLastRoute({ storePath, sessionKey, ...deliveryContext });
+        await sdk.updateLastRoute({ storePath, sessionKey, ...deliveryContext,
+          ...(route.replyThread ? { route: {
+            channel: deliveryContext.channel, target: { to: deliveryContext.to },
+            accountId: deliveryContext.accountId, thread: route.replyThread,
+          } } : {}),
+        });
       } else {
         if (typeof session.patchSessionEntry !== 'function') {
           throw new Error('runtime.agent.session.patchSessionEntry unavailable');
@@ -629,6 +657,7 @@ export class EigenFluxNotifier {
             lastChannel: route.replyChannel,
             lastTo: route.replyTo,
             ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+            ...(route.replyThread ? { lastThreadId: route.replyThread.id } : {}),
           }),
         });
       }
@@ -636,10 +665,11 @@ export class EigenFluxNotifier {
       const persisted = typeof sdk.deliveryContextFromSession === 'function'
         ? sdk.deliveryContextFromSession(entry)
         : entry?.deliveryContext ?? (entry && {
-          channel: entry.lastChannel, to: entry.lastTo, accountId: entry.lastAccountId,
+          channel: entry.lastChannel, to: entry.lastTo, accountId: entry.lastAccountId, threadId: entry.lastThreadId,
         });
       if (persisted?.channel !== deliveryContext.channel || persisted?.to !== deliveryContext.to ||
-          (deliveryContext.accountId && persisted?.accountId !== deliveryContext.accountId)) {
+          (deliveryContext.accountId && persisted?.accountId !== deliveryContext.accountId) ||
+          (route.replyThread && String(persisted?.threadId) !== String(route.replyThread.id))) {
         throw new Error('session store read-back did not confirm the delivery target');
       }
       this.logger.info(
@@ -1064,10 +1094,13 @@ export class EigenFluxNotifier {
   private async resolveRoute(
     options: { ignoreRemembered?: boolean } = {}
   ): Promise<ResolvedNotificationRouteResult> {
+    const session = this.runtime.agent?.session;
     return resolveNotificationRoute(
       this.config as NotificationRouteConfig,
       this.logger,
-      options
+      { ...options, ...(session?.listSessionEntries ? { readSessionStore: (agentId: string, storePath: string) =>
+        Object.fromEntries(session.listSessionEntries!({ agentId, storePath, readOnly: true })
+          .map(({ sessionKey, entry }) => [sessionKey, entry])) } : {}) }
     );
   }
 
