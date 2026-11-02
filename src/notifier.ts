@@ -21,7 +21,8 @@ import { UnconfirmedFeedDeliveryError } from './feed-push-scheduler';
  */
 /** Minimal shape of a session-store entry we read/write when seeding a route. */
 type SessionStoreEntryLike = {
-  deliveryContext?: { channel?: string; to?: string; accountId?: string };
+  deliveryContext?: { channel?: string; to?: string; accountId?: string; threadId?: string | number };
+  lastThreadId?: string | number;
   lastChannel?: string;
   lastTo?: string;
   lastAccountId?: string;
@@ -259,7 +260,7 @@ export class EigenFluxNotifier {
       const digest = createHash('sha256').update(context.key).digest('hex');
       const base = await this.resolveRoute();
       const route = { ...base.route, sessionKey: `agent:${base.route.agentId}:eigenflux:order:${digest}` };
-      await this.seedOneShotDeliveryContext(route.sessionKey, route);
+      if (!await this.seedOneShotDeliveryContext(route.sessionKey, route)) return false;
       checkpoint({ status: 'submitting' });
       // A thrown call can still have been accepted remotely. The submitting
       // receipt deliberately prevents automatic replay in that ambiguous case.
@@ -341,10 +342,10 @@ export class EigenFluxNotifier {
       // subagent resolves its reply target from the session store (it cannot be passed
       // through subagent.run), and a fresh one-shot session has none — without this the
       // run fails with Feishu "requires target" (missing target). Skip when silent
-      // (no channel reply). New-host Feed submission requires a persisted target.
-      if (!silent) {
-        const seeded = await this.seedOneShotDeliveryContext(sessionKey, route);
-        if (targetKey && this.runtime.agent?.session?.listSessionEntries && !seeded) return false;
+      // (no channel reply) since there is nothing to route.
+      if (!silent && !await this.seedOneShotDeliveryContext(sessionKey, route)) {
+        if (!persistentKey) this.enqueueCleanup(sessionKey);
+        return false;
       }
 
       // Isolated delivery uses only runtime.subagent. Current command/heartbeat
@@ -600,82 +601,83 @@ export class EigenFluxNotifier {
     return result.ok;
   }
 
-  /**
-   * Seed the one-shot feed session's delivery context into the session store
-   * BEFORE running the deliver:true subagent.
-   *
-   * Why this is necessary: `runtime.subagent.run` has no parameter to carry a
-   * reply target, and a deliver:true run resolves its target from the session
-   * store entry's `deliveryContext` (OpenClaw's `extractDeliveryInfo`). A freshly
-   * minted one-shot session key has no entry at all, so the agent's reply fails
-   * with Feishu "Delivering to … requires target" (a *missing*-target error, not
-   * a format error). Writing the resolved route here gives that run a real
-   * destination, while preserving the isolated-session design.
-   *
-   * Store path + agent id mirror the read side: a non-`agent:` key resolves to
-   * the default agent ("main"), which matches `route.agentId`. Best-effort —
-   * failures are logged, never thrown (delivery still attempts and can fall back).
-   */
+  /** Isolated deliver:true runs can only resolve their target from the host store. */
   private async seedOneShotDeliveryContext(
     sessionKey: string,
     route: ResolvedNotificationRoute
   ): Promise<boolean> {
-    if (!route.replyChannel || !route.replyTo) {
-      this.logger.warn(
-        `Cannot seed deliveryContext for one-shot session ${sessionKey}: route has no channel/to`
-      );
-      return false;
-    }
-    const session = this.runtime.agent?.session;
-    if (typeof session?.resolveStorePath !== 'function' || typeof session?.patchSessionEntry !== 'function') {
-      this.logger.warn(
-        'runtime.agent.session store API unavailable; cannot seed deliveryContext for one-shot session'
-      );
-      return false;
-    }
-    const deliveryContext = {
-      channel: route.replyChannel,
-      to: route.replyTo,
-      ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
-      ...(route.replyThread ? { threadId: route.replyThread.id } : {}),
-    };
     try {
+      if (!route.replyChannel || !route.replyTo) {
+        throw new Error('route has no channel/to');
+      }
+      const session = this.runtime.agent?.session;
+      if (typeof session?.resolveStorePath !== 'function' || typeof session?.getSessionEntry !== 'function') {
+        throw new Error('runtime.agent.session store read API unavailable');
+      }
+      const deliveryContext = {
+        channel: route.replyChannel,
+        to: route.replyTo,
+        ...(route.replyAccountId ? { accountId: route.replyAccountId } : {}),
+        ...(route.replyThread ? { threadId: route.replyThread.id } : {}),
+      };
       const configuredStore = (this.api.config as { session?: { store?: string } } | undefined)?.session?.store;
       const storePath = session.resolveStorePath(configuredStore, { agentId: route.agentId });
-      // Row-scoped write (patchSessionEntry) instead of the deprecated whole-store
-      // updateSessionStore: patch merges the returned partial into just this entry.
-      const patched = await session.patchSessionEntry({
-        agentId: route.agentId,
-        sessionKey,
-        storePath,
-        ...(session.listSessionEntries && /(^|:)eigenflux:feed:/.test(sessionKey)
-          ? { fallbackEntry: { sessionId: randomUUID(), updatedAt: Date.now() } } : {}),
-        update: () => ({
-          deliveryContext,
-          lastChannel: route.replyChannel,
-          lastTo: route.replyTo,
-          ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
-          ...(route.replyThread ? { lastThreadId: route.replyThread.id } : {}),
-          ...(session.listSessionEntries ? { delivery: {
-            kind: 'external',
-            context: deliveryContext,
-            route: { channel: deliveryContext.channel, target: { to: deliveryContext.to }, accountId: deliveryContext.accountId,
-              ...(route.replyThread ? { thread: route.replyThread } : {}) },
-            origin: { provider: deliveryContext.channel, to: deliveryContext.to, accountId: deliveryContext.accountId,
-              ...(route.replyThread ? { threadId: route.replyThread.id } : {}) },
+      const identity = { agentId: route.agentId, sessionKey, storePath };
+      // Detect optional SDK exports at runtime so older hosts can still load the plugin.
+      const moduleName = 'openclaw/plugin-sdk/session-store-runtime';
+      const sdk = await import(moduleName) as {
+        updateLastRoute?: (params: {
+          storePath: string;
+          sessionKey: string;
+          channel: string;
+          to: string;
+          accountId?: string;
+          threadId?: string | number;
+          route?: { channel: string; target: { to: string }; accountId?: string; thread?: ResolvedNotificationRoute['replyThread'] };
+        }) => Promise<unknown>;
+        deliveryContextFromSession?: (entry?: SessionStoreEntryLike) => SessionStoreEntryLike['deliveryContext'];
+      };
+      if (typeof sdk.updateLastRoute === 'function') {
+        // The host owns the persisted delivery shape and creates missing entries by default.
+        await sdk.updateLastRoute({ storePath, sessionKey, ...deliveryContext,
+          ...(route.replyThread ? { route: {
+            channel: deliveryContext.channel, target: { to: deliveryContext.to },
+            accountId: deliveryContext.accountId, thread: route.replyThread,
           } } : {}),
-        }),
-      });
-      if (session.listSessionEntries && !patched) {
-        this.logger.warn('Host did not persist the isolated session delivery context');
-        return false;
+        });
+      } else {
+        if (typeof session.patchSessionEntry !== 'function') {
+          throw new Error('runtime.agent.session.patchSessionEntry unavailable');
+        }
+        await session.patchSessionEntry({
+          ...identity,
+          fallbackEntry: { sessionId: randomUUID(), updatedAt: Date.now() },
+          update: () => ({
+            deliveryContext,
+            lastChannel: route.replyChannel,
+            lastTo: route.replyTo,
+            ...(route.replyAccountId ? { lastAccountId: route.replyAccountId } : {}),
+            ...(route.replyThread ? { lastThreadId: route.replyThread.id } : {}),
+          }),
+        });
+      }
+      const entry = session.getSessionEntry(identity);
+      const persisted = typeof sdk.deliveryContextFromSession === 'function'
+        ? sdk.deliveryContextFromSession(entry)
+        : entry?.deliveryContext ?? (entry && {
+          channel: entry.lastChannel, to: entry.lastTo, accountId: entry.lastAccountId, threadId: entry.lastThreadId,
+        });
+      if (persisted?.channel !== deliveryContext.channel || persisted?.to !== deliveryContext.to ||
+          (deliveryContext.accountId && persisted?.accountId !== deliveryContext.accountId) ||
+          (route.replyThread && String(persisted?.threadId) !== String(route.replyThread.id))) {
+        throw new Error('session store read-back did not confirm the delivery target');
       }
       this.logger.info(
         `Seeded deliveryContext for one-shot session ${sessionKey}: channel=${deliveryContext.channel}, to=${deliveryContext.to}, account=${route.replyAccountId ?? 'n/a'}`
       );
       return true;
     } catch (error) {
-      this.logger.warn(
+      this.logger.error(
         `Failed to seed deliveryContext for one-shot session ${sessionKey}: ${formatError(error)}`
       );
       return false;

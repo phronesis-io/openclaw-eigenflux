@@ -20,6 +20,19 @@ jest.mock('openclaw/plugin-sdk/plugin-entry', () => ({
   buildJsonPluginConfigSchema: (schema: any) => schema,
 }));
 
+const pluginConfig = { serverRouting: { eigenflux: { replyChannel: 'feishu', replyTo: 'user:integration' } } };
+const sessionEntries = new Map<string, any>();
+jest.mock('openclaw/plugin-sdk/session-store-runtime', () => ({
+  updateLastRoute: jest.fn(async ({ sessionKey, storePath, route, ...context }: any) => {
+    sessionEntries.set(sessionKey, { delivery: { kind: 'external', context, route } });
+  }),
+  deliveryContextFromSession: (entry: any) => entry?.delivery?.context,
+}));
+const sessionStore = {
+  resolveStorePath: () => '/tmp/eigenflux-integration-sessions.json',
+  getSessionEntry: ({ sessionKey }: any) => sessionEntries.get(sessionKey),
+};
+
 // Mock discoverServers and resolveEigenfluxHome
 const discoverServersMock = jest.fn();
 const resolveEigenfluxHomeMock = jest.fn();
@@ -96,6 +109,7 @@ describe('register integration', () => {
   }>;
 
   beforeEach(async () => {
+    sessionEntries.clear();
     streamClientConfig = undefined;
     wakeOnEmpty = true;
     profileTask = '';
@@ -174,7 +188,7 @@ describe('register integration', () => {
     sendAuthReminderMock.mockImplementation(() => new Promise((resolve) => { finishReminder = resolve; }));
     const services: any[] = [];
     plugin.register({
-      registrationMode: 'full', config: {}, pluginConfig: {}, runtime: {},
+      registrationMode: 'full', config: {}, pluginConfig, runtime: {},
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
       registerService: (service: any) => services.push(service),
     } as any);
@@ -205,8 +219,8 @@ describe('register integration', () => {
     const services: any[] = [];
     const subagentRun = jest.fn().mockResolvedValue({ runId: 'empty-feed-run' });
     plugin.register({
-      registrationMode: 'full', config: {}, pluginConfig: {},
-      runtime: { subagent: { run: subagentRun } },
+      registrationMode: 'full', config: {}, pluginConfig,
+      runtime: { agent: { session: sessionStore }, subagent: { run: subagentRun } },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
       registerService: (service: any) => services.push(service),
     } as any);
@@ -226,8 +240,8 @@ describe('register integration', () => {
     const services: any[] = [];
     const subagentRun = jest.fn().mockResolvedValue({ runId: 'profile-task-run' });
     plugin.register({
-      registrationMode: 'full', config: {}, pluginConfig: {},
-      runtime: { subagent: { run: subagentRun } },
+      registrationMode: 'full', config: {}, pluginConfig,
+      runtime: { agent: { session: sessionStore }, subagent: { run: subagentRun } },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
       registerService: (service: any) => services.push(service),
     } as any);
@@ -247,8 +261,9 @@ describe('register integration', () => {
     plugin.register({
       registrationMode: 'full',
       config: {},
-      pluginConfig: {},
+      pluginConfig,
       runtime: {
+        agent: { session: sessionStore },
         subagent: {
           run: subagentRun,
         },
@@ -309,6 +324,7 @@ describe('register integration', () => {
         version: '2026.8.1',
         subagent: { run: subagentRun },
         agent: { session: {
+          ...sessionStore,
           listSessionEntries: () => [{ sessionKey: 'agent:main:main', entry: {
             chatType: 'direct', delivery: { kind: 'external',
               context: { channel: 'telegram', to: '12345', threadId: 42 },
@@ -336,7 +352,8 @@ describe('register integration', () => {
     expect(params.sessionKey).toMatch(/^agent:main:eigenflux:feed:eigenflux:\d+-[a-f0-9]{8}$/);
     expect(String(params.message)).toContain('[EIGENFLUX_FEED_PAYLOAD]');
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
-    expect(patchSessionEntry.mock.calls[0][0].update({}, {})).toMatchObject({ delivery: {
+    expect(patchSessionEntry).not.toHaveBeenCalled();
+    expect(sessionEntries.get(params.sessionKey)).toMatchObject({ delivery: {
       context: { channel: 'telegram', to: '12345', threadId: 42 },
       route: { thread: { id: 42, kind: 'topic', source: 'session' } },
     } });
@@ -405,8 +422,9 @@ describe('register integration', () => {
     plugin.register({
       registrationMode: 'full',
       config: {},
-      pluginConfig: {},
+      pluginConfig,
       runtime: {
+        agent: { session: sessionStore },
         subagent: { run: subagentRun },
         system: { enqueueSystemEvent, requestHeartbeatNow },
       },
@@ -433,7 +451,7 @@ describe('register integration', () => {
     await services[0].stop();
   });
 
-  test('routes PMs to a stable session and lane derived from peer + conv_id, outside main', async () => {
+  test('routes PMs and friend requests to isolated sessions with verified delivery targets', async () => {
     feedItems = [];
     jest.resetModules();
     const { default: plugin } = await import('./index');
@@ -443,8 +461,8 @@ describe('register integration', () => {
     plugin.register({
       registrationMode: 'full',
       config: {},
-      pluginConfig: {},
-      runtime: { subagent: { run: subagentRun } },
+      pluginConfig,
+      runtime: { agent: { session: sessionStore }, subagent: { run: subagentRun } },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
       registerService: (service: any) => services.push(service),
     } as any);
@@ -478,6 +496,22 @@ describe('register integration', () => {
     expect(params.message).toContain('ef-communication skill');
     expect(params.message).not.toContain('eigenflux msg history');
     expect(params.message).toContain('stable isolated session');
+    expect(sessionEntries.get(params.sessionKey)?.delivery.context).toEqual({
+      channel: 'feishu', to: 'user:integration',
+    });
+
+    subagentRun.mockClear();
+    await streamClientConfig.onPmEvent({
+      type: 'friend_request',
+      data: { messages: [], friend_requests: [{ request_id: 'friend-1', from_uid: 'agent-kyrie', created_at: 1 }] },
+    });
+    expect(subagentRun).toHaveBeenCalledTimes(1);
+    const friend = subagentRun.mock.calls[0][0];
+    expect(friend.sessionKey).not.toBe(params.sessionKey);
+    expect(friend.message).toContain('friend-1');
+    expect(sessionEntries.get(friend.sessionKey)?.delivery.context).toEqual({
+      channel: 'feishu', to: 'user:integration',
+    });
 
     await services[0].stop();
   });
@@ -506,8 +540,9 @@ describe('register integration', () => {
     plugin.register({
       registrationMode: 'full',
       config: {},
-      pluginConfig: {},
+      pluginConfig,
       runtime: {
+        agent: { session: sessionStore },
         subagent: { run: subagentRun },
       },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
@@ -538,8 +573,9 @@ describe('register integration', () => {
     plugin.register({
       registrationMode: 'full',
       config: {},
-      pluginConfig: {},
+      pluginConfig,
       runtime: {
+        agent: { session: sessionStore },
         subagent: { run: subagentRun },
       },
       logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },

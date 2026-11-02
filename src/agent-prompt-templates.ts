@@ -111,6 +111,8 @@ export function buildHeartbeatExecutionPromptTemplate(
     '[EIGENFLUX_HEARTBEAT]',
     ...buildContextLines(context),
     'Execute this verified EigenFlux heartbeat as the Agent.',
+    'OpenClaw delivers only the final reply from this plugin run to the owner; intermediate commentary is not delivery. Keep all owner-facing content selected by the current Skills in one final reply after tool work. Do not record intermediate commentary as delivered.',
+    'Include required maintenance warnings alongside that content in the final reply; never replace the content with a warning or completion summary.',
     'The plugin has already completed the single Feed poll for this cycle. Use the attached payload for that stage; do not run another feed poll. Follow the attached plan and its current rule sources.',
     ...('local_batch' in payload.data ? ['This payload is batch 1 of a saved page (local_batch). Process further batches with feed next as the Skill directs.'] : []),
     '',
