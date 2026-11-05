@@ -209,8 +209,24 @@ function registerPlugin(api: OpenClawPluginApi): void {
   let stopping: Promise<void> | undefined;
   let lifecycleRevision = 0;
 
+  // Both discovery callers commit into the same lifecycle-owned runtime group.
+  const prepareRuntimeCommit = (): ((servers: DiscoveredServer[]) => ServerRuntime[]) => {
+    const revision = lifecycleRevision;
+    const wasStopping = Boolean(stopping);
+    return (servers) => {
+      if (wasStopping || stopping || revision !== lifecycleRevision) return runtimes;
+      if (runtimes.length === 0) {
+        runtimes = servers.map((server) =>
+          createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
+        );
+      }
+      return runtimes;
+    };
+  };
+
   const attemptDiscovery = async (cycle: DiscoveryLifecycle): Promise<void> => {
     cycle.attempts++;
+    const commitRuntimes = prepareRuntimeCommit();
     let discovery: DiscoveryResult;
     try {
       discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
@@ -266,11 +282,9 @@ function registerPlugin(api: OpenClawPluginApi): void {
       logger.info(`Client env: EIGENFLUX_CHANNEL=${process.env.EIGENFLUX_CHANNEL} (source=${channel ? 'routing.replyChannel' : 'default'})`);
     }
 
-    runtimes = servers.map((server) =>
-      createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
-    );
+    const discoveredRuntimes = commitRuntimes(servers);
 
-    for (const runtime of runtimes) {
+    for (const runtime of discoveredRuntimes) {
       if (!cycle.active) return;
       logger.info(`Starting services for server=${runtime.server.name}`);
       runtime.profileRefresher.start();
@@ -281,7 +295,7 @@ function registerPlugin(api: OpenClawPluginApi): void {
       runtime.orderNotifications.start();
       runtime.flushLoop.start();
     }
-    logger.info(`EigenFlux discovery ready: services started for ${servers.length} server(s)`);
+    logger.info(`EigenFlux discovery ready: services started for ${discoveredRuntimes.length} server(s)`);
 
     // CLI is installed and running; if it's older than this plugin expects,
     // nudge the agent to update it (informational — services keep running on
@@ -361,12 +375,9 @@ function registerPlugin(api: OpenClawPluginApi): void {
     api,
     logger,
     pluginConfig,
-    eigenfluxHome,
     store,
     () => runtimes,
-    (next) => {
-      runtimes = next;
-    }
+    prepareRuntimeCommit
   );
 }
 
@@ -882,10 +893,9 @@ function registerCommand(
   api: OpenClawPluginApi,
   logger: Logger,
   pluginConfig: ResolvedEigenFluxPluginConfig,
-  eigenfluxHome: string,
   store: PluginRuntimeStore,
   getRuntimes: () => ServerRuntime[],
-  setRuntimes: (runtimes: ServerRuntime[]) => void
+  prepareRuntimeCommit: () => (servers: DiscoveredServer[]) => ServerRuntime[]
 ): void {
   if (!api.registerCommand) {
     logger.warn('registerCommand API unavailable; skipping /eigenflux command registration');
@@ -901,6 +911,7 @@ function registerCommand(
   let inflightDiscovery: Promise<EnsureRuntimesResult> | null = null;
 
   const runDiscovery = async (): Promise<EnsureRuntimesResult> => {
+    const commitRuntimes = prepareRuntimeCommit();
     const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
     if (discovery.kind === 'not_installed') {
       return { runtimes: getRuntimes(), notInstalledBin: discovery.bin };
@@ -912,11 +923,7 @@ function registerCommand(
     if (discovery.servers.length === 0) {
       return { runtimes: getRuntimes() };
     }
-    const created = discovery.servers.map((server) =>
-      createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
-    );
-    setRuntimes(created);
-    return { runtimes: created };
+    return { runtimes: commitRuntimes(discovery.servers) };
   };
 
   const ensureRuntimes = async (): Promise<EnsureRuntimesResult> => {
