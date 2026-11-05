@@ -33,6 +33,7 @@ import {
   type ResolvedEigenFluxPluginConfig,
   type RoutingConfig,
   type DiscoveredServer,
+  type DiscoveryResult,
 } from './config';
 import { findSessionRouteForBinding } from './notification-route-resolver';
 import {
@@ -55,6 +56,7 @@ import { buildPmLane, buildPmSessionKey, splitPmEventByConversation } from './pm
  *  counts as busy while its last activity is fresher than this. Each user turn
  *  refreshes it, so the push waits for an actual lull in the conversation. */
 const FEED_RECENT_ACTIVITY_MS = 90_000;
+const DISCOVERY_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
 import { normalizeReplyTarget } from './reply-target';
 import { writeStoredNotificationRoute, type PluginRuntimeStore } from './session-route-memory';
 import { handleFollowup, FOLLOWUP_KINDS } from './feedback-tool';
@@ -197,97 +199,159 @@ function registerPlugin(api: OpenClawPluginApi): void {
   registerRuntimeModelHooks(api, () => runtimes, logger);
   let notInstalledPromptDelivered = false;
   let outdatedPromptDelivered = false;
+  type DiscoveryLifecycle = {
+    active: boolean;
+    attempts: number;
+    timer?: NodeJS.Timeout;
+    inFlight?: Promise<void>;
+  };
+  let lifecycle: DiscoveryLifecycle | undefined;
+  let stopping: Promise<void> | undefined;
+  let lifecycleRevision = 0;
 
-  // Register a single meta-service that discovers servers on start
+  const attemptDiscovery = async (cycle: DiscoveryLifecycle): Promise<void> => {
+    cycle.attempts++;
+    let discovery: DiscoveryResult;
+    try {
+      discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
+    } catch (error) {
+      discovery = { kind: 'error', error: String(error), retryable: true };
+    }
+    if (!cycle.active) return;
+    if (discovery.kind === 'not_installed') {
+      logger.warn(
+        `EigenFlux discovery not ready: CLI not installed (bin=${discovery.bin}); no automatic retry`
+      );
+      if (!notInstalledPromptDelivered) {
+        notInstalledPromptDelivered = true;
+        await deliverNotInstalledPrompt(api, logger, pluginConfig, eigenfluxHome, discovery.bin, store);
+      }
+      return;
+    }
+    if (discovery.kind === 'error') {
+      const delay = DISCOVERY_RETRY_DELAYS_MS[cycle.attempts - 1];
+      if (discovery.retryable && delay !== undefined) {
+        logger.warn(`EigenFlux discovery not ready (attempt ${cycle.attempts}/4): ${discovery.error}; retrying in ${delay / 1000}s`);
+        cycle.timer = setTimeout(() => {
+          cycle.timer = undefined;
+          if (!cycle.active) return;
+          cycle.inFlight = attemptDiscovery(cycle);
+          void cycle.inFlight.catch((error) => logger.error(`EigenFlux discovery startup failed: ${String(error)}`));
+        }, delay);
+        cycle.timer.unref?.();
+      } else {
+        logger.error(`EigenFlux discovery not ready after ${cycle.attempts} attempt(s): ${discovery.error}; ${discovery.retryable ? 'automatic retries exhausted' : 'automatic retry disabled'}. Resolve the error and restart the EigenFlux service.`);
+      }
+      return;
+    }
+
+    // Pull the latest signed bundle into OpenClaw's user-level Skills dir.
+    // Non-blocking and offline-safe; a successful sync refreshes the Skills
+    // snapshot for the next agent turn.
+    void syncPluginSkills(pluginConfig.eigenfluxBin, logger);
+
+    const servers = discovery.servers;
+    if (servers.length === 0) {
+      logger.info('EigenFlux discovery completed with no configured servers; services remain idle, no automatic retry');
+      return;
+    }
+
+    logger.info(`Discovered ${servers.length} server(s): ${servers.map((s) => s.name).join(', ')}`);
+
+    // Derive EIGENFLUX_CHANNEL from the first server's routing config.
+    if (!process.env.EIGENFLUX_CHANNEL) {
+      const firstRouting = pluginConfig.serverRouting[servers[0].name];
+      const channel = firstRouting?.replyChannel;
+      process.env.EIGENFLUX_CHANNEL = channel || 'openclaw';
+      logger.info(`Client env: EIGENFLUX_CHANNEL=${process.env.EIGENFLUX_CHANNEL} (source=${channel ? 'routing.replyChannel' : 'default'})`);
+    }
+
+    runtimes = servers.map((server) =>
+      createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
+    );
+
+    for (const runtime of runtimes) {
+      if (!cycle.active) return;
+      logger.info(`Starting services for server=${runtime.server.name}`);
+      runtime.profileRefresher.start();
+      await runtime.feedPoller.start();
+      if (!cycle.active) return;
+      await runtime.streamClient.start();
+      if (!cycle.active) return;
+      runtime.orderNotifications.start();
+      runtime.flushLoop.start();
+    }
+    logger.info(`EigenFlux discovery ready: services started for ${servers.length} server(s)`);
+
+    // CLI is installed and running; if it's older than this plugin expects,
+    // nudge the agent to update it (informational — services keep running on
+    // the current version; the agent performs the update at runtime).
+    if (!outdatedPromptDelivered) {
+      const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
+      if (!cycle.active) return;
+      if (isCliOutdated(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
+        outdatedPromptDelivered = true;
+        logger.warn(
+          `EigenFlux CLI outdated (installed=${installedVersion}, expected>=${PLUGIN_CONFIG.EXPECTED_CLI_VERSION}); delivering upgrade prompt`
+        );
+        await deliverOutdatedPrompt(
+          api,
+          logger,
+          pluginConfig,
+          installedVersion as string,
+          PLUGIN_CONFIG.EXPECTED_CLI_VERSION,
+          store
+        );
+      }
+    }
+  };
+
+  // One bounded discovery cycle per service lifecycle; empty configurations stay idle.
   api.registerService({
     id: 'eigenflux:discovery',
     start: async () => {
+      const revision = lifecycleRevision;
+      if (stopping) await stopping;
+      if (revision !== lifecycleRevision) return;
+      if (lifecycle?.active) {
+        await lifecycle.inFlight;
+        return;
+      }
       logger.info('Starting EigenFlux discovery service...');
-
-      const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
-      if (discovery.kind === 'not_installed') {
-        logger.warn(
-          `EigenFlux CLI not installed (bin=${discovery.bin}); delivering install prompt to user`
-        );
-        if (!notInstalledPromptDelivered) {
-          notInstalledPromptDelivered = true;
-          await deliverNotInstalledPrompt(api, logger, pluginConfig, eigenfluxHome, discovery.bin, store);
-        }
-        return;
-      }
-
-      // Pull the latest signed bundle into OpenClaw's user-level Skills dir.
-      // Non-blocking and offline-safe; a successful sync refreshes the Skills
-      // snapshot for the next agent turn.
-      void syncPluginSkills(pluginConfig.eigenfluxBin, logger);
-
-      const servers = discovery.servers;
-      if (servers.length === 0) {
-        logger.warn('No EigenFlux servers discovered; services will not start');
-        return;
-      }
-
-      logger.info(`Discovered ${servers.length} server(s): ${servers.map((s) => s.name).join(', ')}`);
-
-      // Derive EIGENFLUX_CHANNEL from the first server's routing config.
-      if (!process.env.EIGENFLUX_CHANNEL) {
-        const firstRouting = pluginConfig.serverRouting[servers[0].name];
-        const channel = firstRouting?.replyChannel;
-        process.env.EIGENFLUX_CHANNEL = channel || 'openclaw';
-        logger.info(`Client env: EIGENFLUX_CHANNEL=${process.env.EIGENFLUX_CHANNEL} (source=${channel ? 'routing.replyChannel' : 'default'})`);
-      }
-
-      runtimes = servers.map((server) =>
-        createServerRuntime(api, logger, pluginConfig, server, eigenfluxHome, store)
-      );
-
-      for (const runtime of runtimes) {
-        logger.info(`Starting services for server=${runtime.server.name}`);
-        runtime.profileRefresher.start();
-        await runtime.feedPoller.start();
-        await runtime.streamClient.start();
-        runtime.orderNotifications.start();
-        runtime.flushLoop.start();
-      }
-
-      // CLI is installed and running; if it's older than this plugin expects,
-      // nudge the agent to update it (informational — services keep running on
-      // the current version; the agent performs the update at runtime).
-      if (!outdatedPromptDelivered) {
-        const installedVersion = await getInstalledCliVersion(pluginConfig.eigenfluxBin, logger);
-        if (isCliOutdated(installedVersion, PLUGIN_CONFIG.EXPECTED_CLI_VERSION)) {
-          outdatedPromptDelivered = true;
-          logger.warn(
-            `EigenFlux CLI outdated (installed=${installedVersion}, expected>=${PLUGIN_CONFIG.EXPECTED_CLI_VERSION}); delivering upgrade prompt`
-          );
-          await deliverOutdatedPrompt(
-            api,
-            logger,
-            pluginConfig,
-            installedVersion as string,
-            PLUGIN_CONFIG.EXPECTED_CLI_VERSION,
-            store
-          );
-        }
-      }
+      const cycle: DiscoveryLifecycle = { active: true, attempts: 0 };
+      lifecycle = cycle;
+      cycle.inFlight = attemptDiscovery(cycle);
+      await cycle.inFlight;
     },
-    stop: async () => {
+    stop: () => {
+      lifecycleRevision++;
+      if (stopping) return stopping;
+      if (!lifecycle?.active && runtimes.length === 0) return;
       logger.info('Stopping EigenFlux discovery service...');
-      for (const runtime of runtimes) {
+      if (lifecycle) {
+        lifecycle.active = false;
+        if (lifecycle.timer) clearTimeout(lifecycle.timer);
+        lifecycle.timer = undefined;
+      }
+      const stoppedRuntimes = runtimes;
+      runtimes = [];
+      for (const runtime of stoppedRuntimes) {
         logger.info(`Stopping services for server=${runtime.server.name}`);
         runtime.feedPoller.stop();
         runtime.orderNotifications.stop();
         runtime.feedPushScheduler.stop();
         runtime.notifier.stopFeedObservation();
-        await runtime.waitForPendingDelivery();
-        await runtime.notifier.drainPendingCleanups();
-        await runtime.streamClient.stop();
         runtime.profileRefresher.stop();
         runtime.flushLoop.stop();
       }
-      runtimes = [];
       notInstalledPromptDelivered = false;
       outdatedPromptDelivered = false;
+      stopping = Promise.all(stoppedRuntimes.map(async (runtime) => {
+        await runtime.waitForPendingDelivery();
+        await runtime.notifier.drainPendingCleanups();
+        await runtime.streamClient.stop();
+      })).then(() => undefined).finally(() => { stopping = undefined; });
+      return stopping;
     },
   });
 
@@ -831,6 +895,7 @@ function registerCommand(
   type EnsureRuntimesResult = {
     runtimes: ServerRuntime[];
     notInstalledBin?: string;
+    discoveryError?: string;
   };
 
   let inflightDiscovery: Promise<EnsureRuntimesResult> | null = null;
@@ -839,6 +904,10 @@ function registerCommand(
     const discovery = await discoverServers(pluginConfig.eigenfluxBin, logger);
     if (discovery.kind === 'not_installed') {
       return { runtimes: getRuntimes(), notInstalledBin: discovery.bin };
+    }
+    if (discovery.kind === 'error') {
+      logger.error(`EigenFlux command discovery failed: ${discovery.error}`);
+      return { runtimes: getRuntimes(), discoveryError: discovery.error };
     }
     if (discovery.servers.length === 0) {
       return { runtimes: getRuntimes() };
@@ -876,12 +945,15 @@ function registerCommand(
         };
       }
 
-      const { runtimes, notInstalledBin } = await ensureRuntimes();
+      const { runtimes, notInstalledBin, discoveryError } = await ensureRuntimes();
 
       if (notInstalledBin && runtimes.length === 0) {
         return {
           text: `EigenFlux CLI not installed (bin=${notInstalledBin}). ${INSTALL_GUIDANCE}`,
         };
+      }
+      if (discoveryError && runtimes.length === 0) {
+        return { text: `EigenFlux server discovery failed: ${discoveryError}. Check Gateway logs and retry this command after resolving the error.` };
       }
 
       if (parsed.command === 'servers') {
