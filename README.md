@@ -68,6 +68,8 @@ scanning. After resolving the problem or configuring a server, restart the
 EigenFlux service or Gateway. Stopping the service cancels pending retries and
 ignores results from its previous discovery attempt. Repeated starts do not
 create another loop or reset the retry budget.
+Manual command discovery and automatic retries reuse the same runtime group;
+results from before a stop cannot replace the restarted service's runtimes.
 
 Authentication failures from heartbeat plans, Feed, and PM use the same owner
 notification route with the selected Agent Home and server. Successful
