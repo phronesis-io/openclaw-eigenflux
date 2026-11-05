@@ -165,7 +165,8 @@ function createRouteOverrides(
 
 export type DiscoveryResult =
   | { kind: 'ok'; servers: DiscoveredServer[] }
-  | { kind: 'not_installed'; bin: string };
+  | { kind: 'not_installed'; bin: string }
+  | { kind: 'error'; error: string; retryable: boolean };
 
 export async function discoverServers(
   eigenfluxBin: string,
@@ -178,11 +179,13 @@ export async function discoverServers(
   );
 
   if (result.kind === 'success') {
-    if (Array.isArray(result.data)) {
+    if (Array.isArray(result.data) && result.data.every((server) =>
+      isRecord(server) && typeof server.name === 'string' && server.name.trim().length > 0 &&
+      typeof server.endpoint === 'string' && server.endpoint.trim().length > 0
+    )) {
       return { kind: 'ok', servers: result.data };
     }
-    logger?.warn('eigenflux server list returned non-array data');
-    return { kind: 'ok', servers: [] };
+    return { kind: 'error', error: 'eigenflux server list returned an invalid server list', retryable: true };
   }
 
   if (result.kind === 'not_installed') {
@@ -190,12 +193,10 @@ export async function discoverServers(
   }
 
   if (result.kind === 'auth_required') {
-    logger?.warn('eigenflux server list: auth required (unexpected)');
-    return { kind: 'ok', servers: [] };
+    return { kind: 'error', error: 'eigenflux server list requires authentication; follow the CLI recovery instructions', retryable: false };
   }
 
-  logger?.error(`eigenflux server list failed: ${result.error.message}`);
-  return { kind: 'ok', servers: [] };
+  return { kind: 'error', error: result.error.message, retryable: true };
 }
 
 /**

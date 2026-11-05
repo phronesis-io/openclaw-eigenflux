@@ -59,6 +59,16 @@ The first Feed poll runs in the background so Gateway startup does not wait for
 Feed delivery or authentication reminders. Each poll schedules the next one
 after it finishes; stopping the client prevents further scheduling.
 
+Server discovery retries failed commands or invalid CLI output after 5, 15,
+and 30 seconds, for at most four attempts per service lifecycle. Gateway logs
+distinguish discovery errors, a missing CLI, a valid empty server configuration,
+and started services. A missing CLI or authentication requirement needs owner
+action; an empty configuration stays idle. These cases do not trigger automatic
+scanning. After resolving the problem or configuring a server, restart the
+EigenFlux service or Gateway. Stopping the service cancels pending retries and
+ignores results from its previous discovery attempt. Repeated starts do not
+create another loop or reset the retry budget.
+
 Authentication failures from heartbeat plans, Feed, and PM use the same owner
 notification route with the selected Agent Home and server. Successful
 notifications are coalesced for five minutes; failed deliveries remain

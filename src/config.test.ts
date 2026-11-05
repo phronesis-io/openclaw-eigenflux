@@ -175,6 +175,34 @@ describe('discoverServers', () => {
     const result = await discoverServers('eigenflux');
     expect(result).toEqual({ kind: 'not_installed', bin: 'eigenflux' });
   });
+
+  test('preserves a successful empty configuration', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'success', data: [] });
+    expect(await discoverServers('eigenflux')).toEqual({ kind: 'ok', servers: [] });
+  });
+
+  test.each([undefined, {}, [{ name: 'missing-endpoint' }], [null]])(
+    'classifies malformed server data as a retryable discovery error: %p', async (data) => {
+      execEigenfluxMock.mockResolvedValue({ kind: 'success', data });
+      expect(await discoverServers('eigenflux')).toEqual({
+        kind: 'error', error: expect.stringContaining('invalid server list'), retryable: true,
+      });
+    }
+  );
+
+  test('preserves command failures instead of presenting an empty configuration', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'error', error: new Error('CLI timed out') });
+    expect(await discoverServers('eigenflux')).toEqual({
+      kind: 'error', error: 'CLI timed out', retryable: true,
+    });
+  });
+
+  test('authentication failures require recovery rather than automatic discovery retries', async () => {
+    execEigenfluxMock.mockResolvedValue({ kind: 'auth_required', stderr: 'expired' });
+    expect(await discoverServers('eigenflux')).toEqual({
+      kind: 'error', error: expect.stringContaining('requires authentication'), retryable: false,
+    });
+  });
 });
 
 describe('PLUGIN_CONFIG metadata', () => {
